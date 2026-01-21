@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 2.8.3)
+cmake_minimum_required(VERSION 3.5)
 project(slamesh)
 
 SET(CMAKE_CXX_FLAGS "-std=c++14 -Wno-deprecated-declarations -Wno-dev")
@@ -54,7 +54,7 @@ if (OPENMP_FOUND)
     set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 endif()
 #mesh_msg
-find_package(LVR2 2 REQUIRED)
+find_package(LVR2 25 REQUIRED)
 find_package(Boost REQUIRED COMPONENTS system)
 include_directories(include ${LVR2_INCLUDE_DIRS})
 if(USE_VOXBLOX)
@@ -76,7 +76,8 @@ else()
             src/cell.cpp
             src/map.cpp
             src/slamesher_node.cpp
-            )
+            src/slamesher_node.cpp
+    )
 endif()
 
 #target_link_libraries(slamesh ${catkin_LIBRARIES} ${PCL_LIBRARIES}  ${CERES_LIBRARIES} gflags ${GFLAGS_LIBRARY}
