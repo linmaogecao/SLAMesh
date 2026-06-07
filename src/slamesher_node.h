@@ -40,6 +40,7 @@ public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     //record
     std::ofstream file_loc_report_wrt, file_loc_path_wrt, file_loc_path_odom_wrt, file_loc_path_grt_wrt;
+    std::ofstream file_traj_xyz_wrt;  // 每步追加写 x,y,z 轨迹
     std::string log_file_path_GP_map_points, log_file_path_raw_pcl;
     double t_gp{0}, t_compute_rt{0};
     int log_length{0};

@@ -131,6 +131,7 @@ void Log::initLog(std::string & log_file_path){
     log_file_path.erase(log_file_path.end() - 5, log_file_path.end());
     //std::cout << log_file_path << std::endl;
     std::string log_file_path_path          = log_file_path + param.seq.substr(1, 2) + "_pred.txt";
+    std::string log_file_path_traj_xyz      = log_file_path + param.seq.substr(1, 2) + "_traj_xyz.txt";
     //open
     file_loc_report_wrt.open (log_file_path_report, std::ios::out);
     if(!file_loc_report_wrt){
@@ -139,6 +140,14 @@ void Log::initLog(std::string & log_file_path){
     file_loc_path_wrt.open(log_file_path_path, std::ios::out);
     if(!file_loc_path_wrt){
         ROS_WARN("Can not open Path file");
+    }
+    // 实时追加写 x,y,z 轨迹（每步一行，程序中断也不丢失）
+    file_traj_xyz_wrt.open(log_file_path_traj_xyz, std::ios::out);
+    if(!file_traj_xyz_wrt){
+        ROS_WARN("Can not open traj xyz file");
+    } else {
+        std::cout << "Trajectory xyz will be saved to: " << log_file_path_traj_xyz << std::endl;
+        file_traj_xyz_wrt << std::fixed << std::setprecision(6);
     }
     if(param.grt_available){
         file_loc_path_odom_wrt.open(log_file_path_odom, std::ios::out);
@@ -238,6 +247,7 @@ void Log::saveResult(double code_whole_time, const PointMatrix & map_glb_point_f
     }
     g_data.file_loc_path_wrt.close();
     g_data.file_loc_path_grt_wrt.close();
+    g_data.file_traj_xyz_wrt.close();
 }
 void Log::pose_print(ros::Publisher & cloud_pub) const{//ok
     sensor_msgs::PointCloud cloud1 = matrix3DtoPclMsg(pose, step);
@@ -398,7 +408,13 @@ void Log::updatePose(Transf & now_slam_transf){
     }
 
     recordPoseToPath(Slam, now_slam_transf);
-    //save path and grt_path to txt
+    // 实时追加写 x,y,z（每步一行）
+    if(file_traj_xyz_wrt){
+        file_traj_xyz_wrt << now_slam_transf(0,3) << " "
+                          << now_slam_transf(1,3) << " "
+                          << now_slam_transf(2,3) << "\n";
+        file_traj_xyz_wrt.flush();
+    }
     //savePathEveryStep2Txt(file_loc_path_gdt_wrt, path_grt);
     //savePathEveryStep2Txt(file_loc_path_wrt, path);
 
