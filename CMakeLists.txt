@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 2.8.3)
 project(slamesh)
 
-SET(CMAKE_CXX_FLAGS "-std=c++14 -Wno-deprecated-declarations -Wno-dev")
+SET(CMAKE_CXX_FLAGS "-std=c++17 -Wno-deprecated-declarations")
 set(CMAKE_BUILD_TYPE "Release")
 set(catkin_DIR /opt/ros/kinetic/share/catkin/cmake)
 
@@ -42,6 +42,17 @@ link_directories(${PCL_LIBRARY_DIRS})
 #ceres
 find_package(Ceres REQUIRED)
 include_directories(${CERES_INCLUDE_DIRS})
+
+find_path(ANN_INCLUDE_DIR NAMES ANN/ANN.h PATHS /usr/include /usr/local/include)
+find_library(ANN_LIBRARY NAMES ANN ann PATHS /usr/lib /usr/local/lib /usr/lib/x86_64-linux-gnu)
+
+if(NOT ANN_INCLUDE_DIR OR NOT ANN_LIBRARY)
+    message(FATAL_ERROR "ANN library not found! Install libann-dev or set ANN_INCLUDE_DIR and ANN_LIBRARY manually.")
+else()
+    message(STATUS "Found ANN: include=${ANN_INCLUDE_DIR}, lib=${ANN_LIBRARY}")
+endif()
+include_directories(${ANN_INCLUDE_DIR})
+
 #opencv in vins
 #find_package(OpenCV REQUIRED)
 #ictmap
@@ -54,7 +65,7 @@ if (OPENMP_FOUND)
     set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 endif()
 #mesh_msg
-find_package(LVR2 2 REQUIRED)
+find_package(LVR2 25 REQUIRED)
 find_package(Boost REQUIRED COMPONENTS system)
 include_directories(include ${LVR2_INCLUDE_DIRS})
 if(USE_VOXBLOX)
@@ -67,6 +78,10 @@ if(USE_VOXBLOX)
             src/slamesher_node.cpp
             src/voxblox/mesh/mesher.cpp
             src/voxblox/mesh/marching_cubes.cc
+            src/RangeMap.cpp
+            src/BSplineSurface.cpp
+            src/readWrite.cpp
+            src/tool.cpp
             )
 else()
     message("DONT USE_VOXBLOX")
@@ -76,12 +91,16 @@ else()
             src/cell.cpp
             src/map.cpp
             src/slamesher_node.cpp
+            src/RangeMap.cpp
+            src/BSplineSurface.cpp
+            src/readWrite.cpp
+            src/tool.cpp
             )
 endif()
 
 #target_link_libraries(slamesh ${catkin_LIBRARIES} ${PCL_LIBRARIES}  ${CERES_LIBRARIES} gflags ${GFLAGS_LIBRARY}
 #        ${LVR2_LIBRARIES})
-target_link_libraries(slamesh ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBS} ${G2O_LIBS} ${CERES_LIBRARIES} ${LVR2_LIBRARIES})
+target_link_libraries(slamesh ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBS} ${G2O_LIBS} ${CERES_LIBRARIES} ${ANN_LIBRARY} ${LVR2_LIBRARIES} )
 
 
 

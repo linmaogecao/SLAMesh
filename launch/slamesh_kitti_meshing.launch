@@ -1,7 +1,7 @@
 <launch>
     <arg name="seq" default = "/00" />
     <arg name="param" default = "" /> <!-- param is used for tuning "$(arg param)" -->
-    <arg name="data_path" default = "/home/ruanjy/Dataset/sequences" />
+    <arg name="data_path" default = "/home/albus/dataset/kitti/data_odometry_velodyne/dataset/sequences" />
     <arg name="result_path" default = "$(find slamesh)/../../slamesh_result/kitti" />
 
     <rosparam file="$(find slamesh)/config/kitti_meshing.yaml" command="load" />

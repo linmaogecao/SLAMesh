@@ -18,6 +18,7 @@ public:
     std::vector<Cell*> cells_now_new;
 };
 
+bool getPointCloud(PointMatrix & points_result, pcl::PointCloud<pcl::PointXYZ> & pcl_got, double & get_laser_time,double voxel_filter_size);
 class Map{
     // Map class. The current scan and the global map share similar behaviour, so both of them use the "Map" class,
     // eventhough traditionally you may think only the global map is "Map".

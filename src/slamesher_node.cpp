@@ -535,6 +535,7 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/correction_roll_degree",   correction_roll_degree, 0.0);
     nh.param("slamesher/correction_pitch_degree", correction_pitch_degree, 0.0);
     nh.param("slamesher/correction_yaw_degree",     correction_yaw_degree, 0.0);
+
     eigen_1 = 48;
     eigen_2 = 0.95;
     eigen_3 = 0.2;
@@ -828,59 +829,222 @@ void SLAMesher::pubTf(){
     br.sendTransform(tf::StampedTransform(transform, odom_msg.header.stamp, "/map", "/slamesher_odom"));
 }
 void SLAMesher::process(){
-    //main process
     TicToc t_whole;
-    TicToc t_first_map;
-    //initialize map
+
+    // ========== 全局地图 & 工具初始化 ==========
+    BSplineMap bspline_map(param.grid);
+    RangeImageProcessor range_proc;
+
     g_data.extendLog();
-    Transf Tguess = g_data.initFirstTransf();
-    Map map_glb(Tguess);
-    g_data.updatePose(Tguess);
-    std::cout<<"====FIRST GLB MAP READY====TIME:"<<t_first_map.toc()<<std::endl;
-    double max_rg_time = 5000; //max time for registration (in millisecond)
-    Map map_now;
+    Transf T_world = g_data.initFirstTransf();
+    g_data.updatePose(T_world);
+
+    // 配准参数
+    const int    max_rg_iters   = param.register_times;  // 外层迭代次数
+    const double converge_thr   = param.converge_thr;
+    const double match_dist_thr = 0.5;  // 点到曲面最大容许距离 (m)
+    const int    skip_points    = 3;    // 每隔几个点取一个用于配准 (降低计算量)
+
     while(nh.ok()){
-        //begin
         g_data.step++;
         g_data.extendLog();
         TicToc t_step;
-        g_data.t_gp = g_data.t_compute_rt = 0;
-        //new scan
-        Tguess = getOdom();
-        if(!map_now.processNewScan(Tguess, g_data.step, map_glb)){
-            std::cout<<"break"<<std::endl;
+
+        // ========== 1. 获取当前帧点云 (雷达局部坐标系) ==========
+        pcl::PointCloud<pcl::PointXYZ> scan_local;
+        if(!range_proc.getPointCloud(scan_local, 0)){
+            std::cout << "No more point cloud, exit." << std::endl;
             break;
         }
-        //register
-        map_now.registerToMap(map_glb, Tguess, max_rg_time);
+        std::cout << "===STEP " << g_data.step << "=== points: " << scan_local.size() << std::endl;
+
+        // ========== 2. 第一帧：全量建图 ==========
+        if(g_data.step == 1){
+            TicToc t_mapping;
+            // 第一帧用初始位姿变换到世界系
+            pcl::PointCloud<pcl::PointXYZ> scan_world;
+            pcl::transformPointCloud(scan_local, scan_world, T_world.cast<float>());
+
+            // range image 分割聚类
+            range_proc.generateRangeImage(scan_world);
+            SegmentationResult seg = range_proc.segmentRangeImage(5, 0.1, 30);
+            std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> clusters =
+                range_proc.generateClusterClouds(seg);
+
+            // 对每个聚类拟合 B-spline 并注册到地图
+            int num_fitted = 0;
+            for(int cid = 0; cid < (int)clusters.size(); cid++){
+                if(!clusters[cid] || clusters[cid]->size() < 20) continue;
+
+                auto surf = std::make_shared<BSplineSurface>(3, 3, 10, 10, 0.25);
+                auto init_cp = range_proc.computeInitControlPoints(seg, cid, 10, 10, 2);
+                if(init_cp.empty()) continue;
+
+                surf->setExternalInitControls(init_cp);
+                surf->apply(clusters[cid], 50, 1, 1, 0.05);
+                bspline_map.addSurface(surf, clusters[cid]);
+                num_fitted++;
+            }
+            std::cout << "  First frame mapping: " << num_fitted << " surfaces, "
+                      << t_mapping.toc() << " ms" << std::endl;
+
+            // 第一帧记录位姿即可，无需配准
+            g_data.updatePose(T_world);
+            pubTf();
+            path_pub.publish(g_data.path);
+            continue;
+        }
+
+        // ========== 3. 后续帧：scan-to-map 配准 ==========
+        TicToc t_register;
+
+        // 初始位姿猜测：恒速模型
+        Transf T_guess = getOdom();
+
+        // 迭代配准
+        Transf T_curr = T_guess;
+        double delta_scale = 100.0;
+
+        for(int iter = 0; iter < max_rg_iters && delta_scale > converge_thr; iter++){
+
+            // --- 3a. 建立点到曲面对应关系 ---
+            // 按候选曲面分桶: surface_id -> 该曲面对应的局部点索引列表
+            std::unordered_map<int, std::vector<int>> surf_to_pts;
+            for(int i = 0; i < (int)scan_local.size(); i += skip_points){
+                Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
+                    Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) +
+                    T_curr.block<3,1>(0,3);
+                auto candidates = bspline_map.queryCandidates(p_w, 1);
+                for(int sid : candidates){
+                    surf_to_pts[sid].push_back(i);
+                }
+            }
+
+            // --- 3b. 批量求 foot point，构建匹配 (p_local, SurfaceCurvature) ---
+            struct Match {
+                Eigen::Vector3d p_local;    // 雷达系下的点
+                SurfaceCurvature curvature; // 曲面最近点处的完整几何信息
+            };
+            std::vector<Match> matches;
+            matches.reserve(scan_local.size() / skip_points);
+
+            for(auto& [sid, indices] : surf_to_pts){
+                const BSplineMapEntry* entry = bspline_map.getEntry(sid);
+                if(!entry || !entry->surface) continue;
+                auto& surf = entry->surface;
+
+                const auto& knU = surf->getKnotsU();
+                const auto& knV = surf->getKnotsV();
+                const auto& cps = surf->getControls();
+                int num_cpv     = surf->getNumCpV();
+
+                // 收集世界系下的点
+                std::vector<Eigen::Vector3d> pts_world;
+                pts_world.reserve(indices.size());
+                for(int idx : indices){
+                    Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
+                        Eigen::Vector3d(scan_local[idx].x, scan_local[idx].y, scan_local[idx].z) +
+                        T_curr.block<3,1>(0,3);
+                    pts_world.push_back(p_w);
+                }
+
+                // 批量查 foot point
+                std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
+                std::vector<double> dists;
+                surf->findFootPrint(pts_world, footprints, dists);
+
+                // 过滤并收集有效匹配
+                for(int k = 0; k < (int)indices.size(); k++){
+                    double d = std::sqrt(std::abs(dists[k]));
+                    if(d > match_dist_thr || d < 1e-6) continue;
+
+                    auto [paraU, paraV] = footprints[k];
+                    SurfaceCurvature curv = surf->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
+                    if(curv.normal.norm() < 1e-9) continue;
+                    curv.normal.normalize();
+
+                    Match m;
+                    m.p_local = Eigen::Vector3d(scan_local[indices[k]].x,
+                                                scan_local[indices[k]].y,
+                                                scan_local[indices[k]].z);
+                    m.curvature = curv;
+                    matches.push_back(m);
+                }
+            }
+
+            if((int)matches.size() < 10){
+                ROS_WARN("Registration iter %d: only %d matches, skip", iter, (int)matches.size());
+                break;
+            }
+
+            // --- 3c. Ceres 优化当前位姿 (曲率加权 SDM 残差) ---
+            // 参数布局: [qx, qy, qz, qw, tx, ty, tz]
+            Eigen::Quaterniond q_init(T_curr.block<3,3>(0,0));
+            double parameters[7];
+            parameters[0] = q_init.x();
+            parameters[1] = q_init.y();
+            parameters[2] = q_init.z();
+            parameters[3] = q_init.w();
+            parameters[4] = T_curr(0, 3);
+            parameters[5] = T_curr(1, 3);
+            parameters[6] = T_curr(2, 3);
+
+            ceres::LossFunction* loss = new ceres::HuberLoss(0.1);
+            ceres::Problem problem;
+            problem.AddParameterBlock(parameters, 7, new PoseSE3Parameterization());
+
+            for(auto& m : matches){
+                ceres::CostFunction* cost = new SDMRegistrationCostFunction(
+                    m.p_local, m.curvature.point, m.curvature);
+                problem.AddResidualBlock(cost, loss, parameters);
+            }
+
+            ceres::Solver::Options opts;
+            opts.linear_solver_type = ceres::DENSE_QR;
+            opts.max_num_iterations = 10;
+            opts.minimizer_progress_to_stdout = false;
+            opts.num_threads = 4;
+            ceres::Solver::Summary summary;
+            ceres::Solve(opts, &problem, &summary);
+
+            // 从优化结果提取新位姿
+            Eigen::Map<Eigen::Quaterniond> q_opt(parameters);
+            Eigen::Map<Eigen::Vector3d> t_opt(parameters + 4);
+            Transf T_new = Eigen::Matrix4d::Identity();
+            T_new.block<3,3>(0,0) = q_opt.normalized().toRotationMatrix();
+            T_new.block<3,1>(0,3) = t_opt;
+
+            // 收敛判据：本次迭代位姿变化量
+            delta_scale = (T_new.block<3,1>(0,3) - T_curr.block<3,1>(0,3)).norm()
+                        + 5.0 * (T_new.block<3,3>(0,0) - T_curr.block<3,3>(0,0)).norm();
+            T_curr = T_new;
+
+            std::cout << "  iter " << iter << ": matches=" << matches.size()
+                      << " delta=" << delta_scale << std::endl;
+        }
+
+        // 保存位姿
+        T_world = T_curr;
+        g_data.updatePose(T_world);
         pubTf();
-        //map update
-        TicToc t_update;
-        map_glb.updateMap(map_now);
-        g_data.time_update(0, g_data.step) = t_update.toc();
-        //draw map
-        TicToc t_draw_map;
-        visualize(map_glb, map_now, param.visualisation_type);
-        g_data.time_cost_draw_map(0, g_data.step) = t_draw_map.toc();
-        //the average time, exclude time to read pcd files or wait for a msg (downsample included), and time to pub mesh msg
-        g_data.time_cost(0, g_data.step) = t_step.toc() + g_data.time_down_sample(0, g_data.step) -
-                                           g_data.time_get_pcl(0, g_data.step) - t_draw_map.toc();
-        //report
-        std::cout<<"t_overlap_region: "<<g_data.time_find_overlap(0, g_data.step) << "ms"<< std::endl;
-        std::cout<<"t_match_points  : "<<g_data.time_find_overlap_points(0, g_data.step) << "ms"<< std::endl;
-        std::cout<<"t_gp            : "<<g_data.time_gp          (0, g_data.step) << "ms"<< std::endl;
-        std::cout<<"t_rt            : "<<g_data.time_compute_rt  (0,g_data.step) << "ms"<< std::endl;
-        std::cout<<"t_update        : "<<g_data.time_update(0, g_data.step) << "ms"<< std::endl;
-        std::cout<<"t_draw_map      : "<<g_data.time_cost_draw_map(0, g_data.step) << "ms"<< std::endl;
-        std::cout<<"===STEP "<<g_data.step<<"===Time used: "<< g_data.time_cost(0, g_data.step) <<" ms==="<< std::endl;
+
+        std::cout << "  Registration: " << t_register.toc() << " ms | Pose: "
+                  << T_world(0,3) << " " << T_world(1,3) << " " << T_world(2,3) << std::endl;
+
+        // ========== 4. 地图局部更新 (TODO) ==========
+        // 后续在这里实现：
+        //   - 覆盖判断：当前帧是否观测到新区域
+        //   - 新区域：range image 分割 + B-spline 拟合 + addSurface
+        //   - 已有但不完整区域：局部控制点更新
+        // ---------------------------------------------------------
+
+        // 发布路径
+        path_pub.publish(g_data.path);
+
+        std::cout << "===STEP " << g_data.step << "=== Total: " << t_step.toc() << " ms===" << std::endl;
     }
-    //some final process, such as report
-    if(g_data.step == param.max_steps){
-        std::cout<<"Reach Max Step, exit"<<std::endl;
-    }
-    map_glb.filterMeshGlb();
-    mesh_pub.publish(map_glb.mesh_msg);
-    g_data.saveResult(t_whole.toc(), map_glb.vertices_filted, map_glb);
+
+    std::cout << "Process finished. Total time: " << t_whole.toc() / 1000.0 << " s" << std::endl;
 }
 SLAMesher::SLAMesher(ros::NodeHandle & nh_, Parameter & param_, Log & g_data_) : nh (nh_), param(param_), g_data(g_data_){
     odom_pub          = nh.advertise<nav_msgs::Odometry>("/lidar_odometry", 1);

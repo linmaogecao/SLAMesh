@@ -5,6 +5,9 @@
 #endif //SLAMESH_SLAMESHER_NODE_H
 #include "cell.h"
 #include "map.h"
+#include "RangeMap.h"
+#include "BSplineMap.h"
+#include "BSplineSDMErr.h"
 #include <sensor_msgs/point_cloud_conversion.h>
 #include <pcl/registration/icp.h>
 class Parameter{
