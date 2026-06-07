@@ -54,7 +54,7 @@ if (OPENMP_FOUND)
     set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${OpenMP_CXX_FLAGS}")
 endif()
 #mesh_msg
-find_package(LVR2 2 REQUIRED)
+find_package(LVR2 REQUIRED)
 find_package(Boost REQUIRED COMPONENTS system)
 include_directories(include ${LVR2_INCLUDE_DIRS})
 if(USE_VOXBLOX)
