@@ -227,7 +227,7 @@ SurfaceCurvature BSplineSurface::getCurvature(const Parameter& paraU, const Para
 
     result.tangent1 = T1;
     result.tangent2 = T2;
-
+    result.point = getPos(paraU, paraV, knotsU, knotsV, controls, num_cp_v);
     return result;
 }
 
@@ -353,8 +353,8 @@ double BSplineSurface::findFootPrint(const vector<Vector3d> &givepoints, vector<
 
             double dt_u = knots_u[paraU.first + 1] - knots_u[paraU.first];
             double dt_v = knots_v[paraV.first + 1] - knots_v[paraV.first];
-            double new_tf_u = std::max(0.0, std::min(1.0, paraU.second + du * dt_u));
-            double new_tf_v = std::max(0.0, std::min(1.0, paraV.second + dv * dt_v));
+            double new_tf_u = std::max(0.0, std::min(1.0, paraU.second + du));
+            double new_tf_v = std::max(0.0, std::min(1.0, paraV.second + dv));
 
             paraU = {findSpan(new_tf_u, knots_u, controls_num_u), new_tf_u};
             paraV = {findSpan(new_tf_v, knots_v, controls_num_v), new_tf_v};
@@ -367,12 +367,12 @@ double BSplineSurface::findFootPrint(const vector<Vector3d> &givepoints, vector<
         double true_dist_sq = (S_final - p).squaredNorm();
         double true_dist    = std::sqrt(true_dist_sq);
 
-        // squareSum      += true_dist;
-        // point_dists[i]  = true_dist_sq;   // MAD 离群点过滤使用平方距离
-        // footPrints[i]   = {paraU, paraV};
-        squareSum += std::sqrt(dists[0]);
-        point_dists[i] = dists[0];
-        footPrints[i] =  getPara(nnIdx[0]) ;
+        squareSum      += true_dist;
+        point_dists[i]  = true_dist_sq;   // MAD 离群点过滤使用平方距离
+        footPrints[i]   = {paraU, paraV};
+        // squareSum += std::sqrt(dists[0]);
+        // point_dists[i] = dists[0];
+        // footPrints[i] =  getPara(nnIdx[0]) ;
     }
 
     delete[] nnIdx;

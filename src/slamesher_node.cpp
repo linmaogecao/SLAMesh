@@ -844,7 +844,18 @@ void SLAMesher::process(){
     const double converge_thr   = param.converge_thr;
     const double match_dist_thr = 0.5;  // 点到曲面最大容许距离 (m)
     const int    skip_points    = 3;    // 每隔几个点取一个用于配准 (降低计算量)
+    static std::ofstream traj_file;
+    if (!traj_file.is_open()) {
+        traj_file.open("/tmp/bspline_traj_xyz.txt", std::ios::out | std::ios::trunc);
+        traj_file << std::fixed << std::setprecision(6);
+    }
 
+    // 地面约束参考高度 (世界系下地面质心 z，由第一帧初始化)
+    static double z_ground_ref   = std::numeric_limits<double>::quiet_NaN();
+    // 地面点 z 阈值（传感器系）：KITTI lidar 距地面约 1.73m，取 -1.0m 为截止
+    const double ground_z_thr    = -1.0;
+    const double ground_w_rp     = 1.5;   // roll/pitch 约束权重
+    const double ground_w_z      = 1.0;   // 高度约束权重
     while(nh.ok()){
         g_data.step++;
         g_data.extendLog();
@@ -885,8 +896,19 @@ void SLAMesher::process(){
                 bspline_map.addSurface(surf, clusters[cid]);
                 num_fitted++;
             }
-            std::cout << "  First frame mapping: " << num_fitted << " surfaces, "
-                      << t_mapping.toc() << " ms" << std::endl;
+            // std::cout << "  First frame mapping: " << num_fitted << " surfaces, "
+            //           << t_mapping.toc() << " ms" << std::endl;
+
+            // 第一帧：从传感器系地面点计算世界系地面参考高度
+            // 第一帧 T_world = identity，所以世界系 z = 传感器系 z
+            if (std::isnan(z_ground_ref)) {
+                double sum_z = 0.0; int cnt = 0;
+                for (auto& pt : scan_local) {
+                    if (pt.z < ground_z_thr) { sum_z += pt.z; cnt++; }
+                }
+                z_ground_ref = (cnt > 10) ? (sum_z / cnt) : -1.73;
+                std::cout << "  [Ground] z_ground_ref = " << z_ground_ref << " m" << std::endl;
+            }
 
             // 第一帧记录位姿即可，无需配准
             g_data.updatePose(T_world);
@@ -894,12 +916,47 @@ void SLAMesher::process(){
             path_pub.publish(g_data.path);
             continue;
         }
-
         // ========== 3. 后续帧：scan-to-map 配准 ==========
         TicToc t_register;
 
         // 初始位姿猜测：恒速模型
         Transf T_guess = getOdom();
+
+        // ========== 地面约束预计算（传感器系，与 T_curr 无关，只需做一次）==========
+        Eigen::Vector3d ground_n_local  = Eigen::Vector3d::UnitZ();  // 默认值
+        Eigen::Vector3d ground_c_local  = Eigen::Vector3d(0, 0, z_ground_ref);
+        bool ground_valid = false;
+
+        if (!std::isnan(z_ground_ref)) {
+            std::vector<Eigen::Vector3d> gpts;
+            gpts.reserve(2000);
+            for (size_t gi = 0; gi < scan_local.size(); gi += 2) {
+                if (scan_local[gi].z < ground_z_thr)
+                    gpts.emplace_back(scan_local[gi].x, scan_local[gi].y, scan_local[gi].z);
+            }
+            if ((int)gpts.size() >= 20) {
+                // 质心
+                Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+                for (auto& p : gpts) centroid += p;
+                centroid /= (double)gpts.size();
+
+                // PCA 协方差矩阵 → 最小特征向量 = 法向
+                Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+                for (auto& p : gpts) {
+                    Eigen::Vector3d d = p - centroid;
+                    cov += d * d.transpose();
+                }
+                cov /= (double)gpts.size();
+
+                Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(cov);
+                Eigen::Vector3d n = eig.eigenvectors().col(0);  // 最小特征值对应法向
+                if (n.z() < 0) n = -n;  // 确保指向上方
+
+                ground_n_local = n;
+                ground_c_local = centroid;
+                ground_valid   = true;
+            }
+        }
 
         // 迭代配准
         Transf T_curr = T_guess;
@@ -920,9 +977,10 @@ void SLAMesher::process(){
                 }
             }
 
-            // --- 3b. 批量求 foot point，构建匹配 (p_local, SurfaceCurvature) ---
+            // --- 3b. 批量求 foot point，构建匹配 (p_local, p_world, SurfaceCurvature) ---
             struct Match {
-                Eigen::Vector3d p_local;    // 雷达系下的点
+                Eigen::Vector3d p_local;    // 雷达系下的点 (用于 Ceres 优化)
+                Eigen::Vector3d p_world;    // 当前 T_curr 下的世界系坐标 (用于 dist 预计算)
                 SurfaceCurvature curvature; // 曲面最近点处的完整几何信息
             };
             std::vector<Match> matches;
@@ -967,6 +1025,7 @@ void SLAMesher::process(){
                     m.p_local = Eigen::Vector3d(scan_local[indices[k]].x,
                                                 scan_local[indices[k]].y,
                                                 scan_local[indices[k]].z);
+                    m.p_world = pts_world[k];  // 当前 T_curr 变换后的世界系坐标
                     m.curvature = curv;
                     matches.push_back(m);
                 }
@@ -975,6 +1034,26 @@ void SLAMesher::process(){
             if((int)matches.size() < 10){
                 ROS_WARN("Registration iter %d: only %d matches, skip", iter, (int)matches.size());
                 break;
+            }
+
+            // --- 匹配质量诊断：前100个匹配写到本地文件 ---
+            if(iter == 0 && g_data.step == 40){
+                std::ofstream dbg_match("/tmp/match_debug_step2.txt");
+                dbg_match << std::fixed << std::setprecision(4);
+                dbg_match << "# p_world(x y z)  foot_point(x y z)  normal(x y z)  dist_raw  res_normal\n";
+                int dump_cnt = 0;
+                for(auto& m : matches){
+                    if(dump_cnt++ > 200) break;
+                    Eigen::Vector3d diff = m.p_world - m.curvature.point;
+                    double res_n = diff.dot(m.curvature.normal);
+                    double dist3d = diff.norm();
+                    dbg_match << m.p_world.x()          << " " << m.p_world.y()          << " " << m.p_world.z()          << "  "
+                              << m.curvature.point.x()  << " " << m.curvature.point.y()  << " " << m.curvature.point.z()  << "  "
+                              << m.curvature.normal.x() << " " << m.curvature.normal.y() << " " << m.curvature.normal.z() << "  "
+                              << dist3d << "  " << res_n << "\n";
+                }
+                dbg_match.close();
+                std::cout << "  [DEBUG] match dump -> /tmp/match_debug_step2.txt (" << std::min((int)matches.size(), 201) << " matches)\n";
             }
 
             // --- 3c. Ceres 优化当前位姿 (曲率加权 SDM 残差) ---
@@ -989,14 +1068,22 @@ void SLAMesher::process(){
             parameters[5] = T_curr(1, 3);
             parameters[6] = T_curr(2, 3);
 
-            ceres::LossFunction* loss = new ceres::HuberLoss(0.1);
+            ceres::LossFunction* loss = new ceres::HuberLoss(0.5);
             ceres::Problem problem;
             problem.AddParameterBlock(parameters, 7, new PoseSE3Parameterization());
 
             for(auto& m : matches){
                 ceres::CostFunction* cost = new SDMRegistrationCostFunction(
-                    m.p_local, m.curvature.point, m.curvature);
+                    m.p_local, m.p_world, m.curvature);
                 problem.AddResidualBlock(cost, loss, parameters);
+            }
+
+            // --- 地面约束 (roll/pitch/height) ---
+            if (ground_valid) {
+                ceres::CostFunction* gnd_cost = new GroundPlaneConstraint(
+                    ground_n_local, ground_c_local, z_ground_ref,
+                    ground_w_rp, ground_w_z);
+                problem.AddResidualBlock(gnd_cost, nullptr, parameters);
             }
 
             ceres::Solver::Options opts;
@@ -1006,7 +1093,7 @@ void SLAMesher::process(){
             opts.num_threads = 4;
             ceres::Solver::Summary summary;
             ceres::Solve(opts, &problem, &summary);
-
+            std::cout << summary.BriefReport() << std::endl;
             // 从优化结果提取新位姿
             Eigen::Map<Eigen::Quaterniond> q_opt(parameters);
             Eigen::Map<Eigen::Vector3d> t_opt(parameters + 4);
@@ -1030,6 +1117,13 @@ void SLAMesher::process(){
 
         std::cout << "  Registration: " << t_register.toc() << " ms | Pose: "
                   << T_world(0,3) << " " << T_world(1,3) << " " << T_world(2,3) << std::endl;
+
+        if (traj_file.is_open()) {
+            traj_file << T_world(0,3) << " "
+                      << T_world(1,3) << " "
+                      << T_world(2,3) << "\n";
+            traj_file.flush();
+        }
 
         // ========== 4. 地图局部更新 (TODO) ==========
         // 后续在这里实现：

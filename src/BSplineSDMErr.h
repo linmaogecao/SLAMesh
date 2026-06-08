@@ -175,13 +175,17 @@ struct BoundaryPenalty {
 // -----------------------------------------------------------------------
 class SDMRegistrationCostFunction : public ceres::SizedCostFunction<3, 7> {
 public:
+    // curr_point      : 传感器坐标系下的点 (用于 Evaluate 中的 q*p+t)
+    // curr_point_world: 当前 T_curr 下变换到世界系的点 (只用于 dist 预计算)
+    // frame           : 曲面最近点处的曲率帧 (世界系)
     SDMRegistrationCostFunction(const Eigen::Vector3d& curr_point,
-                                const Eigen::Vector3d& surface_point,
+                                const Eigen::Vector3d& curr_point_world,
                                 const SurfaceCurvature& frame)
         : curr_point_(curr_point), surface_point_(frame.point),
           tangent1_(frame.tangent1), tangent2_(frame.tangent2), normal_(frame.normal)
     {
-        double dist = (curr_point - frame.point).dot(frame.normal);
+        // dist 用世界坐标系下的点到曲面的有符号距离
+        double dist = (curr_point_world - frame.point).dot(frame.normal);
         double eps = 1e-4;
 
         auto calc_coeff = [&](double k) -> double {
@@ -247,6 +251,83 @@ private:
     Eigen::Vector3d tangent2_;       // 曲面主方向 T2 (世界系)
     Eigen::Vector3d normal_;         // 曲面法向 (世界系)
     double coeff_t1_, coeff_t2_, coeff_n_;
+};
+
+// -----------------------------------------------------------------------
+// 地面约束: 3 个残差，优化变量为 SE(3) 位姿 [qx,qy,qz,qw, tx,ty,tz]
+//
+//   r[0] = w_rp * (R * n_local).x   →  roll  约束 (应=0)
+//   r[1] = w_rp * (R * n_local).y   →  pitch 约束 (应=0)
+//   r[2] = w_z  * ((R * c_local + t).z - z_ground_ref)  →  高度约束
+//
+// n_local    : 传感器系下地面法向量 (PCA 最小特征向量, 指向上方 z>0)
+// c_local    : 传感器系下地面点质心
+// z_ground_ref: 世界系中地面质心 z 的参考值 (由第一帧初始化)
+// w_rp       : roll/pitch 约束权重
+// w_z        : 高度约束权重
+// -----------------------------------------------------------------------
+class GroundPlaneConstraint : public ceres::SizedCostFunction<3, 7> {
+public:
+    GroundPlaneConstraint(const Eigen::Vector3d& n_local,
+                          const Eigen::Vector3d& c_local,
+                          double z_ground_ref,
+                          double w_rp = 1.0,
+                          double w_z  = 1.0)
+        : n_local_(n_local), c_local_(c_local),
+          z_ground_ref_(z_ground_ref), w_rp_(w_rp), w_z_(w_z) {}
+
+    virtual ~GroundPlaneConstraint() {}
+
+    virtual bool Evaluate(double const* const* parameters,
+                          double* residuals,
+                          double** jacobians) const override {
+        Eigen::Map<const Eigen::Quaterniond> q(parameters[0]);
+        Eigen::Map<const Eigen::Vector3d>    t(parameters[0] + 4);
+
+        Eigen::Vector3d n_world = q * n_local_;           // 地面法向在世界系
+        Eigen::Vector3d c_world = q * c_local_ + t;       // 地面质心在世界系
+
+        residuals[0] = w_rp_ * n_world.x();               // roll:  n_world.x → 0
+        residuals[1] = w_rp_ * n_world.y();               // pitch: n_world.y → 0
+        residuals[2] = w_z_  * (c_world.z() - z_ground_ref_); // height
+
+        if (jacobians && jacobians[0]) {
+            Eigen::Map<Eigen::Matrix<double, 3, 7, Eigen::RowMajor>> J(jacobians[0]);
+            J.setZero();
+
+            // Jacobian of r[0,1] w.r.t. rotation (xi_rot = [wx,wy,wz]):
+            //   d(R*n)/d(xi_rot) = -skew(R*n) = -skew(n_world)
+            //   -skew(v) row k:  row0=[0, v.z, -v.y], row1=[-v.z, 0, v.x], row2=[v.y, -v.x, 0]
+            J(0, 0) = 0;
+            J(0, 1) = w_rp_ *  n_world.z();
+            J(0, 2) = w_rp_ * -n_world.y();
+            // J(0, 3..5) = 0  (n_world independent of t)
+
+            J(1, 0) = w_rp_ * -n_world.z();
+            J(1, 1) = 0;
+            J(1, 2) = w_rp_ *  n_world.x();
+            // J(1, 3..5) = 0
+
+            // Jacobian of r[2] = w_z*(c_world.z - z_ref) w.r.t. [xi_rot, t]:
+            //   d(c_world.z)/d(xi_rot): treat c_world as point → -skew(c_world) row2
+            //   -skew(c_world) row2 = [c_world.y, -c_world.x, 0]
+            //   d(c_world.z)/d(t) = e_z = [0, 0, 1]
+            J(2, 0) = w_z_ *  c_world.y();
+            J(2, 1) = w_z_ * -c_world.x();
+            J(2, 2) = 0;
+            J(2, 3) = 0;
+            J(2, 4) = 0;
+            J(2, 5) = w_z_;
+            // J(2, 6) = 0  (qw column)
+        }
+        return true;
+    }
+
+private:
+    Eigen::Vector3d n_local_;
+    Eigen::Vector3d c_local_;
+    double z_ground_ref_;
+    double w_rp_, w_z_;
 };
 
 #endif //SPLINE_FITTING_BSPLINESDMERR_H
