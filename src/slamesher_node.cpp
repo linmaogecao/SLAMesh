@@ -879,9 +879,8 @@ void SLAMesher::process(){
             // range image 分割聚类
             range_proc.generateRangeImage(scan_world);
             SegmentationResult seg = range_proc.segmentRangeImage(5, 0.1, 30);
-            std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> clusters =
-                range_proc.generateClusterClouds(seg);
-
+            std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> clusters = range_proc.generateClusterClouds(seg);
+            range_proc.saveClustersToTxt(seg, "/home/albus/slam-math/Bspline/build/output_clusters");
             // 对每个聚类拟合 B-spline 并注册到地图
             int num_fitted = 0;
             for(int cid = 0; cid < (int)clusters.size(); cid++){
@@ -982,6 +981,7 @@ void SLAMesher::process(){
                 Eigen::Vector3d p_local;    // 雷达系下的点 (用于 Ceres 优化)
                 Eigen::Vector3d p_world;    // 当前 T_curr 下的世界系坐标 (用于 dist 预计算)
                 SurfaceCurvature curvature; // 曲面最近点处的完整几何信息
+                int scan_idx = -1;          // scan_local 中的原始索引 (用于诊断)
             };
             std::vector<Match> matches;
             matches.reserve(scan_local.size() / skip_points);
@@ -1022,11 +1022,12 @@ void SLAMesher::process(){
                     curv.normal.normalize();
 
                     Match m;
-                    m.p_local = Eigen::Vector3d(scan_local[indices[k]].x,
-                                                scan_local[indices[k]].y,
-                                                scan_local[indices[k]].z);
-                    m.p_world = pts_world[k];  // 当前 T_curr 变换后的世界系坐标
+                    m.p_local   = Eigen::Vector3d(scan_local[indices[k]].x,
+                                                  scan_local[indices[k]].y,
+                                                  scan_local[indices[k]].z);
+                    m.p_world   = pts_world[k];
                     m.curvature = curv;
+                    m.scan_idx  = indices[k];
                     matches.push_back(m);
                 }
             }
@@ -1036,24 +1037,40 @@ void SLAMesher::process(){
                 break;
             }
 
-            // --- 匹配质量诊断：前100个匹配写到本地文件 ---
-            if(iter == 0 && g_data.step == 40){
-                std::ofstream dbg_match("/tmp/match_debug_step2.txt");
-                dbg_match << std::fixed << std::setprecision(4);
-                dbg_match << "# p_world(x y z)  foot_point(x y z)  normal(x y z)  dist_raw  res_normal\n";
-                int dump_cnt = 0;
+            // --- 匹配结果诊断：写 matched / unmatched 两个点云文件 (世界系 xyz) ---
+            // 修改 dump_step 为你想观测的帧号
+            const int dump_step = 69;
+            if(iter == 0 && g_data.step == dump_step){
+                const std::string base = "/home/albus/slam-math/Bspline/build/";
+
+                // 1. matched_points.txt: 成功匹配的原始点 (世界系)
+                std::ofstream f_matched(base + "matched_points.txt");
+                f_matched << std::fixed << std::setprecision(4);
                 for(auto& m : matches){
-                    if(dump_cnt++ > 200) break;
-                    Eigen::Vector3d diff = m.p_world - m.curvature.point;
-                    double res_n = diff.dot(m.curvature.normal);
-                    double dist3d = diff.norm();
-                    dbg_match << m.p_world.x()          << " " << m.p_world.y()          << " " << m.p_world.z()          << "  "
-                              << m.curvature.point.x()  << " " << m.curvature.point.y()  << " " << m.curvature.point.z()  << "  "
-                              << m.curvature.normal.x() << " " << m.curvature.normal.y() << " " << m.curvature.normal.z() << "  "
-                              << dist3d << "  " << res_n << "\n";
+                    f_matched << m.p_world.x() << " " << m.p_world.y() << " " << m.p_world.z() << "\n";
                 }
-                dbg_match.close();
-                std::cout << "  [DEBUG] match dump -> /tmp/match_debug_step2.txt (" << std::min((int)matches.size(), 201) << " matches)\n";
+                f_matched.close();
+
+                // 2. unmatched_points.txt: 没有匹配上的点 (世界系)
+                //    = 全部采样点中不在 matched scan_idx 集合里的点
+                std::unordered_set<int> matched_set;
+                for(auto& m : matches) matched_set.insert(m.scan_idx);
+
+                std::ofstream f_unmatched(base + "unmatched_points.txt");
+                f_unmatched << std::fixed << std::setprecision(4);
+                for(int i = 0; i < (int)scan_local.size(); i += skip_points){
+                    if(matched_set.count(i)) continue;
+                    Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
+                        Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) +
+                        T_curr.block<3,1>(0,3);
+                    f_unmatched << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+                }
+                f_unmatched.close();
+
+                std::cout << "  [DEBUG] step=" << dump_step
+                          << " matched=" << matches.size()
+                          << " unmatched=" << (scan_local.size()/skip_points - matched_set.size())
+                          << " -> " << base << "\n";
             }
 
             // --- 3c. Ceres 优化当前位姿 (曲率加权 SDM 残差) ---
@@ -1093,7 +1110,6 @@ void SLAMesher::process(){
             opts.num_threads = 4;
             ceres::Solver::Summary summary;
             ceres::Solve(opts, &problem, &summary);
-            std::cout << summary.BriefReport() << std::endl;
             // 从优化结果提取新位姿
             Eigen::Map<Eigen::Quaterniond> q_opt(parameters);
             Eigen::Map<Eigen::Vector3d> t_opt(parameters + 4);

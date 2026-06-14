@@ -221,7 +221,7 @@ SegmentationResult RangeImageProcessor::segmentRangeImage(double theta_deg, doub
 
 void RangeImageProcessor::saveClustersToTxt(const SegmentationResult& result, const std::string& folder_path) {
     if (result.clusters.empty()) {
-        //std::cout << "No clusters to save!" << std::endl;
+        std::cout << "--------------No clusters to save!" << std::endl;
         return;
     }
 

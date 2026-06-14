@@ -824,10 +824,10 @@ double BSplineSurface::apply(
         double rmse = (current_sq_dist / point_num); // 均方根误差(平均距离)
 
         // 打印详细调试信息，方便观察收敛情况
-        std::cout << "Iter: " << iter
-                  << " | Total Err: " << current_sq_dist
-                  << " | RMSE: " << rmse
-                  << " | Rel Decr: " << relative_decrease * 100.0 << "%" << std::endl;
+        // std::cout << "Iter: " << iter
+        //           << " | Total Err: " << current_sq_dist
+        //           << " | RMSE: " << rmse
+        //           << " | Rel Decr: " << relative_decrease * 100.0 << "%" << std::endl;
 
         // --- 新的终止策略 ---
 
@@ -986,7 +986,7 @@ double BSplineSurface::apply(
         options.linear_solver_type = ceres::ITERATIVE_SCHUR;
         options.num_threads = 4;
         options.max_num_iterations = 1; // 关键点！
-        options.minimizer_progress_to_stdout = true;
+        options.minimizer_progress_to_stdout = false;
         ceres::Solver::Summary summary;
         t1 = std::chrono::high_resolution_clock::now();
         ceres::Solve(options, &problem, &summary);
@@ -997,15 +997,15 @@ double BSplineSurface::apply(
         setNewControl(controls_copy, controls_num_u, controls_num_v);
         sum_set += ms_since(t1);
     }
-    std::cout << std::fixed << std::setprecision(2)
-          << "sum_fp=" << sum_fp
-          << "ms sum_pre=" << sum_pre
-          << "ms sum_data_res=" << sum_data_res
-          << "ms sum_smooth=" << sum_smooth
-          << "ms sum_bound=" << sum_bound
-          << "ms sum_solve=" << sum_solve
-          << "ms sum_set=" << sum_set
-          << "ms" << std::endl;
+    // std::cout << std::fixed << std::setprecision(2)
+    //       << "sum_fp=" << sum_fp
+    //       << "ms sum_pre=" << sum_pre
+    //       << "ms sum_data_res=" << sum_data_res
+    //       << "ms sum_smooth=" << sum_smooth
+    //       << "ms sum_bound=" << sum_bound
+    //       << "ms sum_solve=" << sum_solve
+    //       << "ms sum_set=" << sum_set
+    //       << "ms" << std::endl;
     // 在 apply 函数的 return last_error; 之前加入：
 
 
