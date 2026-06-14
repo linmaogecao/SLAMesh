@@ -1151,16 +1151,16 @@ void SLAMesher::process(){
         // 策略：配准结束后，对当前帧做分割；统计每个 cluster 中有多少点没有参与匹配；
         //       未匹配比例高的 cluster 说明是新区域，对其拟合新曲面加入地图。
         //
-        // TEST_STEP: 指定第几帧触发（改为 -1 表示每帧都跑；改为正整数只触发一次便于调试）
+        // UPDATE_INTERVAL: 每隔多少帧触发一次地图更新（1 = 每帧，20 = 每20帧）
         // ---------------------------------------------------------
         {
-            const int TEST_STEP = 20;  // 改这里控制触发帧，-1 = 每帧
-            const int   MIN_CLUSTER_PTS     = 30;    // 太小的 cluster 跳过
-            const int   MAX_NEW_SURFACES    = 100;    // 每帧最多新增曲面数
+            const int UPDATE_INTERVAL    = 20;   // 每20帧更新一次
+            const int MIN_CLUSTER_PTS    = 30;   // 太小的 cluster 跳过
+            const int MAX_NEW_SURFACES   = 100;  // 每次最多新增曲面数
             // 保存路径（须已存在）
             const std::string SAVE_DIR = "/home/albus/slam-math/Bspline/build/output_voxels";
 
-            bool do_update = (TEST_STEP < 0) || (g_data.step == TEST_STEP);
+            bool do_update = (g_data.step % UPDATE_INTERVAL == 0);
             if (do_update) {
                 TicToc t_upd;
                 range_proc.generateRangeImage(scan_local);
@@ -1171,7 +1171,7 @@ void SLAMesher::process(){
                 const Eigen::Vector3d t_w = T_world.block<3,1>(0,3);
 
                 // 保存所有聚类（世界坐标系），文件名格式：cluster_world_<id>.txt
-                range_proc.saveClustersWorldToTxt(seg_upd, SAVE_DIR, T_world);
+                //range_proc.saveClustersWorldToTxt(seg_upd, SAVE_DIR, T_world);
 
                 int n_added = 0;
                 std::vector<std::shared_ptr<BSplineSurface>> new_surfs;
@@ -1252,26 +1252,26 @@ void SLAMesher::process(){
 
                 // 保存本帧所有新增曲面的采样点（稀疏，每隔 SURF_SAMPLE_STEP 取一个点）
                 // 格式：surf_id x y z，每行一个点；文件：step_<N>_new_surfaces.txt
-                if (!new_surfs.empty()) {
-                    const int SURF_SAMPLE_STEP = 5;
-                    std::string surf_file = "/home/albus/slam-math/Bspline/build/new_surfaces.txt";
-                    std::ofstream sf(surf_file);
-                    if (sf.is_open()) {
-                        sf << std::fixed << std::setprecision(4);
-                        for (int si = 0; si < (int)new_surfs.size(); ++si) {
-                            const auto& samples = new_surfs[si]->getSamples();
-                            for (int k = 0; k < (int)samples.size(); k += SURF_SAMPLE_STEP) {
-                                sf 
-                                   << samples[k].x() << " "
-                                   << samples[k].y() << " "
-                                   << samples[k].z() << "\n";
-                            }
-                        }
-                        sf.close();
-                        std::cout << "  [MapUpdate] saved " << new_surfs.size()
-                                  << " surface sample files -> " << surf_file << std::endl;
-                    }
-                }
+                // if (!new_surfs.empty()) {
+                //     const int SURF_SAMPLE_STEP = 5;
+                //     std::string surf_file = "/home/albus/slam-math/Bspline/build/new_surfaces.txt";
+                //     std::ofstream sf(surf_file);
+                //     if (sf.is_open()) {
+                //         sf << std::fixed << std::setprecision(4);
+                //         for (int si = 0; si < (int)new_surfs.size(); ++si) {
+                //             const auto& samples = new_surfs[si]->getSamples();
+                //             for (int k = 0; k < (int)samples.size(); k += SURF_SAMPLE_STEP) {
+                //                 sf 
+                //                    << samples[k].x() << " "
+                //                    << samples[k].y() << " "
+                //                    << samples[k].z() << "\n";
+                //             }
+                //         }
+                //         sf.close();
+                //         std::cout << "  [MapUpdate] saved " << new_surfs.size()
+                //                   << " surface sample files -> " << surf_file << std::endl;
+                //     }
+                // }
 
                 std::cout << "  [MapUpdate] step=" << g_data.step
                           << " clusters=" << seg_upd.clusters.size()
