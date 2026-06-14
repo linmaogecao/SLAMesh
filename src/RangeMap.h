@@ -83,9 +83,13 @@ public:
     double alpha_vert_rad_;
     double alpha_horiz_rad_;
     std::vector<RangePixel> range_image_;
+    // pixel_to_cloud_idx_[pixel_idx] = 对应点云中的点下标（-1 表示该 pixel 无效）
+    // 由 generateRangeImage 填充，与 range_image_ 同步
+    std::vector<int> pixel_to_cloud_idx_;
     pcl::PointCloud<pcl::PointXYZ> ouyt;
     RangeImageProcessor() {
         range_image_.resize(H_SCANS * W_COLS);
+        pixel_to_cloud_idx_.resize(H_SCANS * W_COLS, -1);
         alpha_vert_rad_ = (FOV_UP * M_PI / 180.0f - FOV_DOWN * M_PI / 180.0f)/(H_SCANS - 1);
         alpha_horiz_rad_ = (2.0 * M_PI) / W_COLS;
 
@@ -114,6 +118,12 @@ public:
 
     SegmentationResult segmentRangeImage(double theta_deg, double max_dist, int min_cluster_size);
     void saveClustersToTxt(const SegmentationResult& result, const std::string& folder_path);
+
+    // 与 saveClustersToTxt 相同，但将每个点用 transform (4×4) 变换到目标坐标系后再写入。
+    // 用于 range image 基于局部系生成后，把聚类保存到世界系下便于可视化。
+    void saveClustersWorldToTxt(const SegmentationResult& result,
+                                const std::string& folder_path,
+                                const Eigen::Matrix4d& transform);
     bool findValidNeighborPt(int u, int v, const Eigen::Vector3d& center_pt, Eigen::Vector3d& neighbor_pt, bool is_vertical = false, int dir = 1) const;
     std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> generateClusterClouds(const SegmentationResult& result);
 

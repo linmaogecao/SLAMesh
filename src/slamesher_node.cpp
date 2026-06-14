@@ -960,6 +960,8 @@ void SLAMesher::process(){
         // 迭代配准
         Transf T_curr = T_guess;
         double delta_scale = 100.0;
+        // 记录最后一次 iter 中成功匹配的点云下标（供步骤 4 地图更新使用）
+        std::unordered_set<int> last_matched_indices;
 
         for(int iter = 0; iter < max_rg_iters && delta_scale > converge_thr; iter++){
 
@@ -1124,6 +1126,10 @@ void SLAMesher::process(){
 
             std::cout << "  iter " << iter << ": matches=" << matches.size()
                       << " delta=" << delta_scale << std::endl;
+
+            // 保留本次 iter 的匹配下标（每次 iter 都覆盖，最终保留最后一次）
+            last_matched_indices.clear();
+            for (auto& m : matches) last_matched_indices.insert(m.scan_idx);
         }
 
         // 保存位姿
@@ -1141,12 +1147,139 @@ void SLAMesher::process(){
             traj_file.flush();
         }
 
-        // ========== 4. 地图局部更新 (TODO) ==========
-        // 后续在这里实现：
-        //   - 覆盖判断：当前帧是否观测到新区域
-        //   - 新区域：range image 分割 + B-spline 拟合 + addSurface
-        //   - 已有但不完整区域：局部控制点更新
+        // ========== 4. 地图更新：基于未匹配点的新区域扩充 ==========
+        // 策略：配准结束后，对当前帧做分割；统计每个 cluster 中有多少点没有参与匹配；
+        //       未匹配比例高的 cluster 说明是新区域，对其拟合新曲面加入地图。
+        //
+        // TEST_STEP: 指定第几帧触发（改为 -1 表示每帧都跑；改为正整数只触发一次便于调试）
         // ---------------------------------------------------------
+        {
+            const int TEST_STEP = 20;  // 改这里控制触发帧，-1 = 每帧
+            const int   MIN_CLUSTER_PTS     = 30;    // 太小的 cluster 跳过
+            const int   MAX_NEW_SURFACES    = 100;    // 每帧最多新增曲面数
+            // 保存路径（须已存在）
+            const std::string SAVE_DIR = "/home/albus/slam-math/Bspline/build/output_voxels";
+
+            bool do_update = (TEST_STEP < 0) || (g_data.step == TEST_STEP);
+            if (do_update) {
+                TicToc t_upd;
+                range_proc.generateRangeImage(scan_local);
+                SegmentationResult seg_upd = range_proc.segmentRangeImage(5, 0.1, MIN_CLUSTER_PTS);
+
+                // 准备局部系→世界系的变换矩阵
+                const Eigen::Matrix3d R_w = T_world.block<3,3>(0,0);
+                const Eigen::Vector3d t_w = T_world.block<3,1>(0,3);
+
+                // 保存所有聚类（世界坐标系），文件名格式：cluster_world_<id>.txt
+                range_proc.saveClustersWorldToTxt(seg_upd, SAVE_DIR, T_world);
+
+                int n_added = 0;
+                std::vector<std::shared_ptr<BSplineSurface>> new_surfs;
+
+                for (int cid = 0; cid < (int)seg_upd.clusters.size() && n_added < MAX_NEW_SURFACES; cid++) {
+                    const auto& pixels = seg_upd.clusters[cid];
+                    if ((int)pixels.size() < MIN_CLUSTER_PTS) continue;
+
+                    // ------------------------------------------------------------------
+                    // 对 cluster 每个像素逐一查地图，与 ICP 相同的 queryCandidates +
+                    // findFootPrint 判断该点是否已被现有曲面覆盖。
+                    // 按候选曲面分桶后批量调用 findFootPrint，避免逐点调用的开销。
+                    // ------------------------------------------------------------------
+
+                    // step1: 每个像素变换到世界系，同时按候选曲面分桶
+                    std::unordered_map<int, std::vector<int>> surf_to_kidx; // surf_id → 在 pixels 中的下标
+                    std::vector<Eigen::Vector3d> pix_world(pixels.size(), Eigen::Vector3d::Zero());
+                    std::vector<bool> pix_valid(pixels.size(), false);
+
+                    for (int k = 0; k < (int)pixels.size(); ++k) {
+                        const auto& px = range_proc.range_image_[pixels[k]];
+                        if (!px.valid) continue;
+                        Eigen::Vector3d pw = R_w * Eigen::Vector3d(px.x, px.y, px.z) + t_w;
+                        pix_world[k] = pw;
+                        pix_valid[k] = true;
+                        for (int sid : bspline_map.queryCandidates(pw, 1))
+                            surf_to_kidx[sid].push_back(k);
+                    }
+
+                    // step2: 对每个候选曲面批量 findFootPrint，标记已匹配像素
+                    std::vector<bool> confirmed_matched(pixels.size(), false);
+                    for (auto& [sid, kidxs] : surf_to_kidx) {
+                        const BSplineMapEntry* entry = bspline_map.getEntry(sid);
+                        if (!entry || !entry->surface) continue;
+
+                        std::vector<Eigen::Vector3d> batch;
+                        batch.reserve(kidxs.size());
+                        for (int k : kidxs) batch.push_back(pix_world[k]);
+
+                        std::vector<std::pair<BSplineSurface::Parameter,
+                                              BSplineSurface::Parameter>> fps;
+                        std::vector<double> dists;
+                        entry->surface->findFootPrint(batch, fps, dists);
+
+                        for (int i = 0; i < (int)kidxs.size(); ++i) {
+                            double d = std::sqrt(std::abs(dists[i]));
+                            if (d > 1e-6 && d <= match_dist_thr)
+                                confirmed_matched[kidxs[i]] = true;
+                        }
+                    }
+
+                    // step3: 剩余未匹配像素构成候选点云（局部系）
+                    auto cloud_local = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+                    cloud_local->reserve(pixels.size());
+                    for (int k = 0; k < (int)pixels.size(); ++k) {
+                        if (!pix_valid[k] || confirmed_matched[k]) continue;
+                        const auto& px = range_proc.range_image_[pixels[k]];
+                        cloud_local->push_back(pcl::PointXYZ(px.x, px.y, px.z));
+                    }
+                    if ((int)cloud_local->size() < MIN_CLUSTER_PTS) continue;
+
+                    // step4: 变换到世界系，拟合新曲面
+                    auto cloud_world = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+                    pcl::transformPointCloud(*cloud_local, *cloud_world, T_world.cast<float>());
+
+                    // 初始控制点从整个 cluster 算（覆盖范围更完整，仅作初始化）
+                    auto init_cp = range_proc.computeInitControlPoints(seg_upd, cid, 10, 10, 2);
+                    if (init_cp.empty()) continue;
+                    for (auto& cp : init_cp) cp = R_w * cp + t_w;
+
+                    auto surf = std::make_shared<BSplineSurface>(3, 3, 10, 10, 0.25);
+                    surf->setExternalInitControls(init_cp);
+                    surf->apply(cloud_world, 50, 1, 1, 0.05);
+                    bspline_map.addSurface(surf, cloud_world);
+                    new_surfs.push_back(surf);
+                    n_added++;
+                }
+
+                // 保存本帧所有新增曲面的采样点（稀疏，每隔 SURF_SAMPLE_STEP 取一个点）
+                // 格式：surf_id x y z，每行一个点；文件：step_<N>_new_surfaces.txt
+                if (!new_surfs.empty()) {
+                    const int SURF_SAMPLE_STEP = 5;
+                    std::string surf_file = "/home/albus/slam-math/Bspline/build/new_surfaces.txt";
+                    std::ofstream sf(surf_file);
+                    if (sf.is_open()) {
+                        sf << std::fixed << std::setprecision(4);
+                        for (int si = 0; si < (int)new_surfs.size(); ++si) {
+                            const auto& samples = new_surfs[si]->getSamples();
+                            for (int k = 0; k < (int)samples.size(); k += SURF_SAMPLE_STEP) {
+                                sf 
+                                   << samples[k].x() << " "
+                                   << samples[k].y() << " "
+                                   << samples[k].z() << "\n";
+                            }
+                        }
+                        sf.close();
+                        std::cout << "  [MapUpdate] saved " << new_surfs.size()
+                                  << " surface sample files -> " << surf_file << std::endl;
+                    }
+                }
+
+                std::cout << "  [MapUpdate] step=" << g_data.step
+                          << " clusters=" << seg_upd.clusters.size()
+                          << " +surfaces=" << n_added
+                          << " total=" << bspline_map.size()
+                          << " (" << t_upd.toc() << " ms)" << std::endl;
+            }
+        }
 
         // 发布路径
         path_pub.publish(g_data.path);

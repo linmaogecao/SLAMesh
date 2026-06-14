@@ -17,6 +17,8 @@ struct QueueItem {
 void RangeImageProcessor::generateRangeImage(const pcl::PointCloud<pcl::PointXYZ> &cloud)
 {
     std::fill(range_image_.begin(), range_image_.end(), RangePixel());
+    std::fill(pixel_to_cloud_idx_.begin(), pixel_to_cloud_idx_.end(), -1);
+
     float fov_up_rad = FOV_UP * M_PI / 180.0f;
     float fov_down_rad = FOV_DOWN * M_PI / 180.0f;
     float fov_total_rad = std::abs(fov_up_rad - fov_down_rad);
@@ -44,19 +46,16 @@ void RangeImageProcessor::generateRangeImage(const pcl::PointCloud<pcl::PointXYZ
         if (row >= 0 && row < H_SCANS && col >= 0 && col < W_COLS) {
             int idx = row * W_COLS + col;
             RangePixel& px = range_image_[idx];
-            if (!px.valid || range < px.range)
-            {
+            if (!px.valid || range < px.range) {
                 px.x = pt.x;
                 px.y = pt.y;
                 px.z = pt.z;
                 px.range = range;
                 px.valid = true;
+                pixel_to_cloud_idx_[idx] = static_cast<int>(i);  // 记录胜出点的点云下标
             }
-
         }
-
     }
-
 }
 
 void RangeImageProcessor::saveRangeImageBin(const std::string& filename) {
@@ -257,6 +256,39 @@ void RangeImageProcessor::saveClustersToTxt(const SegmentationResult& result, co
     }
 
     //std::cout << "All clusters saved." << std::endl;
+}
+
+void RangeImageProcessor::saveClustersWorldToTxt(const SegmentationResult& result,
+                                                  const std::string& folder_path,
+                                                  const Eigen::Matrix4d& transform)
+{
+    if (result.clusters.empty()) {
+        std::cout << "--------------No clusters to save!" << std::endl;
+        return;
+    }
+
+    const Eigen::Matrix3d R = transform.block<3,3>(0,0);
+    const Eigen::Vector3d t = transform.block<3,1>(0,3);
+
+    for (size_t i = 0; i < result.clusters.size(); ++i) {
+        const auto& cluster_indices = result.clusters[i];
+
+        std::string filename = folder_path + "/cluster_" + std::to_string(i) + ".txt";
+        std::ofstream outfile(filename);
+        if (!outfile.is_open()) {
+            std::cerr << "Error: Could not open file " << filename << std::endl;
+            continue;
+        }
+        outfile << std::fixed << std::setprecision(4);
+
+        for (int idx : cluster_indices) {
+            const auto& px = range_image_[idx];
+            if (!px.valid) continue;
+            Eigen::Vector3d pw = R * Eigen::Vector3d(px.x, px.y, px.z) + t;
+            outfile << pw.x() << " " << pw.y() << " " << pw.z() << "\n";
+        }
+        outfile.close();
+    }
 }
 
 bool RangeImageProcessor::findValidNeighborPt(int u, int v, const Eigen::Vector3d& center_pt, Eigen::Vector3d &neighbor_pt, bool is_vertical, int dir) const {
