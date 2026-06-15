@@ -10,6 +10,7 @@
 #include "BSplineSDMErr.h"
 #include <sensor_msgs/point_cloud_conversion.h>
 #include <pcl/registration/icp.h>
+#include <unordered_set>
 class Parameter{
     //algorithm parameter
 public:
@@ -160,4 +161,49 @@ public:
     void pubTf();
     SLAMesher(ros::NodeHandle & nh_, Parameter & param_, Log & g_data_);
     void process();
+
+private:
+    struct GroundConstraint {
+        Eigen::Vector3d n_local = Eigen::Vector3d::UnitZ();
+        Eigen::Vector3d c_local = Eigen::Vector3d::Zero();
+        bool valid = false;
+    };
+
+    struct RegMatch {
+        Eigen::Vector3d p_local;
+        Eigen::Vector3d p_world;
+        SurfaceCurvature curvature;
+        int scan_idx = -1;
+    };
+
+    void processFirstFrame(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                           Transf& T_world,
+                           RangeImageProcessor& range_proc,
+                           BSplineMap& bspline_map,
+                           double& z_ground_ref,
+                           double ground_z_thr);
+
+    GroundConstraint computeGroundConstraint(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                                             double z_ground_ref,
+                                             double ground_z_thr) const;
+
+    Transf registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                             Transf T_guess,
+                             BSplineMap& bspline_map,
+                             const GroundConstraint& ground,
+                             double z_ground_ref,
+                             double ground_w_rp,
+                             double ground_w_z,
+                             int max_iters,
+                             double converge_thr,
+                             double match_dist_thr,
+                             int skip_points);
+
+    void runMapUpdate(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                      const Transf& T_world,
+                      RangeImageProcessor& range_proc,
+                      BSplineMap& bspline_map,
+                      double match_dist_thr);
+
+    void printMapSummary(const BSplineMap& bspline_map) const;
 };

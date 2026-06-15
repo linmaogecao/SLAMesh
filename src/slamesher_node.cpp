@@ -828,6 +828,349 @@ void SLAMesher::pubTf(){
     transform.setRotation(q);
     br.sendTransform(tf::StampedTransform(transform, odom_msg.header.stamp, "/map", "/slamesher_odom"));
 }
+
+// ========== process 子步骤 ==========
+
+void SLAMesher::processFirstFrame(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                                  Transf& T_world,
+                                  RangeImageProcessor& range_proc,
+                                  BSplineMap& bspline_map,
+                                  double& z_ground_ref,
+                                  double ground_z_thr)
+{
+    pcl::PointCloud<pcl::PointXYZ> scan_world;
+    pcl::transformPointCloud(scan_local, scan_world, T_world.cast<float>());
+
+    range_proc.generateRangeImage(scan_world);
+    SegmentationResult seg = range_proc.segmentRangeImage(5, 0.1, 30);
+    std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> clusters = range_proc.generateClusterClouds(seg);
+    range_proc.saveClustersToTxt(seg, "/home/albus/slam-math/Bspline/build/output_clusters");
+
+    for (int cid = 0; cid < (int)clusters.size(); cid++) {
+        if (!clusters[cid] || clusters[cid]->size() < 20) continue;
+
+        auto surf = std::make_shared<BSplineSurface>(3, 3, 10, 10, 0.25);
+        auto init_cp = range_proc.computeInitControlPoints(seg, cid, 10, 10, 2);
+        if (init_cp.empty()) continue;
+
+        surf->setExternalInitControls(init_cp);
+        surf->apply(clusters[cid], 50, 1, 1, 0.05);
+        bspline_map.addSurface(surf, clusters[cid]);
+    }
+
+    if (std::isnan(z_ground_ref)) {
+        double sum_z = 0.0;
+        int cnt = 0;
+        for (auto& pt : scan_local) {
+            if (pt.z < ground_z_thr) { sum_z += pt.z; cnt++; }
+        }
+        z_ground_ref = (cnt > 10) ? (sum_z / cnt) : -1.73;
+        std::cout << "  [Ground] z_ground_ref = " << z_ground_ref << " m" << std::endl;
+    }
+
+    g_data.updatePose(T_world);
+    pubTf();
+    path_pub.publish(g_data.path);
+}
+
+SLAMesher::GroundConstraint SLAMesher::computeGroundConstraint(
+    const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+    double z_ground_ref,
+    double ground_z_thr) const
+{
+    GroundConstraint gnd;
+    gnd.c_local = Eigen::Vector3d(0, 0, z_ground_ref);
+
+    if (std::isnan(z_ground_ref)) return gnd;
+
+    std::vector<Eigen::Vector3d> gpts;
+    gpts.reserve(2000);
+    for (size_t gi = 0; gi < scan_local.size(); gi += 2) {
+        if (scan_local[gi].z < ground_z_thr)
+            gpts.emplace_back(scan_local[gi].x, scan_local[gi].y, scan_local[gi].z);
+    }
+    if ((int)gpts.size() < 20) return gnd;
+
+    Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+    for (auto& p : gpts) centroid += p;
+    centroid /= (double)gpts.size();
+
+    Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+    for (auto& p : gpts) {
+        Eigen::Vector3d d = p - centroid;
+        cov += d * d.transpose();
+    }
+    cov /= (double)gpts.size();
+
+    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(cov);
+    Eigen::Vector3d n = eig.eigenvectors().col(0);
+    if (n.z() < 0) n = -n;
+
+    gnd.n_local = n;
+    gnd.c_local = centroid;
+    gnd.valid   = true;
+    return gnd;
+}
+
+Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                                    Transf T_guess,
+                                    BSplineMap& bspline_map,
+                                    const GroundConstraint& ground,
+                                    double z_ground_ref,
+                                    double ground_w_rp,
+                                    double ground_w_z,
+                                    int max_iters,
+                                    double converge_thr,
+                                    double match_dist_thr,
+                                    int skip_points)
+{
+    Transf T_curr = T_guess;
+    double delta_scale = 100.0;
+
+    for (int iter = 0; iter < max_iters && delta_scale > converge_thr; iter++) {
+        std::unordered_map<int, std::vector<int>> surf_to_pts;
+        for (int i = 0; i < (int)scan_local.size(); i += skip_points) {
+            Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
+                Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) +
+                T_curr.block<3,1>(0,3);
+            for (int sid : bspline_map.queryCandidates(p_w, 1))
+                surf_to_pts[sid].push_back(i);
+        }
+
+        std::vector<RegMatch> matches;
+        matches.reserve(scan_local.size() / skip_points);
+
+        for (auto& [sid, indices] : surf_to_pts) {
+            const BSplineMapEntry* entry = bspline_map.getEntry(sid);
+            if (!entry || !entry->surface) continue;
+            auto& surf = entry->surface;
+
+            const auto& knU = surf->getKnotsU();
+            const auto& knV = surf->getKnotsV();
+            const auto& cps = surf->getControls();
+            int num_cpv     = surf->getNumCpV();
+
+            std::vector<Eigen::Vector3d> pts_world;
+            pts_world.reserve(indices.size());
+            for (int idx : indices) {
+                pts_world.push_back(
+                    T_curr.block<3,3>(0,0) *
+                    Eigen::Vector3d(scan_local[idx].x, scan_local[idx].y, scan_local[idx].z) +
+                    T_curr.block<3,1>(0,3));
+            }
+
+            std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
+            std::vector<double> dists;
+            surf->findFootPrint(pts_world, footprints, dists);
+
+            for (int k = 0; k < (int)indices.size(); k++) {
+                double d = std::sqrt(std::abs(dists[k]));
+                if (d > match_dist_thr || d < 1e-6) continue;
+
+                auto [paraU, paraV] = footprints[k];
+                SurfaceCurvature curv = surf->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
+                if (curv.normal.norm() < 1e-9) continue;
+                curv.normal.normalize();
+
+                RegMatch m;
+                m.p_local   = Eigen::Vector3d(scan_local[indices[k]].x,
+                                              scan_local[indices[k]].y,
+                                              scan_local[indices[k]].z);
+                m.p_world   = pts_world[k];
+                m.curvature = curv;
+                m.scan_idx  = indices[k];
+                matches.push_back(m);
+            }
+        }
+
+        if ((int)matches.size() < 10) {
+            ROS_WARN("Registration iter %d: only %d matches, skip", iter, (int)matches.size());
+            break;
+        }
+
+        const int dump_step = 69;
+        if (iter == 0 && g_data.step == dump_step) {
+            const std::string base = "/home/albus/slam-math/Bspline/build/";
+
+            std::ofstream f_matched(base + "matched_points.txt");
+            f_matched << std::fixed << std::setprecision(4);
+            for (auto& m : matches)
+                f_matched << m.p_world.x() << " " << m.p_world.y() << " " << m.p_world.z() << "\n";
+            f_matched.close();
+
+            std::unordered_set<int> matched_set;
+            for (auto& m : matches) matched_set.insert(m.scan_idx);
+
+            std::ofstream f_unmatched(base + "unmatched_points.txt");
+            f_unmatched << std::fixed << std::setprecision(4);
+            for (int i = 0; i < (int)scan_local.size(); i += skip_points) {
+                if (matched_set.count(i)) continue;
+                Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
+                    Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) +
+                    T_curr.block<3,1>(0,3);
+                f_unmatched << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+            }
+            f_unmatched.close();
+
+            std::cout << "  [DEBUG] step=" << dump_step
+                      << " matched=" << matches.size()
+                      << " unmatched=" << (scan_local.size()/skip_points - matched_set.size())
+                      << " -> " << base << "\n";
+        }
+
+        Eigen::Quaterniond q_init(T_curr.block<3,3>(0,0));
+        double parameters[7];
+        parameters[0] = q_init.x();
+        parameters[1] = q_init.y();
+        parameters[2] = q_init.z();
+        parameters[3] = q_init.w();
+        parameters[4] = T_curr(0, 3);
+        parameters[5] = T_curr(1, 3);
+        parameters[6] = T_curr(2, 3);
+
+        ceres::LossFunction* loss = new ceres::HuberLoss(0.5);
+        ceres::Problem problem;
+        problem.AddParameterBlock(parameters, 7, new PoseSE3Parameterization());
+
+        for (auto& m : matches) {
+            ceres::CostFunction* cost = new SDMRegistrationCostFunction(
+                m.p_local, m.p_world, m.curvature);
+            problem.AddResidualBlock(cost, loss, parameters);
+        }
+
+        if (ground.valid) {
+            ceres::CostFunction* gnd_cost = new GroundPlaneConstraint(
+                ground.n_local, ground.c_local, z_ground_ref,
+                ground_w_rp, ground_w_z);
+            problem.AddResidualBlock(gnd_cost, nullptr, parameters);
+        }
+
+        ceres::Solver::Options opts;
+        opts.linear_solver_type = ceres::DENSE_QR;
+        opts.max_num_iterations = 10;
+        opts.minimizer_progress_to_stdout = false;
+        opts.num_threads = 4;
+        ceres::Solver::Summary summary;
+        ceres::Solve(opts, &problem, &summary);
+
+        Eigen::Map<Eigen::Quaterniond> q_opt(parameters);
+        Eigen::Map<Eigen::Vector3d> t_opt(parameters + 4);
+        Transf T_new = Eigen::Matrix4d::Identity();
+        T_new.block<3,3>(0,0) = q_opt.normalized().toRotationMatrix();
+        T_new.block<3,1>(0,3) = t_opt;
+
+        delta_scale = (T_new.block<3,1>(0,3) - T_curr.block<3,1>(0,3)).norm()
+                    + 5.0 * (T_new.block<3,3>(0,0) - T_curr.block<3,3>(0,0)).norm();
+        T_curr = T_new;
+
+        std::cout << "  iter " << iter << ": matches=" << matches.size()
+                  << " delta=" << delta_scale << std::endl;
+    }
+    return T_curr;
+}
+
+void SLAMesher::runMapUpdate(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                             const Transf& T_world,
+                             RangeImageProcessor& range_proc,
+                             BSplineMap& bspline_map,
+                             double match_dist_thr)
+{
+    const int UPDATE_INTERVAL  = 20;
+    const int MIN_CLUSTER_PTS  = 30;
+    const int MAX_NEW_SURFACES = 100;
+
+    if (g_data.step % UPDATE_INTERVAL != 0) return;
+
+    TicToc t_upd;
+    range_proc.generateRangeImage(scan_local);
+    SegmentationResult seg_upd = range_proc.segmentRangeImage(5, 0.1, MIN_CLUSTER_PTS);
+
+    const Eigen::Matrix3d R_w = T_world.block<3,3>(0,0);
+    const Eigen::Vector3d t_w = T_world.block<3,1>(0,3);
+
+    int n_added = 0;
+    for (int cid = 0; cid < (int)seg_upd.clusters.size() && n_added < MAX_NEW_SURFACES; cid++) {
+        const auto& pixels = seg_upd.clusters[cid];
+        if ((int)pixels.size() < MIN_CLUSTER_PTS) continue;
+
+        std::unordered_map<int, std::vector<int>> surf_to_kidx;
+        std::vector<Eigen::Vector3d> pix_world(pixels.size(), Eigen::Vector3d::Zero());
+        std::vector<bool> pix_valid(pixels.size(), false);
+
+        for (int k = 0; k < (int)pixels.size(); ++k) {
+            const auto& px = range_proc.range_image_[pixels[k]];
+            if (!px.valid) continue;
+            Eigen::Vector3d pw = R_w * Eigen::Vector3d(px.x, px.y, px.z) + t_w;
+            pix_world[k] = pw;
+            pix_valid[k] = true;
+            for (int sid : bspline_map.queryCandidates(pw, 1))
+                surf_to_kidx[sid].push_back(k);
+        }
+
+        std::vector<bool> confirmed_matched(pixels.size(), false);
+        for (auto& [sid, kidxs] : surf_to_kidx) {
+            const BSplineMapEntry* entry = bspline_map.getEntry(sid);
+            if (!entry || !entry->surface) continue;
+
+            std::vector<Eigen::Vector3d> batch;
+            batch.reserve(kidxs.size());
+            for (int k : kidxs) batch.push_back(pix_world[k]);
+
+            std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> fps;
+            std::vector<double> dists;
+            entry->surface->findFootPrint(batch, fps, dists);
+
+            for (int i = 0; i < (int)kidxs.size(); ++i) {
+                double d = std::sqrt(std::abs(dists[i]));
+                if (d > 1e-6 && d <= match_dist_thr)
+                    confirmed_matched[kidxs[i]] = true;
+            }
+        }
+
+        auto cloud_local = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+        cloud_local->reserve(pixels.size());
+        for (int k = 0; k < (int)pixels.size(); ++k) {
+            if (!pix_valid[k] || confirmed_matched[k]) continue;
+            const auto& px = range_proc.range_image_[pixels[k]];
+            cloud_local->push_back(pcl::PointXYZ(px.x, px.y, px.z));
+        }
+        if ((int)cloud_local->size() < MIN_CLUSTER_PTS) continue;
+
+        auto cloud_world = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+        pcl::transformPointCloud(*cloud_local, *cloud_world, T_world.cast<float>());
+
+        auto init_cp = range_proc.computeInitControlPoints(seg_upd, cid, 10, 10, 2);
+        if (init_cp.empty()) continue;
+        for (auto& cp : init_cp) cp = R_w * cp + t_w;
+
+        auto surf = std::make_shared<BSplineSurface>(3, 3, 10, 10, 0.25);
+        surf->setExternalInitControls(init_cp);
+        surf->apply(cloud_world, 50, 1, 1, 0.05);
+        bspline_map.addSurface(surf, cloud_world);
+        n_added++;
+    }
+
+    std::cout << "  [MapUpdate] step=" << g_data.step
+              << " clusters=" << seg_upd.clusters.size()
+              << " +surfaces=" << n_added
+              << " total=" << bspline_map.size()
+              << " (" << t_upd.toc() << " ms)" << std::endl;
+}
+
+void SLAMesher::printMapSummary(const BSplineMap& bspline_map) const
+{
+    int total_surfaces = bspline_map.size();
+    int total_control_points = 0;
+    for (int sid = 0; sid < total_surfaces; ++sid) {
+        const BSplineMapEntry* e = bspline_map.getEntry(sid);
+        if (e && e->surface)
+            total_control_points += (int)e->surface->getControls().size();
+    }
+    std::cout << "Map summary: "
+              << total_surfaces << " surfaces, "
+              << total_control_points << " control points total" << std::endl;
+}
+
 void SLAMesher::process(){
     TicToc t_whole;
 
@@ -861,7 +1204,6 @@ void SLAMesher::process(){
         g_data.extendLog();
         TicToc t_step;
 
-        // ========== 1. 获取当前帧点云 (雷达局部坐标系) ==========
         pcl::PointCloud<pcl::PointXYZ> scan_local;
         if(!range_proc.getPointCloud(scan_local, 0)){
             std::cout << "No more point cloud, exit." << std::endl;
@@ -869,270 +1211,20 @@ void SLAMesher::process(){
         }
         std::cout << "===STEP " << g_data.step << "=== points: " << scan_local.size() << std::endl;
 
-        // ========== 2. 第一帧：全量建图 ==========
         if(g_data.step == 1){
-            TicToc t_mapping;
-            // 第一帧用初始位姿变换到世界系
-            pcl::PointCloud<pcl::PointXYZ> scan_world;
-            pcl::transformPointCloud(scan_local, scan_world, T_world.cast<float>());
-
-            // range image 分割聚类
-            range_proc.generateRangeImage(scan_world);
-            SegmentationResult seg = range_proc.segmentRangeImage(5, 0.1, 30);
-            std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> clusters = range_proc.generateClusterClouds(seg);
-            range_proc.saveClustersToTxt(seg, "/home/albus/slam-math/Bspline/build/output_clusters");
-            // 对每个聚类拟合 B-spline 并注册到地图
-            int num_fitted = 0;
-            for(int cid = 0; cid < (int)clusters.size(); cid++){
-                if(!clusters[cid] || clusters[cid]->size() < 20) continue;
-
-                auto surf = std::make_shared<BSplineSurface>(3, 3, 10, 10, 0.25);
-                auto init_cp = range_proc.computeInitControlPoints(seg, cid, 10, 10, 2);
-                if(init_cp.empty()) continue;
-
-                surf->setExternalInitControls(init_cp);
-                surf->apply(clusters[cid], 50, 1, 1, 0.05);
-                bspline_map.addSurface(surf, clusters[cid]);
-                num_fitted++;
-            }
-            // std::cout << "  First frame mapping: " << num_fitted << " surfaces, "
-            //           << t_mapping.toc() << " ms" << std::endl;
-
-            // 第一帧：从传感器系地面点计算世界系地面参考高度
-            // 第一帧 T_world = identity，所以世界系 z = 传感器系 z
-            if (std::isnan(z_ground_ref)) {
-                double sum_z = 0.0; int cnt = 0;
-                for (auto& pt : scan_local) {
-                    if (pt.z < ground_z_thr) { sum_z += pt.z; cnt++; }
-                }
-                z_ground_ref = (cnt > 10) ? (sum_z / cnt) : -1.73;
-                std::cout << "  [Ground] z_ground_ref = " << z_ground_ref << " m" << std::endl;
-            }
-
-            // 第一帧记录位姿即可，无需配准
-            g_data.updatePose(T_world);
-            pubTf();
-            path_pub.publish(g_data.path);
+            processFirstFrame(scan_local, T_world, range_proc, bspline_map,
+                              z_ground_ref, ground_z_thr);
             continue;
         }
-        // ========== 3. 后续帧：scan-to-map 配准 ==========
+
         TicToc t_register;
-
-        // 初始位姿猜测：恒速模型
         Transf T_guess = getOdom();
+        GroundConstraint ground = computeGroundConstraint(scan_local, z_ground_ref, ground_z_thr);
 
-        // ========== 地面约束预计算（传感器系，与 T_curr 无关，只需做一次）==========
-        Eigen::Vector3d ground_n_local  = Eigen::Vector3d::UnitZ();  // 默认值
-        Eigen::Vector3d ground_c_local  = Eigen::Vector3d(0, 0, z_ground_ref);
-        bool ground_valid = false;
+        T_world = registerScanToMap(scan_local, T_guess, bspline_map, ground,
+                                    z_ground_ref, ground_w_rp, ground_w_z,
+                                    max_rg_iters, converge_thr, match_dist_thr, skip_points);
 
-        if (!std::isnan(z_ground_ref)) {
-            std::vector<Eigen::Vector3d> gpts;
-            gpts.reserve(2000);
-            for (size_t gi = 0; gi < scan_local.size(); gi += 2) {
-                if (scan_local[gi].z < ground_z_thr)
-                    gpts.emplace_back(scan_local[gi].x, scan_local[gi].y, scan_local[gi].z);
-            }
-            if ((int)gpts.size() >= 20) {
-                // 质心
-                Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
-                for (auto& p : gpts) centroid += p;
-                centroid /= (double)gpts.size();
-
-                // PCA 协方差矩阵 → 最小特征向量 = 法向
-                Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-                for (auto& p : gpts) {
-                    Eigen::Vector3d d = p - centroid;
-                    cov += d * d.transpose();
-                }
-                cov /= (double)gpts.size();
-
-                Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(cov);
-                Eigen::Vector3d n = eig.eigenvectors().col(0);  // 最小特征值对应法向
-                if (n.z() < 0) n = -n;  // 确保指向上方
-
-                ground_n_local = n;
-                ground_c_local = centroid;
-                ground_valid   = true;
-            }
-        }
-
-        // 迭代配准
-        Transf T_curr = T_guess;
-        double delta_scale = 100.0;
-        // 记录最后一次 iter 中成功匹配的点云下标（供步骤 4 地图更新使用）
-        std::unordered_set<int> last_matched_indices;
-
-        for(int iter = 0; iter < max_rg_iters && delta_scale > converge_thr; iter++){
-
-            // --- 3a. 建立点到曲面对应关系 ---
-            // 按候选曲面分桶: surface_id -> 该曲面对应的局部点索引列表
-            std::unordered_map<int, std::vector<int>> surf_to_pts;
-            for(int i = 0; i < (int)scan_local.size(); i += skip_points){
-                Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
-                    Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) +
-                    T_curr.block<3,1>(0,3);
-                auto candidates = bspline_map.queryCandidates(p_w, 1);
-                for(int sid : candidates){
-                    surf_to_pts[sid].push_back(i);
-                }
-            }
-
-            // --- 3b. 批量求 foot point，构建匹配 (p_local, p_world, SurfaceCurvature) ---
-            struct Match {
-                Eigen::Vector3d p_local;    // 雷达系下的点 (用于 Ceres 优化)
-                Eigen::Vector3d p_world;    // 当前 T_curr 下的世界系坐标 (用于 dist 预计算)
-                SurfaceCurvature curvature; // 曲面最近点处的完整几何信息
-                int scan_idx = -1;          // scan_local 中的原始索引 (用于诊断)
-            };
-            std::vector<Match> matches;
-            matches.reserve(scan_local.size() / skip_points);
-
-            for(auto& [sid, indices] : surf_to_pts){
-                const BSplineMapEntry* entry = bspline_map.getEntry(sid);
-                if(!entry || !entry->surface) continue;
-                auto& surf = entry->surface;
-
-                const auto& knU = surf->getKnotsU();
-                const auto& knV = surf->getKnotsV();
-                const auto& cps = surf->getControls();
-                int num_cpv     = surf->getNumCpV();
-
-                // 收集世界系下的点
-                std::vector<Eigen::Vector3d> pts_world;
-                pts_world.reserve(indices.size());
-                for(int idx : indices){
-                    Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
-                        Eigen::Vector3d(scan_local[idx].x, scan_local[idx].y, scan_local[idx].z) +
-                        T_curr.block<3,1>(0,3);
-                    pts_world.push_back(p_w);
-                }
-
-                // 批量查 foot point
-                std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
-                std::vector<double> dists;
-                surf->findFootPrint(pts_world, footprints, dists);
-
-                // 过滤并收集有效匹配
-                for(int k = 0; k < (int)indices.size(); k++){
-                    double d = std::sqrt(std::abs(dists[k]));
-                    if(d > match_dist_thr || d < 1e-6) continue;
-
-                    auto [paraU, paraV] = footprints[k];
-                    SurfaceCurvature curv = surf->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
-                    if(curv.normal.norm() < 1e-9) continue;
-                    curv.normal.normalize();
-
-                    Match m;
-                    m.p_local   = Eigen::Vector3d(scan_local[indices[k]].x,
-                                                  scan_local[indices[k]].y,
-                                                  scan_local[indices[k]].z);
-                    m.p_world   = pts_world[k];
-                    m.curvature = curv;
-                    m.scan_idx  = indices[k];
-                    matches.push_back(m);
-                }
-            }
-
-            if((int)matches.size() < 10){
-                ROS_WARN("Registration iter %d: only %d matches, skip", iter, (int)matches.size());
-                break;
-            }
-
-            // --- 匹配结果诊断：写 matched / unmatched 两个点云文件 (世界系 xyz) ---
-            // 修改 dump_step 为你想观测的帧号
-            const int dump_step = 69;
-            if(iter == 0 && g_data.step == dump_step){
-                const std::string base = "/home/albus/slam-math/Bspline/build/";
-
-                // 1. matched_points.txt: 成功匹配的原始点 (世界系)
-                std::ofstream f_matched(base + "matched_points.txt");
-                f_matched << std::fixed << std::setprecision(4);
-                for(auto& m : matches){
-                    f_matched << m.p_world.x() << " " << m.p_world.y() << " " << m.p_world.z() << "\n";
-                }
-                f_matched.close();
-
-                // 2. unmatched_points.txt: 没有匹配上的点 (世界系)
-                //    = 全部采样点中不在 matched scan_idx 集合里的点
-                std::unordered_set<int> matched_set;
-                for(auto& m : matches) matched_set.insert(m.scan_idx);
-
-                std::ofstream f_unmatched(base + "unmatched_points.txt");
-                f_unmatched << std::fixed << std::setprecision(4);
-                for(int i = 0; i < (int)scan_local.size(); i += skip_points){
-                    if(matched_set.count(i)) continue;
-                    Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
-                        Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) +
-                        T_curr.block<3,1>(0,3);
-                    f_unmatched << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
-                }
-                f_unmatched.close();
-
-                std::cout << "  [DEBUG] step=" << dump_step
-                          << " matched=" << matches.size()
-                          << " unmatched=" << (scan_local.size()/skip_points - matched_set.size())
-                          << " -> " << base << "\n";
-            }
-
-            // --- 3c. Ceres 优化当前位姿 (曲率加权 SDM 残差) ---
-            // 参数布局: [qx, qy, qz, qw, tx, ty, tz]
-            Eigen::Quaterniond q_init(T_curr.block<3,3>(0,0));
-            double parameters[7];
-            parameters[0] = q_init.x();
-            parameters[1] = q_init.y();
-            parameters[2] = q_init.z();
-            parameters[3] = q_init.w();
-            parameters[4] = T_curr(0, 3);
-            parameters[5] = T_curr(1, 3);
-            parameters[6] = T_curr(2, 3);
-
-            ceres::LossFunction* loss = new ceres::HuberLoss(0.5);
-            ceres::Problem problem;
-            problem.AddParameterBlock(parameters, 7, new PoseSE3Parameterization());
-
-            for(auto& m : matches){
-                ceres::CostFunction* cost = new SDMRegistrationCostFunction(
-                    m.p_local, m.p_world, m.curvature);
-                problem.AddResidualBlock(cost, loss, parameters);
-            }
-
-            // --- 地面约束 (roll/pitch/height) ---
-            if (ground_valid) {
-                ceres::CostFunction* gnd_cost = new GroundPlaneConstraint(
-                    ground_n_local, ground_c_local, z_ground_ref,
-                    ground_w_rp, ground_w_z);
-                problem.AddResidualBlock(gnd_cost, nullptr, parameters);
-            }
-
-            ceres::Solver::Options opts;
-            opts.linear_solver_type = ceres::DENSE_QR;
-            opts.max_num_iterations = 10;
-            opts.minimizer_progress_to_stdout = false;
-            opts.num_threads = 4;
-            ceres::Solver::Summary summary;
-            ceres::Solve(opts, &problem, &summary);
-            // 从优化结果提取新位姿
-            Eigen::Map<Eigen::Quaterniond> q_opt(parameters);
-            Eigen::Map<Eigen::Vector3d> t_opt(parameters + 4);
-            Transf T_new = Eigen::Matrix4d::Identity();
-            T_new.block<3,3>(0,0) = q_opt.normalized().toRotationMatrix();
-            T_new.block<3,1>(0,3) = t_opt;
-
-            // 收敛判据：本次迭代位姿变化量
-            delta_scale = (T_new.block<3,1>(0,3) - T_curr.block<3,1>(0,3)).norm()
-                        + 5.0 * (T_new.block<3,3>(0,0) - T_curr.block<3,3>(0,0)).norm();
-            T_curr = T_new; 
-            std::cout << "  iter " << iter << ": matches=" << matches.size()
-                      << " delta=" << delta_scale << std::endl;
-
-            // 保留本次 iter 的匹配下标（每次 iter 都覆盖，最终保留最后一次）
-            last_matched_indices.clear();
-            for (auto& m : matches) last_matched_indices.insert(m.scan_idx);
-        }
-
-        // 保存位姿
-        T_world = T_curr;
         g_data.updatePose(T_world);
         pubTf();
 
@@ -1146,159 +1238,15 @@ void SLAMesher::process(){
             traj_file.flush();
         }
 
-        // ========== 4. 地图更新：基于未匹配点的新区域扩充 ==========
-        // 策略：配准结束后，对当前帧做分割；统计每个 cluster 中有多少点没有参与匹配；
-        //       未匹配比例高的 cluster 说明是新区域，对其拟合新曲面加入地图。
-        //
-        // UPDATE_INTERVAL: 每隔多少帧触发一次地图更新（1 = 每帧，20 = 每20帧）
-        // ---------------------------------------------------------
-        {
-            const int UPDATE_INTERVAL    = 20;   // 每20帧更新一次
-            const int MIN_CLUSTER_PTS    = 30;   // 太小的 cluster 跳过
-            const int MAX_NEW_SURFACES   = 100;  // 每次最多新增曲面数
-            // 保存路径（须已存在）
-            const std::string SAVE_DIR = "/home/albus/slam-math/Bspline/build/output_voxels";
+        runMapUpdate(scan_local, T_world, range_proc, bspline_map, match_dist_thr);
 
-            bool do_update = (g_data.step % UPDATE_INTERVAL == 0);
-            if (do_update) {
-                TicToc t_upd;
-                range_proc.generateRangeImage(scan_local);
-                SegmentationResult seg_upd = range_proc.segmentRangeImage(5, 0.1, MIN_CLUSTER_PTS);
-
-                // 准备局部系→世界系的变换矩阵
-                const Eigen::Matrix3d R_w = T_world.block<3,3>(0,0);
-                const Eigen::Vector3d t_w = T_world.block<3,1>(0,3);
-
-                // 保存所有聚类（世界坐标系），文件名格式：cluster_world_<id>.txt
-                //range_proc.saveClustersWorldToTxt(seg_upd, SAVE_DIR, T_world);
-
-                int n_added = 0;
-                std::vector<std::shared_ptr<BSplineSurface>> new_surfs;
-
-                for (int cid = 0; cid < (int)seg_upd.clusters.size() && n_added < MAX_NEW_SURFACES; cid++) {
-                    const auto& pixels = seg_upd.clusters[cid];
-                    if ((int)pixels.size() < MIN_CLUSTER_PTS) continue;
-
-                    // ------------------------------------------------------------------
-                    // 对 cluster 每个像素逐一查地图，与 ICP 相同的 queryCandidates +
-                    // findFootPrint 判断该点是否已被现有曲面覆盖。
-                    // 按候选曲面分桶后批量调用 findFootPrint，避免逐点调用的开销。
-                    // ------------------------------------------------------------------
-
-                    // step1: 每个像素变换到世界系，同时按候选曲面分桶
-                    std::unordered_map<int, std::vector<int>> surf_to_kidx; // surf_id → 在 pixels 中的下标
-                    std::vector<Eigen::Vector3d> pix_world(pixels.size(), Eigen::Vector3d::Zero());
-                    std::vector<bool> pix_valid(pixels.size(), false);
-
-                    for (int k = 0; k < (int)pixels.size(); ++k) {
-                        const auto& px = range_proc.range_image_[pixels[k]];
-                        if (!px.valid) continue;
-                        Eigen::Vector3d pw = R_w * Eigen::Vector3d(px.x, px.y, px.z) + t_w;
-                        pix_world[k] = pw;
-                        pix_valid[k] = true;
-                        for (int sid : bspline_map.queryCandidates(pw, 1))
-                            surf_to_kidx[sid].push_back(k);
-                    }
-
-                    // step2: 对每个候选曲面批量 findFootPrint，标记已匹配像素
-                    std::vector<bool> confirmed_matched(pixels.size(), false);
-                    for (auto& [sid, kidxs] : surf_to_kidx) {
-                        const BSplineMapEntry* entry = bspline_map.getEntry(sid);
-                        if (!entry || !entry->surface) continue;
-
-                        std::vector<Eigen::Vector3d> batch;
-                        batch.reserve(kidxs.size());
-                        for (int k : kidxs) batch.push_back(pix_world[k]);
-
-                        std::vector<std::pair<BSplineSurface::Parameter,
-                                              BSplineSurface::Parameter>> fps;
-                        std::vector<double> dists;
-                        entry->surface->findFootPrint(batch, fps, dists);
-
-                        for (int i = 0; i < (int)kidxs.size(); ++i) {
-                            double d = std::sqrt(std::abs(dists[i]));
-                            if (d > 1e-6 && d <= match_dist_thr)
-                                confirmed_matched[kidxs[i]] = true;
-                        }
-                    }
-
-                    // step3: 剩余未匹配像素构成候选点云（局部系）
-                    auto cloud_local = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-                    cloud_local->reserve(pixels.size());
-                    for (int k = 0; k < (int)pixels.size(); ++k) {
-                        if (!pix_valid[k] || confirmed_matched[k]) continue;
-                        const auto& px = range_proc.range_image_[pixels[k]];
-                        cloud_local->push_back(pcl::PointXYZ(px.x, px.y, px.z));
-                    }
-                    if ((int)cloud_local->size() < MIN_CLUSTER_PTS) continue;
-
-                    // step4: 变换到世界系，拟合新曲面
-                    auto cloud_world = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-                    pcl::transformPointCloud(*cloud_local, *cloud_world, T_world.cast<float>());
-
-                    // 初始控制点从整个 cluster 算（覆盖范围更完整，仅作初始化）
-                    auto init_cp = range_proc.computeInitControlPoints(seg_upd, cid, 10, 10, 2);
-                    if (init_cp.empty()) continue;
-                    for (auto& cp : init_cp) cp = R_w * cp + t_w;
-
-                    auto surf = std::make_shared<BSplineSurface>(3, 3, 10, 10, 0.25);
-                    surf->setExternalInitControls(init_cp);
-                    surf->apply(cloud_world, 50, 1, 1, 0.05);
-                    bspline_map.addSurface(surf, cloud_world);
-                    new_surfs.push_back(surf);
-                    n_added++;
-                }
-
-                // 保存本帧所有新增曲面的采样点（稀疏，每隔 SURF_SAMPLE_STEP 取一个点）
-                // 格式：surf_id x y z，每行一个点；文件：step_<N>_new_surfaces.txt
-                // if (!new_surfs.empty()) {
-                //     const int SURF_SAMPLE_STEP = 5;
-                //     std::string surf_file = "/home/albus/slam-math/Bspline/build/new_surfaces.txt";
-                //     std::ofstream sf(surf_file);
-                //     if (sf.is_open()) {
-                //         sf << std::fixed << std::setprecision(4);
-                //         for (int si = 0; si < (int)new_surfs.size(); ++si) {
-                //             const auto& samples = new_surfs[si]->getSamples();
-                //             for (int k = 0; k < (int)samples.size(); k += SURF_SAMPLE_STEP) {
-                //                 sf 
-                //                    << samples[k].x() << " "
-                //                    << samples[k].y() << " "
-                //                    << samples[k].z() << "\n";
-                //             }
-                //         }
-                //         sf.close();
-                //         std::cout << "  [MapUpdate] saved " << new_surfs.size()
-                //                   << " surface sample files -> " << surf_file << std::endl;
-                //     }
-                // }
-
-                std::cout << "  [MapUpdate] step=" << g_data.step
-                          << " clusters=" << seg_upd.clusters.size()
-                          << " +surfaces=" << n_added
-                          << " total=" << bspline_map.size()
-                          << " (" << t_upd.toc() << " ms)" << std::endl;
-            }
-        }
-
-        // 发布路径
         path_pub.publish(g_data.path);
-
         std::cout << "===STEP " << g_data.step << "=== Total: " << t_step.toc() << " ms===" << std::endl;
     }
 
     std::cout << "Process finished. Total time: " << t_whole.toc() / 1000.0 << " s" << std::endl;
 
-    int total_surfaces = bspline_map.size();
-    int total_control_points = 0;
-    for (int sid = 0; sid < total_surfaces; ++sid) {
-        const BSplineMapEntry* e = bspline_map.getEntry(sid);
-        if (e && e->surface)
-            total_control_points += (int)e->surface->getControls().size();
-    }
-    std::cout << "Map summary: "
-              << total_surfaces << " surfaces, "
-              << total_control_points << " control points total" << std::endl;
-    // 保存 KITTI 格式轨迹文件（**_pred.txt），供 KITTI 评测工具使用
+    printMapSummary(bspline_map);
     g_data.savePath2TxtKitti(g_data.file_loc_path_wrt, g_data.path);
     g_data.file_loc_path_wrt.close();
     std::cout << "KITTI trajectory saved." << std::endl;
