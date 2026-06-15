@@ -843,7 +843,7 @@ void SLAMesher::process(){
     const int    max_rg_iters   = param.register_times;  // 外层迭代次数
     const double converge_thr   = param.converge_thr;
     const double match_dist_thr = 0.5;  // 点到曲面最大容许距离 (m)
-    const int    skip_points    = 3;    // 每隔几个点取一个用于配准 (降低计算量)
+    const int    skip_points    = 10;    // 每隔几个点取一个用于配准 (降低计算量)
     static std::ofstream traj_file;
     if (!traj_file.is_open()) {
         traj_file.open("/tmp/bspline_traj_xyz.txt", std::ios::out | std::ios::trunc);
@@ -1122,8 +1122,7 @@ void SLAMesher::process(){
             // 收敛判据：本次迭代位姿变化量
             delta_scale = (T_new.block<3,1>(0,3) - T_curr.block<3,1>(0,3)).norm()
                         + 5.0 * (T_new.block<3,3>(0,0) - T_curr.block<3,3>(0,0)).norm();
-            T_curr = T_new;
-
+            T_curr = T_new; 
             std::cout << "  iter " << iter << ": matches=" << matches.size()
                       << " delta=" << delta_scale << std::endl;
 
@@ -1288,6 +1287,21 @@ void SLAMesher::process(){
     }
 
     std::cout << "Process finished. Total time: " << t_whole.toc() / 1000.0 << " s" << std::endl;
+
+    int total_surfaces = bspline_map.size();
+    int total_control_points = 0;
+    for (int sid = 0; sid < total_surfaces; ++sid) {
+        const BSplineMapEntry* e = bspline_map.getEntry(sid);
+        if (e && e->surface)
+            total_control_points += (int)e->surface->getControls().size();
+    }
+    std::cout << "Map summary: "
+              << total_surfaces << " surfaces, "
+              << total_control_points << " control points total" << std::endl;
+    // 保存 KITTI 格式轨迹文件（**_pred.txt），供 KITTI 评测工具使用
+    g_data.savePath2TxtKitti(g_data.file_loc_path_wrt, g_data.path);
+    g_data.file_loc_path_wrt.close();
+    std::cout << "KITTI trajectory saved." << std::endl;
 }
 SLAMesher::SLAMesher(ros::NodeHandle & nh_, Parameter & param_, Log & g_data_) : nh (nh_), param(param_), g_data(g_data_){
     odom_pub          = nh.advertise<nav_msgs::Odometry>("/lidar_odometry", 1);
