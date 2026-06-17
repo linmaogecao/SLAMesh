@@ -7,11 +7,16 @@ slamesher:
   read_offline_pcd: true 
   dataset: 1
   max_steps: 10000
+  max_frames: 201          # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
+  dump_frame: 200          # 0=不保存；>0 时在该帧配准结束后保存世界系点云+匹配/未匹配点
+  save_surface_samples: true  # true 时在 global_map/ 下按序号保存曲面稀疏采样点
   save_mesh_map: false
   #register param
   range_max: 100
   range_min: 1.2
   register_times: 2
+  ground_w_rp: 3.0    # 地面 roll/pitch 约束权重（Ceres GroundPlaneConstraint）
+  ground_w_z:  3.0    # 地面高度约束权重
   cross_overlap: true
   cross_cell_overlap_length: 1
   num_margin_old_cell: 500

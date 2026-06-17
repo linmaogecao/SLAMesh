@@ -67,6 +67,9 @@ POSSIBILITY OF SUCH DAMAGE.
     */
 
 # include "slamesher_node.h"
+#include <filesystem>
+#include <fstream>
+#include <iomanip>
 Parameter param;//parameters
 Log g_data;//global variables
 
@@ -493,15 +496,23 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/dataset", dataset, 6);
     nh.param("slamesher/seq", seq, std::string(""));
     nh.param("slamesher/max_steps", max_steps, 1);
+    nh.param("slamesher/max_frames", max_frames, 0);
+    nh.param("slamesher/dump_frame", dump_frame, 0);
     std::cout<<"max_steps: "<<max_steps<<std::endl;
+    std::cout<<"max_frames: "<<max_frames<<(max_frames > 0 ? " (debug stop)" : " (run full sequence)")<<std::endl;
+    std::cout<<"dump_frame: "<<dump_frame<<(dump_frame > 0 ? " (save debug point clouds)" : " (off)")<<std::endl;
+    std::cout<<"ground_w_rp: "<<ground_w_rp<<"  ground_w_z: "<<ground_w_z<<std::endl;
     nh.param("slamesher/file_loc_report", file_loc_report, std::string("not_set"));
     nh.param("slamesher/save_mesh_map", save_mesh_map, false);
+    nh.param("slamesher/save_surface_samples", save_surface_samples, false);
 
     //<!--  register param  -->-
     nh.param("slamesher/range_max",  range_max,  100.0);
     nh.param("slamesher/range_min",  range_min,  1.0);
     nh.param("slamesher/range_unit", range_unit, 1.0);
     nh.param("slamesher/register_times", register_times, 5);
+    nh.param("slamesher/ground_w_rp", ground_w_rp, 0.0);
+    nh.param("slamesher/ground_w_z",  ground_w_z,  0.0);
     nh.param("slamesher/cross_overlap", cross_overlap, false);
     nh.param("slamesher/cross_cell_overlap_length", cross_cell_overlap_length, 0);
     nh.param("slamesher/num_margin_old_cell", num_margin_old_cell, -1);
@@ -831,6 +842,30 @@ void SLAMesher::pubTf(){
 
 // ========== process 子步骤 ==========
 
+int SLAMesher::chooseControlGridSize(int num_fitting_points)
+{
+    constexpr int kMinCp = 4;
+    constexpr int kMaxCp = 15;
+
+    int n;
+    if (num_fitting_points < 50)
+        n = 4;
+    else if (num_fitting_points < 100)
+        n = 5;
+    else if (num_fitting_points < 150)
+        n = 6;
+    else if (num_fitting_points < 250)
+        n = 8;
+    else if (num_fitting_points < 400)
+        n = 10;
+    else if (num_fitting_points < 700)
+        n = 12;
+    else
+        n = 15;
+
+    return std::max(kMinCp, std::min(n, kMaxCp));
+}
+
 void SLAMesher::processFirstFrame(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                                   Transf& T_world,
                                   RangeImageProcessor& range_proc,
@@ -849,9 +884,11 @@ void SLAMesher::processFirstFrame(const pcl::PointCloud<pcl::PointXYZ>& scan_loc
     for (int cid = 0; cid < (int)clusters.size(); cid++) {
         if (!clusters[cid] || clusters[cid]->size() < 20) continue;
 
-        auto surf = std::make_shared<BSplineSurface>(3, 3, 10, 10, 0.25);
-        auto init_cp = range_proc.computeInitControlPoints(seg, cid, 10, 10, 2);
+        const int num_cp = chooseControlGridSize((int)clusters[cid]->size());
+        auto init_cp = range_proc.computeInitControlPoints(seg, cid, num_cp, num_cp, 2);
         if (init_cp.empty()) continue;
+
+        auto surf = std::make_shared<BSplineSurface>(3, 3, num_cp, num_cp, 0.25);
 
         surf->setExternalInitControls(init_cp);
         surf->apply(clusters[cid], 50, 1, 1, 0.05);
@@ -922,14 +959,17 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                                     int max_iters,
                                     double converge_thr,
                                     double match_dist_thr,
-                                    int skip_points)
+                                    int skip_points,
+                                    double match_min_z)
 {
     Transf T_curr = T_guess;
     double delta_scale = 100.0;
+    std::vector<RegMatch> last_matches;
 
     for (int iter = 0; iter < max_iters && delta_scale > converge_thr; iter++) {
         std::unordered_map<int, std::vector<int>> surf_to_pts;
         for (int i = 0; i < (int)scan_local.size(); i += skip_points) {
+            if (scan_local[i].z < match_min_z) continue;
             Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
                 Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) +
                 T_curr.block<3,1>(0,3);
@@ -987,36 +1027,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             ROS_WARN("Registration iter %d: only %d matches, skip", iter, (int)matches.size());
             break;
         }
-
-        const int dump_step = 69;
-        if (iter == 0 && g_data.step == dump_step) {
-            const std::string base = "/home/albus/slam-math/Bspline/build/";
-
-            std::ofstream f_matched(base + "matched_points.txt");
-            f_matched << std::fixed << std::setprecision(4);
-            for (auto& m : matches)
-                f_matched << m.p_world.x() << " " << m.p_world.y() << " " << m.p_world.z() << "\n";
-            f_matched.close();
-
-            std::unordered_set<int> matched_set;
-            for (auto& m : matches) matched_set.insert(m.scan_idx);
-
-            std::ofstream f_unmatched(base + "unmatched_points.txt");
-            f_unmatched << std::fixed << std::setprecision(4);
-            for (int i = 0; i < (int)scan_local.size(); i += skip_points) {
-                if (matched_set.count(i)) continue;
-                Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
-                    Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) +
-                    T_curr.block<3,1>(0,3);
-                f_unmatched << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
-            }
-            f_unmatched.close();
-
-            std::cout << "  [DEBUG] step=" << dump_step
-                      << " matched=" << matches.size()
-                      << " unmatched=" << (scan_local.size()/skip_points - matched_set.size())
-                      << " -> " << base << "\n";
-        }
+        last_matches = matches;
 
         Eigen::Quaterniond q_init(T_curr.block<3,3>(0,0));
         double parameters[7];
@@ -1066,6 +1077,45 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         std::cout << "  iter " << iter << ": matches=" << matches.size()
                   << " delta=" << delta_scale << std::endl;
     }
+
+    if (param.dump_frame > 0 && g_data.step == param.dump_frame && !last_matches.empty()) {
+        const std::string base = "/home/albus/slam-math/Bspline/build/";
+        const std::string tag  = std::to_string(g_data.step);
+        const Eigen::Matrix3d R = T_curr.block<3, 3>(0, 0);
+        const Eigen::Vector3d t = T_curr.block<3, 1>(0, 3);
+
+        std::ofstream f_scan(base + tag + "_scan_world.txt", std::ios::out | std::ios::trunc);
+        f_scan << std::fixed << std::setprecision(6);
+        for (const auto& pt : scan_local.points) {
+            const Eigen::Vector3d p_w = R * Eigen::Vector3d(pt.x, pt.y, pt.z) + t;
+            f_scan << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+        }
+        f_scan.close();
+
+        std::ofstream f_matched(base + tag + "_matched.txt", std::ios::out | std::ios::trunc);
+        f_matched << std::fixed << std::setprecision(6);
+        for (const auto& m : last_matches)
+            f_matched << m.p_world.x() << " " << m.p_world.y() << " " << m.p_world.z() << "\n";
+        f_matched.close();
+
+        std::unordered_set<int> matched_set;
+        for (const auto& m : last_matches) matched_set.insert(m.scan_idx);
+
+        std::ofstream f_unmatched(base + tag + "_unmatched.txt", std::ios::out | std::ios::trunc);
+        f_unmatched << std::fixed << std::setprecision(6);
+        for (int i = 0; i < (int)scan_local.size(); i += skip_points) {
+            if (scan_local[i].z < match_min_z) continue;
+            if (matched_set.count(i)) continue;
+            const Eigen::Vector3d p_w = R * Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) + t;
+            f_unmatched << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+        }
+        f_unmatched.close();
+
+        std::cout << "  [Dump] frame=" << g_data.step
+                  << " matched=" << last_matches.size()
+                  << " unmatched=" << (scan_local.size() / skip_points - matched_set.size())
+                  << " -> " << base << tag << "_*.txt" << std::endl;
+    }
     return T_curr;
 }
 
@@ -1077,7 +1127,7 @@ void SLAMesher::runMapUpdate(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
 {
     const int UPDATE_INTERVAL  = 20;
     const int MIN_CLUSTER_PTS  = 30;
-    const int MAX_NEW_SURFACES = 100;
+    const int MAX_NEW_SURFACES = 70;
 
     if (g_data.step % UPDATE_INTERVAL != 0) return;
 
@@ -1136,14 +1186,16 @@ void SLAMesher::runMapUpdate(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
         }
         if ((int)cloud_local->size() < MIN_CLUSTER_PTS) continue;
 
+        const int num_cp = chooseControlGridSize((int)cloud_local->size());
+
         auto cloud_world = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
         pcl::transformPointCloud(*cloud_local, *cloud_world, T_world.cast<float>());
 
-        auto init_cp = range_proc.computeInitControlPoints(seg_upd, cid, 10, 10, 2);
+        auto init_cp = range_proc.computeInitControlPoints(seg_upd, cid, num_cp, num_cp, 2);
         if (init_cp.empty()) continue;
         for (auto& cp : init_cp) cp = R_w * cp + t_w;
 
-        auto surf = std::make_shared<BSplineSurface>(3, 3, 10, 10, 0.25);
+        auto surf = std::make_shared<BSplineSurface>(3, 3, num_cp, num_cp, 0.25);
         surf->setExternalInitControls(init_cp);
         surf->apply(cloud_world, 50, 1, 1, 0.05);
         bspline_map.addSurface(surf, cloud_world);
@@ -1171,6 +1223,88 @@ void SLAMesher::printMapSummary(const BSplineMap& bspline_map) const
               << total_control_points << " control points total" << std::endl;
 }
 
+void SLAMesher::saveControlPointsToTxt(const BSplineMap& bspline_map, bool save_surface_samples) const
+{
+    const std::string out_dir = "/home/albus/slam-math/Bspline/build/controls";
+    const std::string sample_dir = "/home/albus/slam-math/Bspline/build/global_map";
+    constexpr int kSampleGridU = 8;
+    constexpr int kSampleGridV = 8;
+
+    auto findSpan = [](double t, const std::vector<double>& knots, int num_cp) {
+        if (t >= 1.0 - 1e-9) return num_cp - 1;
+        for (int k = 3; k < num_cp; ++k)
+            if (knots[k] <= t && t < knots[k + 1]) return k;
+        return 3;
+    };
+
+    std::error_code ec;
+    std::filesystem::create_directories(out_dir, ec);
+    if (ec) {
+        std::cerr << "Failed to create directory: " << out_dir << " (" << ec.message() << ")\n";
+        return;
+    }
+    if (save_surface_samples) {
+        std::filesystem::create_directories(sample_dir, ec);
+        if (ec) {
+            std::cerr << "Failed to create directory: " << sample_dir << " (" << ec.message() << ")\n";
+            return;
+        }
+    }
+
+    int n_saved = 0;
+    int n_samples_saved = 0;
+    for (int sid = 0; sid < bspline_map.size(); ++sid) {
+        const BSplineMapEntry* e = bspline_map.getEntry(sid);
+        if (!e || !e->surface) continue;
+
+        const std::string out_path = out_dir + "/" + std::to_string(sid) + ".txt";
+        std::ofstream out(out_path, std::ios::out | std::ios::trunc);
+        if (!out) {
+            std::cerr << "Failed to open: " << out_path << std::endl;
+            continue;
+        }
+
+        out << std::fixed << std::setprecision(6);
+        for (const auto& cp : e->surface->getControls())
+            out << cp.x() << " " << cp.y() << " " << cp.z() << "\n";
+        ++n_saved;
+
+        if (!save_surface_samples) continue;
+
+        const auto& surf = e->surface;
+        const auto& knU = surf->getKnotsU();
+        const auto& knV = surf->getKnotsV();
+        const auto& cps = surf->getControls();
+        const int num_cpv = surf->getNumCpV();
+        const int num_cpu = surf->getNumCpU();
+
+        const std::string sample_path = sample_dir + "/" + std::to_string(sid) + ".txt";
+        std::ofstream sout(sample_path, std::ios::out | std::ios::trunc);
+        if (!sout) {
+            std::cerr << "Failed to open: " << sample_path << std::endl;
+            continue;
+        }
+        sout << std::fixed << std::setprecision(6);
+        for (int iu = 0; iu < kSampleGridU; ++iu) {
+            const double u = (kSampleGridU > 1) ? double(iu) / double(kSampleGridU - 1) : 0.0;
+            const BSplineSurface::Parameter paraU(findSpan(u, knU, num_cpu), u);
+            for (int iv = 0; iv < kSampleGridV; ++iv) {
+                const double v = (kSampleGridV > 1) ? double(iv) / double(kSampleGridV - 1) : 0.0;
+                const BSplineSurface::Parameter paraV(findSpan(v, knV, num_cpv), v);
+                const Eigen::Vector3d p = surf->getPos(paraU, paraV, knU, knV, cps, num_cpv);
+                sout << p.x() << " " << p.y() << " " << p.z() << "\n";
+            }
+        }
+        ++n_samples_saved;
+    }
+
+    std::cout << "B-spline control points saved: " << n_saved
+              << " files in " << out_dir << std::endl;
+    if (save_surface_samples)
+        std::cout << "B-spline surface samples saved: " << n_samples_saved
+                  << " files in " << sample_dir << std::endl;
+}
+
 void SLAMesher::process(){
     TicToc t_whole;
 
@@ -1185,8 +1319,8 @@ void SLAMesher::process(){
     // 配准参数
     const int    max_rg_iters   = param.register_times;  // 外层迭代次数
     const double converge_thr   = param.converge_thr;
-    const double match_dist_thr = 0.5;  // 点到曲面最大容许距离 (m)
-    const int    skip_points    = 10;    // 每隔几个点取一个用于配准 (降低计算量)
+    const double match_dist_thr = 0.3;  // 点到曲面最大容许距离 (m)
+    const int    skip_points    = 20;    // 每隔几个点取一个用于配准 (降低计算量)
     static std::ofstream traj_file;
     if (!traj_file.is_open()) {
         traj_file.open("/tmp/bspline_traj_xyz.txt", std::ios::out | std::ios::trunc);
@@ -1197,10 +1331,13 @@ void SLAMesher::process(){
     static double z_ground_ref   = std::numeric_limits<double>::quiet_NaN();
     // 地面点 z 阈值（传感器系）：KITTI lidar 距地面约 1.73m，取 -1.0m 为截止
     const double ground_z_thr    = -1.0;
-    const double ground_w_rp     = 1.5;   // roll/pitch 约束权重
-    const double ground_w_z      = 1.0;   // 高度约束权重
     while(nh.ok()){
         g_data.step++;
+        if (param.max_frames > 0 && g_data.step > param.max_frames) {
+            std::cout << "Reached max_frames=" << param.max_frames << ", stop." << std::endl;
+            g_data.step--;
+            break;
+        }
         g_data.extendLog();
         TicToc t_step;
 
@@ -1222,8 +1359,9 @@ void SLAMesher::process(){
         GroundConstraint ground = computeGroundConstraint(scan_local, z_ground_ref, ground_z_thr);
 
         T_world = registerScanToMap(scan_local, T_guess, bspline_map, ground,
-                                    z_ground_ref, ground_w_rp, ground_w_z,
-                                    max_rg_iters, converge_thr, match_dist_thr, skip_points);
+                                    z_ground_ref, param.ground_w_rp, param.ground_w_z,
+                                    max_rg_iters, converge_thr, match_dist_thr, skip_points,
+                                    range_proc.MIN_Z);
 
         g_data.updatePose(T_world);
         pubTf();
@@ -1247,6 +1385,7 @@ void SLAMesher::process(){
     std::cout << "Process finished. Total time: " << t_whole.toc() / 1000.0 << " s" << std::endl;
 
     printMapSummary(bspline_map);
+    saveControlPointsToTxt(bspline_map, param.save_surface_samples);
     g_data.savePath2TxtKitti(g_data.file_loc_path_wrt, g_data.path);
     g_data.file_loc_path_wrt.close();
     std::cout << "KITTI trajectory saved." << std::endl;

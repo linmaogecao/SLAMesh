@@ -15,10 +15,11 @@ class Parameter{
     //algorithm parameter
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-    int    max_steps{10000}, register_times, num_test, min_points_num_to_gp, num_thread, cross_cell_overlap_length, dataset;
+    int    max_steps{10000}, max_frames{0}, dump_frame{0}, register_times, num_test, min_points_num_to_gp, num_thread, cross_cell_overlap_length, dataset;
     double range_max, range_min, range_unit;
     double variance_register, variance_map_update, variance_map_show, variance_min, variance_sensor;
     double grid, voxel_size, converge_thr;
+    double ground_w_rp{0.0}, ground_w_z{0.0};
 
     double correction_x{0}, correction_y{0}, correction_z{0},
     correction_roll_degree{0}, correction_pitch_degree{0}, correction_yaw_degree{0};
@@ -29,7 +30,7 @@ public:
     bool three_dir;//features fixed
     bool odom_available, read_offline_pcd, cross_overlap, grt_available, imu_feedback,
             meshing_tsdf, full_cover, save_raw_point_clouds, point2mesh{true},
-            residual_combination{true}, save_mesh_map;
+            residual_combination{true}, save_mesh_map, save_surface_samples{false};
     int visualisation_type;
     int num_margin_old_cell;
     double bias_acc_x, bias_acc_y;
@@ -197,7 +198,8 @@ private:
                              int max_iters,
                              double converge_thr,
                              double match_dist_thr,
-                             int skip_points);
+                             int skip_points,
+                             double match_min_z);
 
     void runMapUpdate(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                       const Transf& T_world,
@@ -206,4 +208,8 @@ private:
                       double match_dist_thr);
 
     void printMapSummary(const BSplineMap& bspline_map) const;
+    void saveControlPointsToTxt(const BSplineMap& bspline_map, bool save_surface_samples) const;
+
+    // 3 阶 B-spline：u/v 同尺寸，范围 [4, 15]
+    static int chooseControlGridSize(int num_fitting_points);
 };
