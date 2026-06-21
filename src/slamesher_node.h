@@ -16,17 +16,20 @@ class Parameter{
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     int    max_steps{10000}, max_frames{0}, dump_frame{0}, register_times, num_test, min_points_num_to_gp, num_thread, cross_cell_overlap_length, dataset;
+    int    map_update_interval{20}, ground_build_interval{20};
+    int    map_save_step_begin{0}, map_save_step_end{0};  // 0=不限；导出 created_step 在此闭区间内的曲面
     double range_max, range_min, range_unit;
     double variance_register, variance_map_update, variance_map_show, variance_min, variance_sensor;
     double grid, voxel_size, converge_thr;
     double ground_w_rp{0.0}, ground_w_z{0.0};
+    double ground_match_w_n{0.0}, ground_match_w_t{0.1};  // 地面 BSpline 匹配法向/切向权重
 
     double correction_x{0}, correction_y{0}, correction_z{0},
     correction_roll_degree{0}, correction_pitch_degree{0}, correction_yaw_degree{0};
     double test_param;
     double eigen_1, eigen_2, eigen_3;//PCA
 
-    std::string file_loc_report, file_loc_dataset, seq;
+    std::string file_loc_report, file_loc_dataset, seq, console_log_path;
     bool three_dir;//features fixed
     bool odom_available, read_offline_pcd, cross_overlap, grt_available, imu_feedback,
             meshing_tsdf, full_cover, save_raw_point_clouds, point2mesh{true},
@@ -174,7 +177,8 @@ private:
         Eigen::Vector3d p_local;
         Eigen::Vector3d p_world;
         SurfaceCurvature curvature;
-        int scan_idx = -1;
+        int scan_idx  = -1;
+        bool is_ground = false;
     };
 
     void processFirstFrame(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
@@ -195,11 +199,15 @@ private:
                              double z_ground_ref,
                              double ground_w_rp,
                              double ground_w_z,
+                             double ground_match_w_n,
+                             double ground_match_w_t,
                              int max_iters,
                              double converge_thr,
                              double match_dist_thr,
                              int skip_points,
-                             double match_min_z);
+                             double match_min_z,
+                             double ground_z_min,
+                             double ground_z_max);
 
     void runMapUpdate(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                       const Transf& T_world,
@@ -207,8 +215,19 @@ private:
                       BSplineMap& bspline_map,
                       double match_dist_thr);
 
+    // 提取地面点（传感器系 z 范围）→ 转世界系 → 按体素去重 → 拟合 BSpline → is_ground=true 写入地图
+    // 第 1 帧和每隔 ground_build_interval 帧调用一次
+    void buildGroundMap(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                        const Transf& T_world,
+                        BSplineMap& bspline_map,
+                        double ground_z_min,
+                        double ground_z_max);
+
     void printMapSummary(const BSplineMap& bspline_map) const;
-    void saveControlPointsToTxt(const BSplineMap& bspline_map, bool save_surface_samples) const;
+    void saveControlPointsToTxt(const BSplineMap& bspline_map,
+                                bool save_surface_samples,
+                                int step_begin = 0,
+                                int step_end = 0) const;
 
     // 3 阶 B-spline：u/v 同尺寸，范围 [4, 15]
     static int chooseControlGridSize(int num_fitting_points);

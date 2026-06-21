@@ -7,16 +7,23 @@ slamesher:
   read_offline_pcd: true 
   dataset: 1
   max_steps: 10000
-  max_frames: 201          # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
-  dump_frame: 200          # 0=不保存；>0 时在该帧配准结束后保存世界系点云+匹配/未匹配点
-  save_surface_samples: true  # true 时在 global_map/ 下按序号保存曲面稀疏采样点
+  max_frames: 500          # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
+  dump_frame: 0          # 0=不保存；>0 时在该帧配准结束后保存世界系点云+匹配/未匹配点
+  console_log_path: "/home/albus/catkin_ws/src/SLAMesh/debug.txt"   # 空=自动写到 file_loc_report/seq##_run_时间.log；也可填绝对路径如 debug.txt
+  save_surface_samples: false  # true 时在 global_map/ 下按序号保存曲面稀疏采样点（全序列）
+  map_save_step_begin: 0  # 0=不限；>0 时与 end 配合，只导出该 step 闭区间内新建的曲面
+  map_save_step_end:   1000  # 例：1000+1500 → all_surfaces_1000_1500.txt
   save_mesh_map: false
   #register param
   range_max: 100
   range_min: 1.2
   register_times: 2
-  ground_w_rp: 3.0    # 地面 roll/pitch 约束权重（Ceres GroundPlaneConstraint）
-  ground_w_z:  3.0    # 地面高度约束权重
+  map_update_interval: 10      # 障碍 MapUpdate 间隔（帧）；step % N == 0 时建障碍曲面
+  ground_build_interval: 10    # 地面 buildGroundMap 间隔（帧）；第1帧 + step % N == 0
+  ground_w_rp: 0.0   # GroundPlaneConstraint 已移除，此参数不再使用
+  ground_w_z:  0.0   # GroundPlaneConstraint 已移除，此参数不再使用
+  ground_match_w_n: 0.0   # 地面 BSpline 匹配法向权重（roll/pitch/高度）；0=关闭法向约束
+  ground_match_w_t: 0.0   # 地面 BSpline 匹配切向权重（x/y/yaw）；0=完全不用地面匹配残差
   cross_overlap: true
   cross_cell_overlap_length: 1
   num_margin_old_cell: 500

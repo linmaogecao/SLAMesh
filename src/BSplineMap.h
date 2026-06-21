@@ -32,6 +32,8 @@ struct BSplineMapEntry {
     int                              surface_id = -1;
     std::shared_ptr<BSplineSurface>  surface;            // 拟合完成的曲面
     std::vector<VoxelKey>            occupied_voxels;    // 该曲面覆盖的体素（无重复）
+    bool                             is_ground = false;  // 是否是地面曲面
+    int                              created_step = -1;  // 写入地图时的 g_data.step
 };
 
 // -----------------------------------------------------------------------
@@ -48,13 +50,17 @@ public:
     // 返回分配给该曲面的 surface_id。
     // ------------------------------------------------------------------
     int addSurface(std::shared_ptr<BSplineSurface>            surf,
-                   const pcl::PointCloud<pcl::PointXYZ>::Ptr& cluster_cloud)
+                   const pcl::PointCloud<pcl::PointXYZ>::Ptr& cluster_cloud,
+                   bool is_ground = false,
+                   int created_step = -1)
     {
         int sid = static_cast<int>(entries_.size());
 
         BSplineMapEntry entry;
-        entry.surface_id = sid;
-        entry.surface    = surf;
+        entry.surface_id   = sid;
+        entry.surface      = surf;
+        entry.is_ground    = is_ground;
+        entry.created_step = created_step;
 
         // 遍历 cluster 原始点注册体素（去重），体素 -> 关联曲面列表
         std::unordered_set<VoxelKey, VoxelKeyHash> seen;
@@ -70,6 +76,29 @@ public:
 
         entries_.push_back(std::move(entry));
         return sid;
+    }
+
+    double getVoxelSize() const { return voxel_size_; }
+
+    // 查 voxel_index_ 中某 XY 体素范围内是否已有地面曲面（buildGroundMap 大格去重用）
+    // ix_lo..ix_hi, iy_lo..iy_hi 为 BSplineMap 体素坐标（整数）
+    bool hasGroundSurfaceInVoxelRange(int ix_lo, int ix_hi,
+                                      int iy_lo, int iy_hi) const {
+        for (const auto& [key, sids] : voxel_index_) {
+            if (key.x < ix_lo || key.x > ix_hi) continue;
+            if (key.y < iy_lo || key.y > iy_hi) continue;
+            for (int sid : sids) {
+                if (sid >= 0 && sid < (int)entries_.size() && entries_[sid].is_ground)
+                    return true;
+            }
+        }
+        return false;
+    }
+
+    int groundSurfaceCount() const {
+        int cnt = 0;
+        for (const auto& e : entries_) if (e.is_ground) ++cnt;
+        return cnt;
     }
 
     // ------------------------------------------------------------------

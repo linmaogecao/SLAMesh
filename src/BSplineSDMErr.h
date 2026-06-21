@@ -254,27 +254,102 @@ private:
 };
 
 // -----------------------------------------------------------------------
-// 地面约束: 3 个残差，优化变量为 SE(3) 位姿 [qx,qy,qz,qw, tx,ty,tz]
+// 地面匹配专用：大法向权重（约束 roll/pitch/高度），小切向权重（不干扰 x/y/yaw）
+// w_n : 法向残差权重（建议 5.0）
+// w_t : 切向残差权重（建议 0.1，近似关掉切向贡献）
+// -----------------------------------------------------------------------
+class GroundSDMRegistrationCostFunction : public ceres::SizedCostFunction<3, 7> {
+public:
+    GroundSDMRegistrationCostFunction(const Eigen::Vector3d& curr_point,
+                                      const Eigen::Vector3d& curr_point_world,
+                                      const SurfaceCurvature& frame,
+                                      double w_n = 5.0,
+                                      double w_t = 0.1)
+        : curr_point_(curr_point), surface_point_(frame.point),
+          tangent1_(frame.tangent1), tangent2_(frame.tangent2), normal_(frame.normal),
+          w_n_(w_n), w_t_(w_t) {}
+
+    virtual ~GroundSDMRegistrationCostFunction() {}
+
+    virtual bool Evaluate(double const *const *parameters,
+                          double *residuals,
+                          double **jacobians) const override {
+        Eigen::Map<const Eigen::Quaterniond> q(parameters[0]);
+        Eigen::Map<const Eigen::Vector3d>    t(parameters[0] + 4);
+
+        Eigen::Vector3d point_w = q * curr_point_ + t;
+        Eigen::Vector3d diff = point_w - surface_point_;
+
+        residuals[0] = w_t_ * diff.dot(tangent1_);
+        residuals[1] = w_t_ * diff.dot(tangent2_);
+        residuals[2] = w_n_ * diff.dot(normal_);
+
+        if (jacobians && jacobians[0]) {
+            Eigen::Matrix3d skew_pw;
+            skew_pw <<        0, -point_w.z(),  point_w.y(),
+                     point_w.z(),          0, -point_w.x(),
+                    -point_w.y(),  point_w.x(),          0;
+
+            Eigen::Matrix<double, 3, 6> dp_by_xi;
+            dp_by_xi.block<3,3>(0,0) = -skew_pw;
+            dp_by_xi.block<3,3>(0,3) = Eigen::Matrix3d::Identity();
+
+            Eigen::Matrix<double, 3, 3> A;
+            A.row(0) = w_t_ * tangent1_.transpose();
+            A.row(1) = w_t_ * tangent2_.transpose();
+            A.row(2) = w_n_ * normal_.transpose();
+
+            Eigen::Map<Eigen::Matrix<double, 3, 7, Eigen::RowMajor>> J(jacobians[0]);
+            J.setZero();
+            J.block<3,6>(0,0) = A * dp_by_xi;
+        }
+        return true;
+    }
+
+private:
+    Eigen::Vector3d curr_point_;
+    Eigen::Vector3d surface_point_;
+    Eigen::Vector3d tangent1_;
+    Eigen::Vector3d tangent2_;
+    Eigen::Vector3d normal_;
+    double w_n_, w_t_;
+};
+
+// -----------------------------------------------------------------------
+// 地面约束（雷达系表述）: 3 个残差，优化变量为 SE(3) 位姿 [qx,qy,qz,qw, tx,ty,tz]
 //
-//   r[0] = w_rp * (R * n_local).x   →  roll  约束 (应=0)
-//   r[1] = w_rp * (R * n_local).y   →  pitch 约束 (应=0)
-//   r[2] = w_z  * ((R * c_local + t).z - z_ground_ref)  →  高度约束
+// 物理假设：车贴在当地路面上 → 地面法向在雷达系里应竖直向上，地面高度 z_l ≈ z_ground_ref。
+// 上坡时世界系地面法向/高度会变，但雷达系下这两个量仍应稳定。
 //
-// n_local    : 传感器系下地面法向量 (PCA 最小特征向量, 指向上方 z>0)
-// c_local    : 传感器系下地面点质心
-// z_ground_ref: 世界系中地面质心 z 的参考值 (由第一帧初始化)
-// w_rp       : roll/pitch 约束权重
-// w_z        : 高度约束权重
+// 在当前 Ceres 步内，用线性化锚定位姿 (R_a, t_a) 把 PCA 地面法向/质心变到世界系并固定：
+//   n_w_a = R_a * n_l,   c_w_a = R_a * c_l + t_a
+// 优化 (R, t) 时，变回雷达系检查：
+//   n_lidar = R^T * n_w_a
+//   c_lidar = R^T * (c_w_a - t)
+//
+//   r[0] = w_rp * n_lidar.x   →  当地地面法向在雷达系水平 (roll/pitch)
+//   r[1] = w_rp * n_lidar.y
+//   r[2] = w_z  * (c_lidar.z - z_ground_ref)  →  雷达系地面高度
+//
+// n_local     : 传感器系 PCA 地面法向 (z>0)
+// c_local     : 传感器系 PCA 地面质心
+// n_world_a   : 锚定位姿下的 n_w_a = R_a * n_l
+// c_world_a   : 锚定位姿下的 c_w_a = R_a * c_l + t_a
+// z_ground_ref: 雷达系地面参考高度 (第一帧 z_l 均值, 约 -1.73m)
 // -----------------------------------------------------------------------
 class GroundPlaneConstraint : public ceres::SizedCostFunction<3, 7> {
 public:
     GroundPlaneConstraint(const Eigen::Vector3d& n_local,
                           const Eigen::Vector3d& c_local,
                           double z_ground_ref,
+                          const Eigen::Vector3d& n_world_a,
+                          const Eigen::Vector3d& c_world_a,
                           double w_rp = 1.0,
                           double w_z  = 1.0)
         : n_local_(n_local), c_local_(c_local),
-          z_ground_ref_(z_ground_ref), w_rp_(w_rp), w_z_(w_z) {}
+          z_ground_ref_(z_ground_ref),
+          n_world_a_(n_world_a), c_world_a_(c_world_a),
+          w_rp_(w_rp), w_z_(w_z) {}
 
     virtual ~GroundPlaneConstraint() {}
 
@@ -284,41 +359,38 @@ public:
         Eigen::Map<const Eigen::Quaterniond> q(parameters[0]);
         Eigen::Map<const Eigen::Vector3d>    t(parameters[0] + 4);
 
-        Eigen::Vector3d n_world = q * n_local_;           // 地面法向在世界系
-        Eigen::Vector3d c_world = q * c_local_ + t;       // 地面质心在世界系
+        // 世界系锚定地面 → 当前雷达系
+        const Eigen::Vector3d n_lidar = q.conjugate() * n_world_a_;
+        const Eigen::Vector3d c_lidar = q.conjugate() * (c_world_a_ - t);
 
-        residuals[0] = w_rp_ * n_world.x();               // roll:  n_world.x → 0
-        residuals[1] = w_rp_ * n_world.y();               // pitch: n_world.y → 0
-        residuals[2] = w_z_  * (c_world.z() - z_ground_ref_); // height
+        residuals[0] = w_rp_ * n_lidar.x();
+        residuals[1] = w_rp_ * n_lidar.y();
+        residuals[2] = w_z_  * (c_lidar.z() - z_ground_ref_);
 
         if (jacobians && jacobians[0]) {
             Eigen::Map<Eigen::Matrix<double, 3, 7, Eigen::RowMajor>> J(jacobians[0]);
             J.setZero();
 
-            // Jacobian of r[0,1] w.r.t. rotation (xi_rot = [wx,wy,wz]):
-            //   d(R*n)/d(xi_rot) = -skew(R*n) = -skew(n_world)
-            //   -skew(v) row k:  row0=[0, v.z, -v.y], row1=[-v.z, 0, v.x], row2=[v.y, -v.x, 0]
+            const Eigen::Matrix3d R = q.normalized().toRotationMatrix();
+
+            // n_lidar = R^T n_w_a,  d(n_lidar)/dω = [n_lidar]_×
             J(0, 0) = 0;
-            J(0, 1) = w_rp_ *  n_world.z();
-            J(0, 2) = w_rp_ * -n_world.y();
-            // J(0, 3..5) = 0  (n_world independent of t)
+            J(0, 1) = w_rp_ *  n_lidar.z();
+            J(0, 2) = w_rp_ * -n_lidar.y();
 
-            J(1, 0) = w_rp_ * -n_world.z();
+            J(1, 0) = w_rp_ * -n_lidar.z();
             J(1, 1) = 0;
-            J(1, 2) = w_rp_ *  n_world.x();
-            // J(1, 3..5) = 0
+            J(1, 2) = w_rp_ *  n_lidar.x();
 
-            // Jacobian of r[2] = w_z*(c_world.z - z_ref) w.r.t. [xi_rot, t]:
-            //   d(c_world.z)/d(xi_rot): treat c_world as point → -skew(c_world) row2
-            //   -skew(c_world) row2 = [c_world.y, -c_world.x, 0]
-            //   d(c_world.z)/d(t) = e_z = [0, 0, 1]
-            J(2, 0) = w_z_ *  c_world.y();
-            J(2, 1) = w_z_ * -c_world.x();
+            // c_lidar = R^T(c_w_a - t)
+            // d(c_lidar.z)/dω = e_z^T [c_lidar]_× = [-c_y, c_x, 0]
+            J(2, 0) = w_z_ * (-c_lidar.y());
+            J(2, 1) = w_z_ * ( c_lidar.x());
             J(2, 2) = 0;
-            J(2, 3) = 0;
-            J(2, 4) = 0;
-            J(2, 5) = w_z_;
-            // J(2, 6) = 0  (qw column)
+            // d(c_lidar.z)/d t = -e_z^T R^T  →  -R(j,2) for t_j
+            J(2, 3) = w_z_ * (-R(0, 2));
+            J(2, 4) = w_z_ * (-R(1, 2));
+            J(2, 5) = w_z_ * (-R(2, 2));
         }
         return true;
     }
@@ -327,6 +399,8 @@ private:
     Eigen::Vector3d n_local_;
     Eigen::Vector3d c_local_;
     double z_ground_ref_;
+    Eigen::Vector3d n_world_a_;
+    Eigen::Vector3d c_world_a_;
     double w_rp_, w_z_;
 };
 
