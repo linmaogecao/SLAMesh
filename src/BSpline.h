@@ -59,9 +59,11 @@ public:
         Eigen::Vector3d u_axis   = Eigen::Vector3d::UnitX();
         Eigen::Vector3d v_axis   = Eigen::Vector3d::UnitY();
         Eigen::Vector3d n_axis   = Eigen::Vector3d::UnitZ();
-        double u_min = 0.0, u_max = 0.0;
+        double u_min = 0.0, u_max = 0.0;   // raw point projection range (no margin)
         double v_min = 0.0, v_max = 0.0;
         double h_avg = 0.0;
+        double u_lo = 0.0, u_hi = 0.0;    // BSpline parameterization range (with margin)
+        double v_lo = 0.0, v_hi = 0.0;
         bool   valid = false;
     };
     BSplineSurface(int deg_u,int deg_v,int control_num_u,int control_num_v,double interal=0.01):
@@ -141,6 +143,7 @@ private:
         controls.clear();
         positions.clear();
         sampling_paras_.clear();
+        span_sample_index_.clear();
     }
 
     /** follow <<General Matrix Representations for B-Splines>> calculate BSpline coeff matrix
@@ -182,5 +185,8 @@ private:
     int cn2 = 0;
     int cn3 = 0;
     PlaneFrame plane_frame_;
+    // Span-indexed sample lookup built in setNewControl.
+    // span_sample_index_[si][sj] holds position indices for span (si+3, sj+3).
+    std::vector<std::vector<std::vector<int>>> span_sample_index_;
     std::vector<Eigen::Vector3d> ext_init_controls_;
 };

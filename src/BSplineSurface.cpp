@@ -282,33 +282,23 @@ void BSplineSurface::buildRangeGrid(const pcl::PointCloud<pcl::PointXYZ>::Ptr& c
 }
 
 double BSplineSurface::findFootPrint(const vector<Vector3d> &givepoints, vector<pair<Parameter, Parameter>> &footPrints, vector<double> &point_dists) {
-    footPrints.clear();
-    footPrints.resize( givepoints.size());
-    point_dists.clear();
-    point_dists.resize(givepoints.size());
-    int iKNei = 1;
-    int iDim = 3;
-    size_t iNPts = positions.size();
-    double eps = 0;
+    footPrints.assign(givepoints.size(), {Parameter(0, 0.0), Parameter(0, 0.0)});
+    point_dists.assign(givepoints.size(), 0.0);
 
-    ANNpointArray dataPts = annAllocPts(iNPts, iDim); // allocate data points; // data points
-    ANNpoint queryPt = annAllocPt(iDim);  // allocate query point
+    const int n_pos = (int)positions.size();
+    if (n_pos == 0 || givepoints.empty()) return 0.0;
 
-    ANNidxArray nnIdx = new ANNidx[iKNei]; // allocate near neigh indices
-    ANNdistArray dists = new ANNdist[iKNei]; // allocate near neighbor dists
+    const int nu_spans = (int)span_sample_index_.size();
+    const int nv_spans = (nu_spans > 0) ? (int)span_sample_index_[0].size() : 0;
 
-    for( int i = 0; i!= iNPts; ++i) {
-        dataPts[i][0] = positions[i].x();
-        dataPts[i][1] = positions[i].y();
-        dataPts[i][2] = positions                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                    [i].z();
-    }
-    ANNkd_tree* kdTree = new ANNkd_tree( // build search structure
-            dataPts, // the data points
-            iNPts, // number of points
-            iDim);
+    // Use UV-projected span lookup when plane_frame_ is valid and span index was built.
+    const bool use_span = (plane_frame_.valid
+                           && nu_spans > 0 && nv_spans > 0
+                           && (plane_frame_.u_hi - plane_frame_.u_lo) > 1e-9
+                           && (plane_frame_.v_hi - plane_frame_.v_lo) > 1e-9);
 
-    // 在参数域内查找全局参数 t 所在的 span
-    auto findSpan = [&](double t, const vector<double>& knots, int num_cp) {
+    // Find knot span index for a normalized parameter t in [0,1].
+    auto findSpan = [&](double t, const vector<double>& knots, int num_cp) -> int {
         if (t >= 1.0 - 1e-9) return num_cp - 1;
         for (int k = 3; k < num_cp; ++k)
             if (knots[k] <= t && t < knots[k + 1]) return k;
@@ -316,26 +306,58 @@ double BSplineSurface::findFootPrint(const vector<Vector3d> &givepoints, vector<
     };
 
     double squareSum = 0.0;
-    for( int i = 0 ;i!= (int)givepoints.size(); ++i) {
-        queryPt[0] = givepoints[i].x();
-        queryPt[1] = givepoints[i].y();
-        queryPt[2] = givepoints[i].z();
-        kdTree->annkSearch( // search
-                queryPt, // query point
-                iKNei, // number of near neighbors
-                nnIdx, // nearest neighbors (returned)
-                dists, // distance (returned)
-                eps); // error bound
-
-        // ---- [Newton Refinement] ------------------------------------------------
-        // kd-tree 只给出最近采样点的参数（近似），Newton 迭代修正到曲面真实最近点。
-        // 真正最近点满足：r·Su = 0 且 r·Sv = 0（残差垂直于曲面切平面）
-        // 迭代解 2×2 线性系统：
-        //   [Su·Su  Su·Sv] [du]   [-r·Su]
-        //   [Su·Sv  Sv·Sv] [dv] = [-r·Sv]
-        // -------------------------------------------------------------------------
-        auto [paraU, paraV] = getPara(nnIdx[0]);
+    for (int i = 0; i < (int)givepoints.size(); ++i) {
         const Vector3d& p = givepoints[i];
+
+        // ---- Step 1: find best initial sample via UV-span lookup or brute force ----
+        int best_idx = 0;
+        double best_dist_sq = std::numeric_limits<double>::max();
+
+        if (use_span) {
+            // Project query point onto PCA plane, map to normalized BSpline parameter.
+            Vector3d diff = p - plane_frame_.centroid;
+            double u_proj  = diff.dot(plane_frame_.u_axis);
+            double v_proj  = diff.dot(plane_frame_.v_axis);
+            double u_norm  = (u_proj - plane_frame_.u_lo) / (plane_frame_.u_hi - plane_frame_.u_lo);
+            double v_norm  = (v_proj - plane_frame_.v_lo) / (plane_frame_.v_hi - plane_frame_.v_lo);
+            u_norm = std::max(0.0, std::min(1.0, u_norm));
+            v_norm = std::max(0.0, std::min(1.0, v_norm));
+
+            // Estimate span indices (offset by -3 for span_sample_index_ indexing).
+            int sp_u = std::max(0, std::min(nu_spans - 1, findSpan(u_norm, knots_u, controls_num_u) - 3));
+            int sp_v = std::max(0, std::min(nv_spans - 1, findSpan(v_norm, knots_v, controls_num_v) - 3));
+
+            // Search estimated span ± 1 in both directions (~9 patches at most).
+            for (int dsi = -1; dsi <= 1; ++dsi) {
+                int si = sp_u + dsi;
+                if (si < 0 || si >= nu_spans) continue;
+                for (int dsj = -1; dsj <= 1; ++dsj) {
+                    int sj = sp_v + dsj;
+                    if (sj < 0 || sj >= nv_spans) continue;
+                    for (int idx : span_sample_index_[si][sj]) {
+                        double d = (positions[idx] - p).squaredNorm();
+                        if (d < best_dist_sq) { best_dist_sq = d; best_idx = idx; }
+                    }
+                }
+            }
+            // Fallback: shouldn't happen on a well-fitted surface, but be safe.
+            if (best_dist_sq == std::numeric_limits<double>::max()) {
+                for (int k = 0; k < n_pos; ++k) {
+                    double d = (positions[k] - p).squaredNorm();
+                    if (d < best_dist_sq) { best_dist_sq = d; best_idx = k; }
+                }
+            }
+        } else {
+            // Fallback: linear scan over all samples (no heap alloc, no ANN rebuild).
+            for (int k = 0; k < n_pos; ++k) {
+                double d = (positions[k] - p).squaredNorm();
+                if (d < best_dist_sq) { best_dist_sq = d; best_idx = k; }
+            }
+        }
+
+        // ---- Step 2: Newton refinement from best initial (u,v) ----
+        // Solves r·Su = 0, r·Sv = 0 where r = S(u,v) - p.
+        auto [paraU, paraV] = sampling_paras_[best_idx];
 
         for (int nr = 0; nr < 3; ++nr) {
             Vector3d S  = getPos(paraU, paraV, knots_u, knots_v, controls, controls_num_v);
@@ -344,15 +366,13 @@ double BSplineSurface::findFootPrint(const vector<Vector3d> &givepoints, vector<
             Vector3d r  = S - p;
 
             double a00 = Su.dot(Su), a01 = Su.dot(Sv), a11 = Sv.dot(Sv);
-            double b0  = -r.dot(Su), b1 = -r.dot(Sv);
+            double b0  = -r.dot(Su), b1  = -r.dot(Sv);
             double det = a00 * a11 - a01 * a01;
             if (std::abs(det) < 1e-10) break;
 
             double du = (b0 * a11 - b1 * a01) / det;
             double dv = (a00 * b1 - a01 * b0) / det;
 
-            double dt_u = knots_u[paraU.first + 1] - knots_u[paraU.first];
-            double dt_v = knots_v[paraV.first + 1] - knots_v[paraV.first];
             double new_tf_u = std::max(0.0, std::min(1.0, paraU.second + du));
             double new_tf_v = std::max(0.0, std::min(1.0, paraV.second + dv));
 
@@ -361,28 +381,16 @@ double BSplineSurface::findFootPrint(const vector<Vector3d> &givepoints, vector<
 
             if (std::abs(du) < 1e-6 && std::abs(dv) < 1e-6) break;
         }
-        // ---- [Newton Refinement End] --------------------------------------------
 
         Vector3d S_final    = getPos(paraU, paraV, knots_u, knots_v, controls, controls_num_v);
         double true_dist_sq = (S_final - p).squaredNorm();
-        double true_dist    = std::sqrt(true_dist_sq);
 
-        squareSum      += true_dist;
-        point_dists[i]  = true_dist_sq;   // MAD 离群点过滤使用平方距离
+        squareSum      += std::sqrt(true_dist_sq);
+        point_dists[i]  = true_dist_sq;
         footPrints[i]   = {paraU, paraV};
-        // squareSum += std::sqrt(dists[0]);
-        // point_dists[i] = dists[0];
-        // footPrints[i] =  getPara(nnIdx[0]) ;
     }
 
-    delete[] nnIdx;
-    delete[] dists;
-    delete kdTree;
-    annDeallocPts(dataPts);
-    annClose(); // done with ANN
-
     return squareSum;
-
 }
 
 std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter> BSplineSurface:: getPara(int index) {
@@ -509,6 +517,10 @@ void BSplineSurface::initControlPointPCA(const pcl::PointCloud<pcl::PointXYZ>::P
     const double u_hi = plane_frame_.u_max + margin_ratio * u_range;
     const double v_lo = plane_frame_.v_min - margin_ratio * v_range;
     const double v_hi = plane_frame_.v_max + margin_ratio * v_range;
+    plane_frame_.u_lo = u_lo;
+    plane_frame_.u_hi = u_hi;
+    plane_frame_.v_lo = v_lo;
+    plane_frame_.v_hi = v_hi;
 
     const double u_step = (u_hi - u_lo) / (num_u - 1);
     const double v_step = (v_hi - v_lo) / (num_v - 1);
@@ -625,17 +637,26 @@ void BSplineSurface::setNewControl(const vector<Vector3d> &controlPs, int num_u,
     controls_num_u = num_u;
     controls_num_v = num_v;
 
-    int start_u = 3;
-    int end_u   = controls_num_u ;
-    int valid_cnt  = 0;
-    int start_v = 3;
-    int end_v   = controls_num_v ;
+    const int start_u = 3;
+    const int end_u   = controls_num_u;
+    const int start_v = 3;
+    const int end_v   = controls_num_v;
+
+    // Pre-allocate span index grid: span i maps to index (i - 3)
+    const int nu_spans = std::max(0, controls_num_u - 3);
+    const int nv_spans = std::max(0, controls_num_v - 3);
+    if (nu_spans > 0 && nv_spans > 0)
+        span_sample_index_.assign(nu_spans, vector<vector<int>>(nv_spans));
+
+    int pos_idx = 0;
     for (int i = start_u; i <= end_u; ++i) {
         double dt_u = knots_u[i + 1] - knots_u[i];
         if (dt_u <= 1e-6) continue;
+        const int si = i - 3;
         for (int j = start_v; j <= end_v; ++j) {
             double dt_v = knots_v[j + 1] - knots_v[j];
             if (dt_v <= 1e-6) continue;
+            const int sj = j - 3;
 
             for (double fu = 0.0; fu <= 1.0; fu += interal_) {
                 for (double fv = 0.0; fv <= 1.0; fv += interal_) {
@@ -647,15 +668,15 @@ void BSplineSurface::setNewControl(const vector<Vector3d> &controlPs, int num_u,
 
                     Vector3d p = getPos(paraU, paraV, knots_u, knots_v, controls, controls_num_v);
                     positions.push_back(p);
-                    sampling_paras_.push_back(std::make_pair(paraU, paraV));
+                    sampling_paras_.push_back({paraU, paraV});
 
-
+                    if (si >= 0 && si < nu_spans && sj >= 0 && sj < nv_spans)
+                        span_sample_index_[si][sj].push_back(pos_idx);
+                    ++pos_idx;
                 }
             }
         }
     }
-    //std::cout<<"cn1 "<<cn1<<" cn2 "<<cn2<<" cn3 "<<cn3<<std::endl;
-    //std::cout<<"positions size:"<<positions.size()<<" :"<<valid_cnt<<std::endl;
 }
 
 void BSplineSurface::setKnotParams(int num_cp_u,int num_cp_v) {
