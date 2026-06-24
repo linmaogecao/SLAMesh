@@ -530,6 +530,8 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/ground_w_z",  ground_w_z,  0.0);
     nh.param("slamesher/ground_match_w_n", ground_match_w_n, 0.0);
     nh.param("slamesher/ground_match_w_t", ground_match_w_t, 0.1);
+    nh.param("slamesher/ground_coverage_min",    ground_coverage_min,    0.75);
+    nh.param("slamesher/map_unmatched_ratio_min", map_unmatched_ratio_min, 0.30);
     nh.param("slamesher/cross_overlap", cross_overlap, false);
     nh.param("slamesher/cross_cell_overlap_length", cross_cell_overlap_length, 0);
     nh.param("slamesher/num_margin_old_cell", num_margin_old_cell, -1);
@@ -885,33 +887,9 @@ int SLAMesher::chooseControlGridSize(int num_fitting_points)
 
 void SLAMesher::processFirstFrame(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                                   Transf& T_world,
-                                  RangeImageProcessor& range_proc,
-                                  BSplineMap& bspline_map,
                                   double& z_ground_ref,
                                   double ground_z_thr)
 {
-    pcl::PointCloud<pcl::PointXYZ> scan_world;
-    pcl::transformPointCloud(scan_local, scan_world, T_world.cast<float>());
-
-    range_proc.generateRangeImage(scan_world);
-    SegmentationResult seg = range_proc.segmentRangeImage(5, 0.1, 30);
-    std::vector<pcl::PointCloud<pcl::PointXYZ>::Ptr> clusters = range_proc.generateClusterClouds(seg);
-    range_proc.saveClustersToTxt(seg, "/home/albus/slam-math/Bspline/build/output_clusters");
-
-    for (int cid = 0; cid < (int)clusters.size(); cid++) {
-        if (!clusters[cid] || clusters[cid]->size() < 20) continue;
-
-        const int num_cp = chooseControlGridSize((int)clusters[cid]->size());
-        auto init_cp = range_proc.computeInitControlPoints(seg, cid, num_cp, num_cp, 2);
-        if (init_cp.empty()) continue;
-
-        auto surf = std::make_shared<BSplineSurface>(3, 3, num_cp, num_cp, 0.25);
-
-        surf->setExternalInitControls(init_cp);
-        surf->apply(clusters[cid], 50, 1, 1, 0.05);
-        bspline_map.addSurface(surf, clusters[cid], /*is_ground=*/false, g_data.step);
-    }
-
     if (std::isnan(z_ground_ref)) {
         double sum_z = 0.0;
         int cnt = 0;
@@ -1174,155 +1152,179 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
     return T_curr;
 }
 
-void SLAMesher::runMapUpdate(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
-                             const Transf& T_world,
-                             RangeImageProcessor& range_proc,
-                             BSplineMap& bspline_map,
-                             double match_dist_thr)
+void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                            const Transf& T_world,
+                            RangeImageProcessor& range_proc,
+                            BSplineMap& bspline_map,
+                            double match_dist_thr,
+                            double ground_z_min,
+                            double ground_z_max)
 {
-    const int MIN_CLUSTER_PTS  = 30;
-    const int MAX_NEW_SURFACES = 70;
+    constexpr int    MIN_CLUSTER_PTS  = 30;
+    constexpr int    MAX_NEW_SURFACES = 70;
+    constexpr double MATCH_DIST_GND   = 0.5;   // 地面覆盖率检测距离阈值
 
-    if (g_data.step % param.map_update_interval != 0) return;
+    const bool do_obstacle = (g_data.step == 1) || (g_data.step % param.map_update_interval  == 0);
+    const bool do_ground   = (g_data.step == 1) || (g_data.step % param.ground_build_interval == 0);
+    if (!do_obstacle && !do_ground) return;
 
     TicToc t_upd;
     range_proc.generateRangeImage(scan_local);
-    SegmentationResult seg_upd = range_proc.segmentRangeImage(5, 0.1, MIN_CLUSTER_PTS);
+    SegmentationResult seg = range_proc.segmentRangeImage(5, 0.1, MIN_CLUSTER_PTS);
 
     const Eigen::Matrix3d R_w = T_world.block<3,3>(0,0);
     const Eigen::Vector3d t_w = T_world.block<3,1>(0,3);
 
-    int n_added = 0;
-    for (int cid = 0; cid < (int)seg_upd.clusters.size() && n_added < MAX_NEW_SURFACES; cid++) {
-        const auto& pixels = seg_upd.clusters[cid];
-        if ((int)pixels.size() < MIN_CLUSTER_PTS) continue;
+    int n_added_gnd = 0, n_added_obs = 0;
 
-        std::unordered_map<int, std::vector<int>> surf_to_kidx;
-        std::vector<Eigen::Vector3d> pix_world(pixels.size(), Eigen::Vector3d::Zero());
-        std::vector<bool> pix_valid(pixels.size(), false);
+    // ── 地面分支：汇总全帧所有地面点 → 全局匹配已有地面面 → 未覆盖点拟合一张大地面 ──
+    if (do_ground) {
+        constexpr int MIN_GND_PTS = 50;
+        constexpr int GND_NUM_CP  = 15;   // 控制点足够多，信任拟合算法
 
-        for (int k = 0; k < (int)pixels.size(); ++k) {
-            const auto& px = range_proc.range_image_[pixels[k]];
-            if (!px.valid) continue;
-            Eigen::Vector3d pw = R_w * Eigen::Vector3d(px.x, px.y, px.z) + t_w;
-            pix_world[k] = pw;
-            pix_valid[k] = true;
-            for (int sid : bspline_map.queryCandidates(pw, 1))
-                surf_to_kidx[sid].push_back(k);
-        }
-
-        std::vector<bool> confirmed_matched(pixels.size(), false);
-        for (auto& [sid, kidxs] : surf_to_kidx) {
-            const BSplineMapEntry* entry = bspline_map.getEntry(sid);
-            if (!entry || !entry->surface) continue;
-
-            std::vector<Eigen::Vector3d> batch;
-            batch.reserve(kidxs.size());
-            for (int k : kidxs) batch.push_back(pix_world[k]);
-
-            std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> fps;
-            std::vector<double> dists;
-            entry->surface->findFootPrint(batch, fps, dists);
-
-            for (int i = 0; i < (int)kidxs.size(); ++i) {
-                double d = std::sqrt(std::abs(dists[i]));
-                if (d > 1e-6 && d <= match_dist_thr)
-                    confirmed_matched[kidxs[i]] = true;
+        // 步骤 1：遍历所有 cluster，收集雷达系 z 带内的地面点（世界系）
+        auto cloud_gnd_all = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+        for (int cid2 = 0; cid2 < (int)seg.clusters.size(); cid2++) {
+            for (int pidx : seg.clusters[cid2]) {
+                const auto& px = range_proc.range_image_[pidx];
+                if (!px.valid) continue;
+                if (px.z < ground_z_min || px.z > ground_z_max) continue;
+                Eigen::Vector3d pw = R_w * Eigen::Vector3d(px.x, px.y, px.z) + t_w;
+                cloud_gnd_all->push_back(pcl::PointXYZ(
+                    static_cast<float>(pw.x()), static_cast<float>(pw.y()), static_cast<float>(pw.z())));
             }
         }
 
-        auto cloud_local = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-        cloud_local->reserve(pixels.size());
-        for (int k = 0; k < (int)pixels.size(); ++k) {
-            if (!pix_valid[k] || confirmed_matched[k]) continue;
-            const auto& px = range_proc.range_image_[pixels[k]];
-            cloud_local->push_back(pcl::PointXYZ(px.x, px.y, px.z));
+        if ((int)cloud_gnd_all->size() >= MIN_GND_PTS) {
+            // 步骤 2：对全帧地面点做采样，查已有地面面的 footprint 覆盖
+            const int n_all    = (int)cloud_gnd_all->size();
+            const int skip_cov = std::max(1, n_all / 2000);   // 最多约 2000 个采样点
+
+            std::vector<bool> pt_covered(n_all, false);
+            std::unordered_map<int, std::vector<int>> gnd_surf_to_kidx;
+            for (int k = 0; k < n_all; k += skip_cov) {
+                const Eigen::Vector3d pw(cloud_gnd_all->points[k].x,
+                                         cloud_gnd_all->points[k].y,
+                                         cloud_gnd_all->points[k].z);
+                for (int sid : bspline_map.queryCandidates(pw, 1)) {
+                    const BSplineMapEntry* e = bspline_map.getEntry(sid);
+                    if (!e || !e->is_ground) continue;
+                    gnd_surf_to_kidx[sid].push_back(k);
+                }
+            }
+
+            for (auto& [sid, kidxs] : gnd_surf_to_kidx) {
+                const BSplineMapEntry* e = bspline_map.getEntry(sid);
+                if (!e || !e->surface) continue;
+                std::vector<Eigen::Vector3d> batch;
+                batch.reserve(kidxs.size());
+                for (int ki : kidxs)
+                    batch.emplace_back(cloud_gnd_all->points[ki].x,
+                                       cloud_gnd_all->points[ki].y,
+                                       cloud_gnd_all->points[ki].z);
+                std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> fps;
+                std::vector<double> dists;
+                e->surface->findFootPrint(batch, fps, dists);
+                for (int i = 0; i < (int)kidxs.size(); ++i) {
+                    double d = std::sqrt(std::abs(dists[i]));
+                    if (d > 1e-6 && d <= MATCH_DIST_GND)
+                        pt_covered[kidxs[i]] = true;
+                }
+            }
+
+            // 步骤 3：收集采样中未被已有地面面覆盖的点
+            auto cloud_gnd_new = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+            for (int k = 0; k < n_all; k += skip_cov) {
+                if (!pt_covered[k])
+                    cloud_gnd_new->push_back(cloud_gnd_all->points[k]);
+            }
+
+            // 步骤 4：未覆盖点足够多则拟合一张大地面（PCA 自动初始化）
+            if ((int)cloud_gnd_new->size() >= MIN_GND_PTS) {
+                auto surf = std::make_shared<BSplineSurface>(3, 3, GND_NUM_CP, GND_NUM_CP, 0.25);
+                surf->apply(cloud_gnd_new, 30, 1, 1, 0.05);
+                bspline_map.addSurface(surf, cloud_gnd_new, /*is_ground=*/true, g_data.step);
+                ++n_added_gnd;
+            }
         }
-        if ((int)cloud_local->size() < MIN_CLUSTER_PTS) continue;
-
-        const int num_cp = chooseControlGridSize((int)cloud_local->size());
-
-        auto cloud_world = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-        pcl::transformPointCloud(*cloud_local, *cloud_world, T_world.cast<float>());
-
-        auto init_cp = range_proc.computeInitControlPoints(seg_upd, cid, num_cp, num_cp, 2);
-        if (init_cp.empty()) continue;
-        for (auto& cp : init_cp) cp = R_w * cp + t_w;
-
-        auto surf = std::make_shared<BSplineSurface>(3, 3, num_cp, num_cp, 0.25);
-        surf->setExternalInitControls(init_cp);
-        surf->apply(cloud_world, 50, 1, 1, 0.05);
-        bspline_map.addSurface(surf, cloud_world, /*is_ground=*/false, g_data.step);
-        n_added++;
     }
 
-    std::cout << "  [MapUpdate] step=" << g_data.step
-              << " clusters=" << seg_upd.clusters.size()
-              << " +surfaces=" << n_added
+    // ── 障碍分支：z > ground_z_max 的像素，未匹配比例达标才建图 ──
+    for (int cid = 0; cid < (int)seg.clusters.size(); cid++) {
+        const auto& pixels = seg.clusters[cid];
+        if ((int)pixels.size() < MIN_CLUSTER_PTS) continue;
+
+        if (do_obstacle && n_added_obs < MAX_NEW_SURFACES) {
+            std::unordered_map<int, std::vector<int>> surf_to_kidx;
+            std::vector<Eigen::Vector3d> pix_world(pixels.size(), Eigen::Vector3d::Zero());
+            std::vector<bool> pix_valid(pixels.size(), false);
+
+            for (int k = 0; k < (int)pixels.size(); ++k) {
+                const auto& px = range_proc.range_image_[pixels[k]];
+                if (!px.valid) continue;
+                if (px.z <= ground_z_max) continue;  // 排除地面高度带
+                Eigen::Vector3d pw = R_w * Eigen::Vector3d(px.x, px.y, px.z) + t_w;
+                pix_world[k] = pw;
+                pix_valid[k] = true;
+                for (int sid : bspline_map.queryCandidates(pw, 1))
+                    surf_to_kidx[sid].push_back(k);
+            }
+
+            std::vector<bool> confirmed_matched(pixels.size(), false);
+            for (auto& [sid, kidxs] : surf_to_kidx) {
+                const BSplineMapEntry* entry = bspline_map.getEntry(sid);
+                if (!entry || !entry->surface) continue;
+                std::vector<Eigen::Vector3d> batch;
+                batch.reserve(kidxs.size());
+                for (int k : kidxs) batch.push_back(pix_world[k]);
+                std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> fps;
+                std::vector<double> dists;
+                entry->surface->findFootPrint(batch, fps, dists);
+                for (int i = 0; i < (int)kidxs.size(); ++i) {
+                    double d = std::sqrt(std::abs(dists[i]));
+                    if (d > 1e-6 && d <= match_dist_thr)
+                        confirmed_matched[kidxs[i]] = true;
+                }
+            }
+
+            int n_valid = static_cast<int>(std::count(pix_valid.begin(), pix_valid.end(), true));
+            if (n_valid < MIN_CLUSTER_PTS) continue;
+
+            auto cloud_local = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+            cloud_local->reserve(pixels.size());
+            for (int k = 0; k < (int)pixels.size(); ++k) {
+                if (!pix_valid[k] || confirmed_matched[k]) continue;
+                const auto& px = range_proc.range_image_[pixels[k]];
+                cloud_local->push_back(pcl::PointXYZ(px.x, px.y, px.z));
+            }
+            const int n_unmatched = static_cast<int>(cloud_local->size());
+            if (n_unmatched < MIN_CLUSTER_PTS) continue;
+            if (static_cast<double>(n_unmatched) / n_valid < param.map_unmatched_ratio_min) continue;
+
+            const int num_cp = chooseControlGridSize(n_unmatched);
+            auto cloud_world = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+            pcl::transformPointCloud(*cloud_local, *cloud_world, T_world.cast<float>());
+
+            auto init_cp = range_proc.computeInitControlPoints(seg, cid, num_cp, num_cp, 2);
+            if (init_cp.empty()) continue;
+            for (auto& cp : init_cp) cp = R_w * cp + t_w;
+
+            auto surf = std::make_shared<BSplineSurface>(3, 3, num_cp, num_cp, 0.25);
+            surf->setExternalInitControls(init_cp);
+            surf->apply(cloud_world, 50, 1, 1, 0.05);
+            bspline_map.addSurface(surf, cloud_world, /*is_ground=*/false, g_data.step);
+            ++n_added_obs;
+        }
+    }
+
+    std::cout << "  [MapBuild] step=" << g_data.step
+              << " clusters=" << seg.clusters.size()
+              << " +gnd=" << n_added_gnd << " +obs=" << n_added_obs
               << " total=" << bspline_map.size()
+              << " (gnd=" << bspline_map.groundSurfaceCount() << ")"
               << " (" << t_upd.toc() << " ms)" << std::endl;
 }
 
-void SLAMesher::buildGroundMap(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
-                               const Transf& T_world,
-                               BSplineMap& bspline_map,
-                               double ground_z_min,
-                               double ground_z_max)
-{
-    const Eigen::Matrix3d R_w = T_world.block<3,3>(0,0);
-    const Eigen::Vector3d t_w = T_world.block<3,1>(0,3);
-    constexpr int    MIN_GND_PTS      = 30;
-    constexpr double GROUND_CELL_SIZE = 5.0;   // 地面分格大小（米），每格建一张 BSpline
-
-    // 步骤 1：传感器系 z 范围提取地面点，转世界系，按 GROUND_CELL_SIZE 大格分桶
-    // 使用 VoxelKey(gx, gy, 0) 作为 2D 桶 key
-    std::unordered_map<VoxelKey, pcl::PointCloud<pcl::PointXYZ>::Ptr, VoxelKeyHash> buckets;
-    for (const auto& pt : scan_local) {
-        if (pt.z < ground_z_min || pt.z > ground_z_max) continue;
-        Eigen::Vector3d pw = R_w * Eigen::Vector3d(pt.x, pt.y, pt.z) + t_w;
-        VoxelKey key;
-        key.x = static_cast<int>(std::floor(pw.x() / GROUND_CELL_SIZE));
-        key.y = static_cast<int>(std::floor(pw.y() / GROUND_CELL_SIZE));
-        key.z = 0;
-        auto& bucket = buckets[key];
-        if (!bucket) bucket = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-        bucket->push_back(pcl::PointXYZ(pw.x(), pw.y(), pw.z()));
-    }
-
-    if (buckets.empty()) return;
-
-    // 步骤 2 & 3：逐大格去重 → 拟合地面 BSpline → 写入地图
-    const double vs = bspline_map.getVoxelSize();
-    int n_added = 0;
-    for (auto& [key, cloud] : buckets) {
-        if ((int)cloud->size() < MIN_GND_PTS) continue;
-
-        // 将大格范围转成 BSplineMap 体素坐标范围，查 voxel_index_ 去重
-        const double x_min = key.x * GROUND_CELL_SIZE;
-        const double x_max = x_min + GROUND_CELL_SIZE;
-        const double y_min = key.y * GROUND_CELL_SIZE;
-        const double y_max = y_min + GROUND_CELL_SIZE;
-        const int ix_lo = static_cast<int>(std::floor(x_min / vs));
-        const int ix_hi = static_cast<int>(std::floor((x_max - 1e-9) / vs));
-        const int iy_lo = static_cast<int>(std::floor(y_min / vs));
-        const int iy_hi = static_cast<int>(std::floor((y_max - 1e-9) / vs));
-
-        // 该 1.6m 体素范围内已有地面曲面则跳过
-        if (bspline_map.hasGroundSurfaceInVoxelRange(ix_lo, ix_hi, iy_lo, iy_hi)) continue;
-
-        const int num_cp = chooseControlGridSize((int)cloud->size());
-        auto surf = std::make_shared<BSplineSurface>(3, 3, num_cp, num_cp, 0.25);
-        surf->apply(cloud, 30, 1, 1, 0.05);
-        bspline_map.addSurface(surf, cloud, /*is_ground=*/true, g_data.step);
-        ++n_added;
-    }
-
-    if (n_added > 0)
-        std::cout << "  [GroundMap] step=" << g_data.step
-                  << " buckets=" << buckets.size()
-                  << " added=" << n_added
-                  << " total_ground=" << bspline_map.groundSurfaceCount() << std::endl;
-}
 
 void SLAMesher::printMapSummary(const BSplineMap& bspline_map) const
 {
@@ -1358,12 +1360,6 @@ void SLAMesher::saveControlPointsToTxt(const BSplineMap& bspline_map,
     };
 
     std::string all_sample_path = build_dir + "/all_surfaces.txt";
-    if (filter_by_step) {
-        const int lo = (step_begin > 0) ? step_begin : 0;
-        const int hi = (step_end   > 0) ? step_end   : 0;
-        all_sample_path = build_dir + "/all_surfaces_" + std::to_string(lo)
-                        + "_" + std::to_string(hi) + ".txt";
-    }
 
     auto findSpan = [](double t, const std::vector<double>& knots, int num_cp) {
         if (t >= 1.0 - 1e-9) return num_cp - 1;
@@ -1400,8 +1396,6 @@ void SLAMesher::saveControlPointsToTxt(const BSplineMap& bspline_map,
             return;
         }
         all_sample << std::fixed << std::setprecision(6);
-        if (filter_by_step)
-            all_sample << "# created_step sid is_ground x y z\n";
         write_all_samples = true;
     }
 
@@ -1467,9 +1461,7 @@ void SLAMesher::saveControlPointsToTxt(const BSplineMap& bspline_map,
                     const double v = (kSampleGridV > 1) ? double(iv) / double(kSampleGridV - 1) : 0.0;
                     const BSplineSurface::Parameter paraV(findSpan(v, knV, num_cpv), v);
                     const Eigen::Vector3d p = surf->getPos(paraU, paraV, knU, knV, cps, num_cpv);
-                    all_sample << e->created_step << " " << sid << " "
-                               << (e->is_ground ? 1 : 0) << " "
-                               << p.x() << " " << p.y() << " " << p.z() << "\n";
+                    all_sample << p.x() << " " << p.y() << " " << p.z() << "\n";
                     ++n_all_sample_pts;
                 }
             }
@@ -1543,9 +1535,8 @@ void SLAMesher::process(){
         std::cout << "===STEP " << g_data.step << "=== points: " << scan_local.size() << std::endl;
 
         if(g_data.step == 1){
-            processFirstFrame(scan_local, T_world, range_proc, bspline_map,
-                              z_ground_ref, ground_z_thr);
-            buildGroundMap(scan_local, T_world, bspline_map, GROUND_Z_MIN, GROUND_Z_MAX);
+            processFirstFrame(scan_local, T_world, z_ground_ref, ground_z_thr);
+            runMapBuild(scan_local, T_world, range_proc, bspline_map, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
             continue;
         }
 
@@ -1572,11 +1563,7 @@ void SLAMesher::process(){
             traj_file.flush();
         }
 
-        runMapUpdate(scan_local, T_world, range_proc, bspline_map, match_dist_thr);
-
-        if (g_data.step % param.ground_build_interval == 0) {
-            buildGroundMap(scan_local, T_world, bspline_map, GROUND_Z_MIN, GROUND_Z_MAX);
-        }
+        runMapBuild(scan_local, T_world, range_proc, bspline_map, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
 
         path_pub.publish(g_data.path);
         std::cout << "===STEP " << g_data.step << "=== Total: " << t_step.toc() << " ms===" << std::endl;

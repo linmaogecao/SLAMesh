@@ -79,7 +79,7 @@ public:
     const float FOV_DOWN = -24.8f;
     const double MIN_RANGE = 1.0;
     const double MAX_RANGE = 50.0;
-    const double MIN_Z = -1.5;   // 低于此高度的点不进 range image (世界系/雷达系)
+    const double MIN_Z = -2.5;   // 低于此高度的点不进 range image (世界系/雷达系)
     double alpha_vert_rad_;
     double alpha_horiz_rad_;
     std::vector<RangePixel> range_image_;

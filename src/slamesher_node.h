@@ -23,6 +23,8 @@ public:
     double grid, voxel_size, converge_thr;
     double ground_w_rp{0.0}, ground_w_z{0.0};
     double ground_match_w_n{0.0}, ground_match_w_t{0.1};  // 地面 BSpline 匹配法向/切向权重
+    double ground_coverage_min{0.75};   // 簇内已覆盖比例 >= 此值时跳过建图
+    double map_unmatched_ratio_min{0.30}; // 簇内未匹配比例 >= 此值才新建障碍曲面
 
     double correction_x{0}, correction_y{0}, correction_z{0},
     correction_roll_degree{0}, correction_pitch_degree{0}, correction_yaw_degree{0};
@@ -181,10 +183,9 @@ private:
         bool is_ground = false;
     };
 
+    // 第 1 帧：初始化 z_ground_ref + updatePose；建图由 runMapBuild 统一处理
     void processFirstFrame(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                            Transf& T_world,
-                           RangeImageProcessor& range_proc,
-                           BSplineMap& bspline_map,
                            double& z_ground_ref,
                            double ground_z_thr);
 
@@ -209,19 +210,14 @@ private:
                              double ground_z_min,
                              double ground_z_max);
 
-    void runMapUpdate(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
-                      const Transf& T_world,
-                      RangeImageProcessor& range_proc,
-                      BSplineMap& bspline_map,
-                      double match_dist_thr);
-
-    // 提取地面点（传感器系 z 范围）→ 转世界系 → 按体素去重 → 拟合 BSpline → is_ground=true 写入地图
-    // 第 1 帧和每隔 ground_build_interval 帧调用一次
-    void buildGroundMap(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
-                        const Transf& T_world,
-                        BSplineMap& bspline_map,
-                        double ground_z_min,
-                        double ground_z_max);
+    // 统一建图：一次 range image 分割 → z 分流地面/障碍 → 按各自 interval 决定是否建图
+    void runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                     const Transf& T_world,
+                     RangeImageProcessor& range_proc,
+                     BSplineMap& bspline_map,
+                     double match_dist_thr,
+                     double ground_z_min,
+                     double ground_z_max);
 
     void printMapSummary(const BSplineMap& bspline_map) const;
     void saveControlPointsToTxt(const BSplineMap& bspline_map,
