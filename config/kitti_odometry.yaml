@@ -8,12 +8,13 @@ slamesher:
   dataset: 1
   max_steps: 10000
   max_frames: 200         # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
-  dump_frame: 0          # 0=不保存；>0 时在对应 step 配准结束后导出到 /home/albus/slam-math/Bspline/build/
+  dump_frame: 140          # 0=不保存；>0 时在对应 step 配准结束后导出 matched/unmatched 到 build/
+  dump_cluster_step: 0   # 0=不保存；>0 时在该 step 建图分割后导出障碍 cluster 到 build/output_clusters/
   console_log_path: "/home/albus/catkin_ws/src/SLAMesh/debug.txt"   # 空=自动写到 file_loc_report/seq##_run_时间.log；也可填绝对路径如 debug.txt
-  save_surface_samples: false  # true 时在 global_map/ 下按序号保存曲面稀疏采样点（全序列）
+  save_surface_samples: true  # true 时在 global_map/ 下按序号保存曲面稀疏采样点（全序列）
   all_surfaces_max_step: 0  # 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面（如 60）
-  map_save_step_begin: 0  # 与 end 配合的 step 闭区间过滤（all_surfaces_max_step>0 时优先）
-  map_save_step_end:   0  # 0=不限；例 begin=100 end=150 只导出该区间新建的曲面
+  map_save_step_begin: 100  # 与 end 配合的 step 闭区间过滤（all_surfaces_max_step>0 时优先）
+  map_save_step_end:   130  # 0=不限；例 begin=100 end=150 只导出该区间新建的曲面
   save_mesh_map: false
   #register param
   range_max: 100

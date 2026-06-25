@@ -504,11 +504,15 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/max_steps", max_steps, 1);
     nh.param("slamesher/max_frames", max_frames, 0);
     nh.param("slamesher/dump_frame", dump_frame, 0);
+    nh.param("slamesher/dump_cluster_step", dump_cluster_step, 0);
     nh.param("slamesher/all_surfaces_max_step", all_surfaces_max_step, 0);
     std::cout<<"max_steps: "<<max_steps<<std::endl;
     std::cout<<"max_frames: "<<max_frames<<(max_frames > 0 ? " (debug stop)" : " (run full sequence)")<<std::endl;
     std::cout<<"dump_frame: "<<dump_frame
              <<(dump_frame > 0 ? " (save matched/unmatched -> " + std::string(kBsplineBuildDir) + ")" : " (off)")
+             <<std::endl;
+    std::cout<<"dump_cluster_step: "<<dump_cluster_step
+             <<(dump_cluster_step > 0 ? " (save clusters -> " + std::string(kBsplineBuildDir) + "/output_clusters)" : " (off)")
              <<std::endl;
     std::cout<<"all_surfaces_max_step: "<<all_surfaces_max_step
              <<(all_surfaces_max_step > 0 ? " (export surfaces with created_step <= N)" : " (off)")
@@ -1111,9 +1115,10 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
     constexpr int    MAX_NEW_SURFACES = 70;
     constexpr double MATCH_DIST_GND   = 0.5;   // 地面覆盖率检测距离阈值
 
+    const bool dump_clusters = (param.dump_cluster_step > 0 && g_data.step == param.dump_cluster_step);
     const bool do_obstacle = (g_data.step == 1) || (g_data.step % param.map_update_interval  == 0);
     const bool do_ground   = (g_data.step == 1) || (g_data.step % param.ground_build_interval == 0);
-    if (!do_obstacle && !do_ground) return;
+    if (!do_obstacle && !do_ground && !dump_clusters) return;
 
     TicToc t_upd;
     range_proc.generateRangeImage(scan_local);
@@ -1259,6 +1264,21 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
             surf->apply(cloud_world, 50, 1, 1, 0.05);
             bspline_map.addSurface(surf, cloud_world, /*is_ground=*/false, g_data.step);
             ++n_added_obs;
+        }
+    }
+
+    if (dump_clusters) {
+        const std::string cluster_dir = std::string(kBsplineBuildDir) + "/output_clusters";
+        std::error_code ec;
+        std::filesystem::create_directories(cluster_dir, ec);
+        if (ec) {
+            std::cerr << "  [DumpCluster] failed to create dir: " << cluster_dir
+                      << " (" << ec.message() << ")\n";
+        } else {
+            range_proc.saveClustersWorldToTxt(seg, cluster_dir, T_world);
+            std::cout << "  [DumpCluster] step=" << g_data.step
+                      << " clusters=" << seg.clusters.size()
+                      << " -> " << cluster_dir << "/cluster_*.txt (world frame)" << std::endl;
         }
     }
 
