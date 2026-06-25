@@ -18,12 +18,10 @@ public:
     int    max_steps{10000}, max_frames{0}, dump_frame{0}, register_times, num_test, min_points_num_to_gp, num_thread, cross_cell_overlap_length, dataset;
     int    map_update_interval{20}, ground_build_interval{20};
     int    map_save_step_begin{0}, map_save_step_end{0};  // 0=不限；导出 created_step 在此闭区间内的曲面
+    int    all_surfaces_max_step{0};  // 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面
     double range_max, range_min, range_unit;
     double variance_register, variance_map_update, variance_map_show, variance_min, variance_sensor;
     double grid, voxel_size, converge_thr;
-    double ground_w_rp{0.0}, ground_w_z{0.0};
-    double ground_match_w_n{0.0}, ground_match_w_t{0.1};  // 地面 BSpline 匹配法向/切向权重
-    double ground_coverage_min{0.75};   // 簇内已覆盖比例 >= 此值时跳过建图
     double map_unmatched_ratio_min{0.30}; // 簇内未匹配比例 >= 此值才新建障碍曲面
 
     double correction_x{0}, correction_y{0}, correction_z{0},
@@ -169,12 +167,6 @@ public:
     void process();
 
 private:
-    struct GroundConstraint {
-        Eigen::Vector3d n_local = Eigen::Vector3d::UnitZ();
-        Eigen::Vector3d c_local = Eigen::Vector3d::Zero();
-        bool valid = false;
-    };
-
     struct RegMatch {
         Eigen::Vector3d p_local;
         Eigen::Vector3d p_world;
@@ -183,25 +175,12 @@ private:
         bool is_ground = false;
     };
 
-    // 第 1 帧：初始化 z_ground_ref + updatePose；建图由 runMapBuild 统一处理
-    void processFirstFrame(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
-                           Transf& T_world,
-                           double& z_ground_ref,
-                           double ground_z_thr);
-
-    GroundConstraint computeGroundConstraint(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
-                                             double z_ground_ref,
-                                             double ground_z_thr) const;
+    // 第 1 帧：初始化位姿并建图
+    void processFirstFrame(Transf& T_world);
 
     Transf registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                              Transf T_guess,
                              BSplineMap& bspline_map,
-                             const GroundConstraint& ground,
-                             double z_ground_ref,
-                             double ground_w_rp,
-                             double ground_w_z,
-                             double ground_match_w_n,
-                             double ground_match_w_t,
                              int max_iters,
                              double converge_thr,
                              double match_dist_thr,

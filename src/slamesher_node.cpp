@@ -75,6 +75,10 @@ Parameter param;//parameters
 Log g_data;//global variables
 static ConsoleLogTee g_console_log_tee;
 
+namespace {
+constexpr const char* kBsplineBuildDir = "/home/albus/slam-math/Bspline/build";
+}  // namespace
+
 Log::Log(){
     log_length =  param.max_steps;
     num_cells_now = num_cells_glb = num_cells_new =
@@ -251,7 +255,7 @@ void Log::pose_print(ros::Publisher & cloud_pub) const{//ok
 void Log::savePath2TxtKitti(std::ofstream & file_out, nav_msgs::Path & path_msg){
     //write kitti format pose txt file, from path_msg, before write, transform to the camera frame using provided extrinsic
     if(file_out){
-        for(int i = 0; i<= step-1; i++){
+        for(int i = 1; i<= step; i++){
             Transf T_rectified;
             Transf T_velo2cam = Eigen::Matrix4d::Identity();
             if(param.seq == "/00" || param.seq == "/01" || param.seq == "/02" || param.seq == "/13" || param.seq == "/14" ||
@@ -500,11 +504,15 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/max_steps", max_steps, 1);
     nh.param("slamesher/max_frames", max_frames, 0);
     nh.param("slamesher/dump_frame", dump_frame, 0);
+    nh.param("slamesher/all_surfaces_max_step", all_surfaces_max_step, 0);
     std::cout<<"max_steps: "<<max_steps<<std::endl;
     std::cout<<"max_frames: "<<max_frames<<(max_frames > 0 ? " (debug stop)" : " (run full sequence)")<<std::endl;
-    std::cout<<"dump_frame: "<<dump_frame<<(dump_frame > 0 ? " (save debug point clouds)" : " (off)")<<std::endl;
-    std::cout<<"ground_w_rp: "<<ground_w_rp<<"  ground_w_z: "<<ground_w_z<<std::endl;
-    std::cout<<"ground_match_w_n: "<<ground_match_w_n<<"  ground_match_w_t: "<<ground_match_w_t<<std::endl;
+    std::cout<<"dump_frame: "<<dump_frame
+             <<(dump_frame > 0 ? " (save matched/unmatched -> " + std::string(kBsplineBuildDir) + ")" : " (off)")
+             <<std::endl;
+    std::cout<<"all_surfaces_max_step: "<<all_surfaces_max_step
+             <<(all_surfaces_max_step > 0 ? " (export surfaces with created_step <= N)" : " (off)")
+             <<std::endl;
     std::cout<<"map_update_interval: "<<map_update_interval
              <<"  ground_build_interval: "<<ground_build_interval<<std::endl;
     nh.param("slamesher/file_loc_report", file_loc_report, std::string("not_set"));
@@ -526,11 +534,6 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/register_times", register_times, 5);
     nh.param("slamesher/map_update_interval", map_update_interval, 20);
     nh.param("slamesher/ground_build_interval", ground_build_interval, 20);
-    nh.param("slamesher/ground_w_rp", ground_w_rp, 0.0);
-    nh.param("slamesher/ground_w_z",  ground_w_z,  0.0);
-    nh.param("slamesher/ground_match_w_n", ground_match_w_n, 0.0);
-    nh.param("slamesher/ground_match_w_t", ground_match_w_t, 0.1);
-    nh.param("slamesher/ground_coverage_min",    ground_coverage_min,    0.75);
     nh.param("slamesher/map_unmatched_ratio_min", map_unmatched_ratio_min, 0.30);
     nh.param("slamesher/cross_overlap", cross_overlap, false);
     nh.param("slamesher/cross_cell_overlap_length", cross_cell_overlap_length, 0);
@@ -885,74 +888,16 @@ int SLAMesher::chooseControlGridSize(int num_fitting_points)
     return std::max(kMinCp, std::min(n, kMaxCp));
 }
 
-void SLAMesher::processFirstFrame(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
-                                  Transf& T_world,
-                                  double& z_ground_ref,
-                                  double ground_z_thr)
+void SLAMesher::processFirstFrame(Transf& T_world)
 {
-    if (std::isnan(z_ground_ref)) {
-        double sum_z = 0.0;
-        int cnt = 0;
-        for (auto& pt : scan_local) {
-            if (pt.z < ground_z_thr) { sum_z += pt.z; cnt++; }
-        }
-        z_ground_ref = (cnt > 10) ? (sum_z / cnt) : -1.73;
-        std::cout << "  [Ground] z_ground_ref = " << z_ground_ref << " m" << std::endl;
-    }
-
     g_data.updatePose(T_world);
     pubTf();
     path_pub.publish(g_data.path);
 }
 
-SLAMesher::GroundConstraint SLAMesher::computeGroundConstraint(
-    const pcl::PointCloud<pcl::PointXYZ>& scan_local,
-    double z_ground_ref,
-    double ground_z_thr) const
-{
-    GroundConstraint gnd;
-    gnd.c_local = Eigen::Vector3d(0, 0, z_ground_ref);
-
-    if (std::isnan(z_ground_ref)) return gnd;
-
-    std::vector<Eigen::Vector3d> gpts;
-    gpts.reserve(2000);
-    for (size_t gi = 0; gi < scan_local.size(); gi += 2) {
-        if (scan_local[gi].z < ground_z_thr)
-            gpts.emplace_back(scan_local[gi].x, scan_local[gi].y, scan_local[gi].z);
-    }
-    if ((int)gpts.size() < 20) return gnd;
-
-    Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
-    for (auto& p : gpts) centroid += p;
-    centroid /= (double)gpts.size();
-
-    Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
-    for (auto& p : gpts) {
-        Eigen::Vector3d d = p - centroid;
-        cov += d * d.transpose();
-    }
-    cov /= (double)gpts.size();
-
-    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> eig(cov);
-    Eigen::Vector3d n = eig.eigenvectors().col(0);
-    if (n.z() < 0) n = -n;
-
-    gnd.n_local = n;
-    gnd.c_local = centroid;
-    gnd.valid   = true;
-    return gnd;
-}
-
 Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                                     Transf T_guess,
                                     BSplineMap& bspline_map,
-                                    const GroundConstraint& ground,
-                                    double z_ground_ref,
-                                    double ground_w_rp,
-                                    double ground_w_z,
-                                    double ground_match_w_n,
-                                    double ground_match_w_t,
                                     int max_iters,
                                     double converge_thr,
                                     double match_dist_thr,
@@ -1035,7 +980,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
                 Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) +
                 T_curr.block<3,1>(0,3);
-            for (int sid : bspline_map.queryCandidates(p_w, 1))
+            for (int sid : bspline_map.queryCandidates(p_w, 2))
                 obs_surf_to_pts[sid].push_back(i);
         }
 
@@ -1073,18 +1018,10 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         ceres::Problem problem;
         problem.AddParameterBlock(parameters, 7, new PoseSE3Parameterization());
 
-        // 地面匹配：大法向权重（管 roll/pitch/高度），小切向（不乱改 x/y/yaw）
-        // 障碍匹配：原 SDM 残差
+        // 地面和障碍统一用 SDM 残差
         for (auto& m : matches) {
-            ceres::CostFunction* cost;
-            if (m.is_ground) {
-                cost = new GroundSDMRegistrationCostFunction(
-                    m.p_local, m.p_world, m.curvature,
-                    ground_match_w_n, ground_match_w_t);
-            } else {
-                cost = new SDMRegistrationCostFunction(
-                    m.p_local, m.p_world, m.curvature);
-            }
+            ceres::CostFunction* cost = new SDMRegistrationCostFunction(
+                m.p_local, m.p_world, m.curvature);
             problem.AddResidualBlock(cost, loss, parameters);
         }
 
@@ -1111,43 +1048,53 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                   << " (gnd~" << n_gnd << " obs~" << (matches.size() - n_gnd) << ")" << std::endl;
     }
 
-    if (param.dump_frame > 0 && g_data.step == param.dump_frame && !last_matches.empty()) {
-        const std::string base = "/home/albus/slam-math/Bspline/build/";
-        const std::string tag  = std::to_string(g_data.step);
-        const Eigen::Matrix3d R = T_curr.block<3, 3>(0, 0);
-        const Eigen::Vector3d t = T_curr.block<3, 1>(0, 3);
+    if (param.dump_frame > 0 && g_data.step == param.dump_frame) {
+        const std::string base = kBsplineBuildDir;
+        std::error_code ec;
+        std::filesystem::create_directories(base, ec);
+        if (ec) {
+            std::cerr << "  [Dump] failed to create dir: " << base << " (" << ec.message() << ")\n";
+        } else {
+            const Eigen::Matrix3d R = T_curr.block<3, 3>(0, 0);
+            const Eigen::Vector3d t = T_curr.block<3, 1>(0, 3);
 
-        std::ofstream f_scan(base + "scan_world.txt", std::ios::out | std::ios::trunc);
-        f_scan << std::fixed << std::setprecision(6);
-        for (const auto& pt : scan_local.points) {
-            const Eigen::Vector3d p_w = R * Eigen::Vector3d(pt.x, pt.y, pt.z) + t;
-            f_scan << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+            std::ofstream f_scan(base + "/scan_world.txt", std::ios::out | std::ios::trunc);
+            f_scan << std::fixed << std::setprecision(6);
+            for (const auto& pt : scan_local.points) {
+                const Eigen::Vector3d p_w = R * Eigen::Vector3d(pt.x, pt.y, pt.z) + t;
+                f_scan << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+            }
+            f_scan.close();
+
+            std::ofstream f_matched(base + "/matched.txt", std::ios::out | std::ios::trunc);
+            f_matched << std::fixed << std::setprecision(6);
+            for (const auto& m : last_matches)
+                f_matched << m.p_world.x() << " " << m.p_world.y() << " " << m.p_world.z() << "\n";
+            f_matched.close();
+
+            std::unordered_set<int> matched_set;
+            for (const auto& m : last_matches) matched_set.insert(m.scan_idx);
+
+            int n_unmatched = 0;
+            std::ofstream f_unmatched(base + "/unmatched.txt", std::ios::out | std::ios::trunc);
+            f_unmatched << std::fixed << std::setprecision(6);
+            for (int i = 0; i < (int)scan_local.size(); i += skip_points) {
+                const double z = scan_local[i].z;
+                const bool is_gnd = (z >= ground_z_min && z <= ground_z_max);
+                const bool is_obs = (z >= match_min_z);
+                if (!is_gnd && !is_obs) continue;
+                if (matched_set.count(i)) continue;
+                const Eigen::Vector3d p_w = R * Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) + t;
+                f_unmatched << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+                ++n_unmatched;
+            }
+            f_unmatched.close();
+
+            std::cout << "  [Dump] step=" << g_data.step
+                      << " matched=" << last_matches.size()
+                      << " unmatched=" << n_unmatched
+                      << " -> " << base << "/{matched,unmatched,scan_world}.txt" << std::endl;
         }
-        f_scan.close();
-
-        std::ofstream f_matched(base + "matched.txt", std::ios::out | std::ios::trunc);
-        f_matched << std::fixed << std::setprecision(6);
-        for (const auto& m : last_matches)
-            f_matched << m.p_world.x() << " " << m.p_world.y() << " " << m.p_world.z() << "\n";
-        f_matched.close();
-
-        std::unordered_set<int> matched_set;
-        for (const auto& m : last_matches) matched_set.insert(m.scan_idx);
-
-        std::ofstream f_unmatched(base + "unmatched.txt", std::ios::out | std::ios::trunc);
-        f_unmatched << std::fixed << std::setprecision(6);
-        for (int i = 0; i < (int)scan_local.size(); i += skip_points) {
-            if (scan_local[i].z < match_min_z) continue;
-            if (matched_set.count(i)) continue;
-            const Eigen::Vector3d p_w = R * Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) + t;
-            f_unmatched << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
-        }
-        f_unmatched.close();
-
-        std::cout << "  [Dump] frame=" << g_data.step
-                  << " matched=" << last_matches.size()
-                  << " unmatched=" << (scan_local.size() / skip_points - matched_set.size())
-                  << " -> " << base << tag << "_*.txt" << std::endl;
     }
     return T_curr;
 }
@@ -1345,7 +1292,7 @@ void SLAMesher::saveControlPointsToTxt(const BSplineMap& bspline_map,
                                        int step_begin,
                                        int step_end) const
 {
-    const std::string build_dir = "/home/albus/slam-math/Bspline/build";
+    const std::string build_dir = kBsplineBuildDir;
     constexpr int kSampleGridU = 8;
     constexpr int kSampleGridV = 8;
 
@@ -1510,10 +1457,6 @@ void SLAMesher::process(){
         traj_file << std::fixed << std::setprecision(6);
     }
 
-    // 地面约束参考高度 (雷达系下地面 z，由第一帧初始化，约 -1.73m)
-    static double z_ground_ref   = std::numeric_limits<double>::quiet_NaN();
-    // 地面点 z 阈值（传感器系）：KITTI lidar 距地面约 1.73m，取 -1.0m 为截止
-    const double ground_z_thr    = -1.0;
     // buildGroundMap 用：传感器系下地面点 z 范围
     const double GROUND_Z_MIN    = -3.0;
     const double GROUND_Z_MAX    = -1.0;
@@ -1535,18 +1478,15 @@ void SLAMesher::process(){
         std::cout << "===STEP " << g_data.step << "=== points: " << scan_local.size() << std::endl;
 
         if(g_data.step == 1){
-            processFirstFrame(scan_local, T_world, z_ground_ref, ground_z_thr);
+            processFirstFrame(T_world);
             runMapBuild(scan_local, T_world, range_proc, bspline_map, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
             continue;
         }
 
         TicToc t_register;
         Transf T_guess = getOdom();
-        GroundConstraint ground = computeGroundConstraint(scan_local, z_ground_ref, ground_z_thr);
 
-        T_world = registerScanToMap(scan_local, T_guess, bspline_map, ground,
-                                    z_ground_ref, param.ground_w_rp, param.ground_w_z,
-                                    param.ground_match_w_n, param.ground_match_w_t,
+        T_world = registerScanToMap(scan_local, T_guess, bspline_map,
                                     max_rg_iters, converge_thr, match_dist_thr, skip_points,
                                     range_proc.MIN_Z, GROUND_Z_MIN, GROUND_Z_MAX);
 
@@ -1573,7 +1513,9 @@ void SLAMesher::process(){
     std::cout << "Process finished. Total time: " << t_whole.toc() / 1000.0 << " s" << std::endl;
 
     printMapSummary(bspline_map);
-    if (param.map_save_step_begin > 0 || param.map_save_step_end > 0) {
+    if (param.all_surfaces_max_step > 0) {
+        saveControlPointsToTxt(bspline_map, true, 0, param.all_surfaces_max_step);
+    } else if (param.map_save_step_begin > 0 || param.map_save_step_end > 0) {
         saveControlPointsToTxt(bspline_map, true,
                                param.map_save_step_begin, param.map_save_step_end);
     } else {

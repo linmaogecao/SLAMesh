@@ -80,21 +80,6 @@ public:
 
     double getVoxelSize() const { return voxel_size_; }
 
-    // 查 voxel_index_ 中某 XY 体素范围内是否已有地面曲面（buildGroundMap 大格去重用）
-    // ix_lo..ix_hi, iy_lo..iy_hi 为 BSplineMap 体素坐标（整数）
-    bool hasGroundSurfaceInVoxelRange(int ix_lo, int ix_hi,
-                                      int iy_lo, int iy_hi) const {
-        for (const auto& [key, sids] : voxel_index_) {
-            if (key.x < ix_lo || key.x > ix_hi) continue;
-            if (key.y < iy_lo || key.y > iy_hi) continue;
-            for (int sid : sids) {
-                if (sid >= 0 && sid < (int)entries_.size() && entries_[sid].is_ground)
-                    return true;
-            }
-        }
-        return false;
-    }
-
     int groundSurfaceCount() const {
         int cnt = 0;
         for (const auto& e : entries_) if (e.is_ground) ++cnt;

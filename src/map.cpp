@@ -16,7 +16,8 @@ bool getPointCloud(PointMatrix & points_result, pcl::PointCloud<pcl::PointXYZ> &
     int data_set = param.dataset;//1  kitti, 2 maicity,
     //read
     if(param.read_offline_pcd) {
-        if(!readKitti(param.file_loc_dataset, param.seq, g_data.step, data_set,  *pcl_raw_ptr)){
+        const int frame_idx = std::max(0, g_data.step - 1);
+        if(!readKitti(param.file_loc_dataset, param.seq, frame_idx, data_set,  *pcl_raw_ptr)){
             std::cout << "No more PCD file!" << std::endl;
             return false;
         }

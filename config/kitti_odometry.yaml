@@ -7,12 +7,13 @@ slamesher:
   read_offline_pcd: true 
   dataset: 1
   max_steps: 10000
-  max_frames: 200          # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
-  dump_frame: 0          # 0=不保存；>0 时在该帧配准结束后保存世界系点云+匹配/未匹配点
+  max_frames: 61         # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
+  dump_frame: 60          # 0=不保存；>0 时在对应 step 配准结束后导出到 /home/albus/slam-math/Bspline/build/
   console_log_path: "/home/albus/catkin_ws/src/SLAMesh/debug.txt"   # 空=自动写到 file_loc_report/seq##_run_时间.log；也可填绝对路径如 debug.txt
   save_surface_samples: true  # true 时在 global_map/ 下按序号保存曲面稀疏采样点（全序列）
-  map_save_step_begin: 0  # 0=不限；>0 时与 end 配合，只导出该 step 闭区间内新建的曲面
-  map_save_step_end:   1000  # 例：1000+1500 → all_surfaces_1000_1500.txt
+  all_surfaces_max_step: 60  # 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面（如 60）
+  map_save_step_begin: 0  # 与 end 配合的 step 闭区间过滤（all_surfaces_max_step>0 时优先）
+  map_save_step_end:   0  # 0=不限；例 begin=100 end=150 只导出该区间新建的曲面
   save_mesh_map: false
   #register param
   range_max: 100
@@ -20,11 +21,6 @@ slamesher:
   register_times: 2
   map_update_interval: 10      # 障碍 MapUpdate 间隔（帧）；step % N == 0 时建障碍曲面
   ground_build_interval: 10    # 地面 buildGroundMap 间隔（帧）；第1帧 + step % N == 0
-  ground_w_rp: 0.0   # GroundPlaneConstraint 已移除，此参数不再使用
-  ground_w_z:  0.0   # GroundPlaneConstraint 已移除，此参数不再使用
-  ground_match_w_n: 0.0   # 地面 BSpline 匹配法向权重（roll/pitch/高度）；0=关闭法向约束
-  ground_match_w_t: 0.0   # 地面 BSpline 匹配切向权重（x/y/yaw）；0=完全不用地面匹配残差
-  ground_coverage_min: 0.75     # 簇内已覆盖比例 >= 此值时跳过地面建图
   map_unmatched_ratio_min: 0.30 # 簇内未匹配比例 >= 此值才新建障碍曲面
   cross_overlap: true
   cross_cell_overlap_length: 1
@@ -37,7 +33,7 @@ slamesher:
   visualisation_type: 3
   #gp param
   num_thread: 8
-  grid: 1.6
+  grid: 2
   min_points_num_to_gp: 11
   num_test: 6
   
