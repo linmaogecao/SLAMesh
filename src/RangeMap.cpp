@@ -94,7 +94,9 @@ void RangeImageProcessor::saveRangeImageBin(const std::string& filename) {
     std::cout << ">>> Range Image 已成功保存至: " << filename << " <<<\n";
 }
 
-SegmentationResult RangeImageProcessor::segmentRangeImage(double theta_deg, double max_dist, int min_cluster_size) {
+SegmentationResult RangeImageProcessor::segmentRangeImage(double theta_deg, double max_dist, int min_cluster_size,
+                                                        double ground_z_min, double ground_z_max,
+                                                        bool exclude_ground_band) {
     SegmentationResult result;
     const int pixel_num = H_SCANS * W_COLS;
     result.label_map.assign(pixel_num, 0);
@@ -102,10 +104,17 @@ SegmentationResult RangeImageProcessor::segmentRangeImage(double theta_deg, doub
     const double theta_rad = theta_deg * M_PI / 180.0;
     //const double normal_cos_thresh = std::cos(normal_angle_deg * M_PI / 180.0);
 
-    // ---------- 1. 标记有效像素 ----------
+    auto isGroundPixel = [&](const RangePixel& px) {
+        return px.z >= ground_z_min && px.z <= ground_z_max;
+    };
+
+    // ---------- 1. 标记有效像素（可选排除地面高度带） ----------
     std::vector<bool> pixel_valid(pixel_num, false);
     for (int idx = 0; idx < pixel_num; ++idx) {
-        if (range_image_[idx].valid) pixel_valid[idx] = true;
+        const auto& px = range_image_[idx];
+        if (!px.valid) continue;
+        if (exclude_ground_band && isGroundPixel(px)) continue;
+        pixel_valid[idx] = true;
     }
 
     // ---------- 2. 预计算法向量 ----------

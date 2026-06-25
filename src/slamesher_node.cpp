@@ -1117,29 +1117,27 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
 
     TicToc t_upd;
     range_proc.generateRangeImage(scan_local);
-    SegmentationResult seg = range_proc.segmentRangeImage(5, 0.1, MIN_CLUSTER_PTS);
+    // 障碍聚类：地面高度带像素不参与 BFS
+    SegmentationResult seg = range_proc.segmentRangeImage(
+        5, 0.1, MIN_CLUSTER_PTS, ground_z_min, ground_z_max, true);
 
     const Eigen::Matrix3d R_w = T_world.block<3,3>(0,0);
     const Eigen::Vector3d t_w = T_world.block<3,1>(0,3);
 
     int n_added_gnd = 0, n_added_obs = 0;
 
-    // ── 地面分支：汇总全帧所有地面点 → 全局匹配已有地面面 → 未覆盖点拟合一张大地面 ──
+    // ── 地面分支：直接扫 range image 地面像素，不经过 cluster ──
     if (do_ground) {
         constexpr int MIN_GND_PTS = 50;
         constexpr int GND_NUM_CP  = 15;   // 控制点足够多，信任拟合算法
 
-        // 步骤 1：遍历所有 cluster，收集雷达系 z 带内的地面点（世界系）
         auto cloud_gnd_all = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-        for (int cid2 = 0; cid2 < (int)seg.clusters.size(); cid2++) {
-            for (int pidx : seg.clusters[cid2]) {
-                const auto& px = range_proc.range_image_[pidx];
-                if (!px.valid) continue;
-                if (px.z < ground_z_min || px.z > ground_z_max) continue;
-                Eigen::Vector3d pw = R_w * Eigen::Vector3d(px.x, px.y, px.z) + t_w;
-                cloud_gnd_all->push_back(pcl::PointXYZ(
-                    static_cast<float>(pw.x()), static_cast<float>(pw.y()), static_cast<float>(pw.z())));
-            }
+        for (const auto& px : range_proc.range_image_) {
+            if (!px.valid) continue;
+            if (px.z < ground_z_min || px.z > ground_z_max) continue;
+            Eigen::Vector3d pw = R_w * Eigen::Vector3d(px.x, px.y, px.z) + t_w;
+            cloud_gnd_all->push_back(pcl::PointXYZ(
+                static_cast<float>(pw.x()), static_cast<float>(pw.y()), static_cast<float>(pw.z())));
         }
 
         if ((int)cloud_gnd_all->size() >= MIN_GND_PTS) {
@@ -1196,7 +1194,7 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
         }
     }
 
-    // ── 障碍分支：z > ground_z_max 的像素，未匹配比例达标才建图 ──
+    // ── 障碍分支：仅对非地面 cluster 建图（地面已在分割前排除） ──
     for (int cid = 0; cid < (int)seg.clusters.size(); cid++) {
         const auto& pixels = seg.clusters[cid];
         if ((int)pixels.size() < MIN_CLUSTER_PTS) continue;

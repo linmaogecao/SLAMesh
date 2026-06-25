@@ -116,7 +116,10 @@ public:
         return nv;
     }
 
-    SegmentationResult segmentRangeImage(double theta_deg, double max_dist, int min_cluster_size);
+    // exclude_ground_band=true 时，z∈[ground_z_min,ground_z_max] 的像素不参与 BFS 聚类（仅障碍聚类）
+    SegmentationResult segmentRangeImage(double theta_deg, double max_dist, int min_cluster_size,
+                                         double ground_z_min = -1e9, double ground_z_max = 1e9,
+                                         bool exclude_ground_band = false);
     void saveClustersToTxt(const SegmentationResult& result, const std::string& folder_path);
 
     // 与 saveClustersToTxt 相同，但将每个点用 transform (4×4) 变换到目标坐标系后再写入。
