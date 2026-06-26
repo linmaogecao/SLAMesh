@@ -1,0 +1,319 @@
+// GroundGridMap.h
+// XY 2D 栅格地面地图。
+//
+// 设计思路：
+//   世界系 XY 面以固定分辨率 cell_size 划格，每个格子独立维护：
+//     - 落在其中的地面点（世界系 xyz）
+//     - 拟合完成的局部 BSpline 曲面（可为 nullptr）
+//     - 最后更新的 step，用于滑动窗口清理
+//
+// 地面点分 cluster（格）流程：
+//   1. 当前帧地面点（雷达系）→ 变换到世界系
+//   2. 按 (floor(x/cell_size), floor(y/cell_size)) 投格
+//   3. 每格积累点，达到 min_pts 后标记 needs_refit
+//   4. 调用 refitDirty() 对所有 needs_refit 格重新拟合 BSpline
+//
+// 配准查询：
+//   给定世界系点 p，取 (ix,iy) 及其 ±radius 格内所有有效曲面作为候选。
+//   只查当前 step 附近的格（滑动窗口）。
+//
+#pragma once
+
+#include <cmath>
+#include <unordered_map>
+#include <unordered_set>
+#include <vector>
+#include <memory>
+#include <limits>
+#include <Eigen/Core>
+#include <pcl/point_cloud.h>
+#include <pcl/point_types.h>
+#include "BSpline.h"   // BSplineSurface, SurfaceCurvature
+
+// -----------------------------------------------------------------------
+// XY 格子 key（只用 ix, iy，z 方向不划格）
+// -----------------------------------------------------------------------
+struct GroundCellKey {
+    int ix = 0, iy = 0;
+    bool operator==(const GroundCellKey& o) const { return ix == o.ix && iy == o.iy; }
+};
+
+struct GroundCellKeyHash {
+    size_t operator()(const GroundCellKey& k) const {
+        return std::hash<int>()(k.ix) ^ (std::hash<int>()(k.iy) * 2654435761u);
+    }
+};
+
+// -----------------------------------------------------------------------
+// 单个地面格子
+// -----------------------------------------------------------------------
+struct GroundCell {
+    pcl::PointCloud<pcl::PointXYZ> pts;   // 积累的世界系地面点（未采样原始）
+    std::shared_ptr<BSplineSurface> surf;  // 拟合好的局部曲面（nullptr = 未拟合）
+    int last_update_step = -1;            // 最后有新点进来的 step
+    bool needs_refit = false;             // pts 发生变化，需重新拟合
+};
+
+// -----------------------------------------------------------------------
+// XY 2D 栅格地面地图
+// -----------------------------------------------------------------------
+class GroundGridMap {
+public:
+    // cell_size   : XY 栅格边长（米），建议 4–8 m
+    // min_pts     : 格内点数达到此值才触发拟合
+    // num_cp      : BSpline 每维控制点数
+    // active_radius : 配准查询时格坐标半径（格数）
+    explicit GroundGridMap(double cell_size   = 6.0,
+                           int    min_pts     = 80,
+                           int    num_cp      = 5,
+                           int    active_radius = 6)
+        : cell_size_(cell_size),
+          min_pts_(min_pts),
+          num_cp_(num_cp),
+          active_radius_(active_radius)
+    {}
+
+    // -----------------------------------------------------------------------
+    // 把一帧地面点（世界系）投格，按 XY 分组写入对应 GroundCell
+    // 返回新增/更新的格 key 列表
+    // -----------------------------------------------------------------------
+    std::vector<GroundCellKey> addPoints(
+        const pcl::PointCloud<pcl::PointXYZ>& pts_world,
+        int current_step)
+    {
+        std::unordered_set<GroundCellKey, GroundCellKeyHash> touched;
+        for (const auto& pt : pts_world) {
+            GroundCellKey k = toCellKey(pt.x, pt.y);
+            auto& cell = cells_[k];
+            cell.pts.push_back(pt);
+            cell.last_update_step = current_step;
+            cell.needs_refit = true;
+            touched.insert(k);
+        }
+        return {touched.begin(), touched.end()};
+    }
+
+    // -----------------------------------------------------------------------
+    // 对所有 needs_refit 的格执行 BSpline 拟合（或重拟）
+    // 点数不足 min_pts 的格跳过（曲面保持 nullptr 或上次的旧曲面）
+    // -----------------------------------------------------------------------
+    int refitDirty()
+    {
+        int n_fit = 0;
+        for (auto& [k, cell] : cells_) {
+            if (!cell.needs_refit) continue;
+            if (refitCell(k, cell)) ++n_fit;
+        }
+        return n_fit;
+    }
+
+    // 仅重拟合本帧触及的格（避免扫全图）
+    int refitCells(const std::vector<GroundCellKey>& keys)
+    {
+        int n_fit = 0;
+        for (const auto& k : keys) {
+            auto it = cells_.find(k);
+            if (it == cells_.end() || !it->second.needs_refit) continue;
+            if (refitCell(k, it->second)) ++n_fit;
+        }
+        return n_fit;
+    }
+
+    // 配准：在候选曲面中取 footprint 距离最近的一张
+    const BSplineSurface* queryNearestSurface(const Eigen::Vector3d& p) const
+    {
+        const BSplineSurface* best = nullptr;
+        double best_d = std::numeric_limits<double>::max();
+        for (const BSplineSurface* sp : querySurfaces(p)) {
+            std::vector<Eigen::Vector3d> batch{p};
+            std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> fps;
+            std::vector<double> dists;
+            const_cast<BSplineSurface*>(sp)->findFootPrint(batch, fps, dists);
+            if (dists.empty()) continue;
+            double d = std::sqrt(std::abs(dists[0]));
+            if (d < best_d) { best_d = d; best = sp; }
+        }
+        return best;
+    }
+
+    // -----------------------------------------------------------------------
+    // 配准查询：给定世界系点 p，返回附近格的曲面列表（非 nullptr）
+    // 只搜 ±active_radius_ 格范围（2D，z 不限）
+    // -----------------------------------------------------------------------
+    std::vector<const BSplineSurface*> querySurfaces(
+        const Eigen::Vector3d& p) const
+    {
+        std::vector<const BSplineSurface*> result;
+        GroundCellKey center = toCellKey(p.x(), p.y());
+        for (int di = -active_radius_; di <= active_radius_; ++di)
+        for (int dj = -active_radius_; dj <= active_radius_; ++dj) {
+            GroundCellKey k{center.ix + di, center.iy + dj};
+            auto it = cells_.find(k);
+            if (it == cells_.end()) continue;
+            if (it->second.surf) result.push_back(it->second.surf.get());
+        }
+        return result;
+    }
+
+    // 同上，但返回 (BSplineSurface*, cell_key) 对，便于外部区分
+    struct CandEntry {
+        const BSplineSurface* surf;
+        GroundCellKey key;
+    };
+    std::vector<CandEntry> queryCandidates(const Eigen::Vector3d& p) const {
+        std::vector<CandEntry> result;
+        GroundCellKey center = toCellKey(p.x(), p.y());
+        for (int di = -active_radius_; di <= active_radius_; ++di)
+        for (int dj = -active_radius_; dj <= active_radius_; ++dj) {
+            GroundCellKey k{center.ix + di, center.iy + dj};
+            auto it = cells_.find(k);
+            if (it == cells_.end()) continue;
+            if (it->second.surf) result.push_back({it->second.surf.get(), k});
+        }
+        return result;
+    }
+
+    // -----------------------------------------------------------------------
+    // 删除距车辆超过 max_dist 米（XY 曼哈顿格数）的旧格，释放内存
+    // 通常每隔几十帧调用一次
+    // -----------------------------------------------------------------------
+    int removeDistant(const Eigen::Vector3d& vehicle_pos, double max_dist) {
+        GroundCellKey center = toCellKey(vehicle_pos.x(), vehicle_pos.y());
+        int radius_cells = static_cast<int>(std::ceil(max_dist / cell_size_));
+        std::vector<GroundCellKey> to_erase;
+        for (const auto& [k, cell] : cells_) {
+            if (std::abs(k.ix - center.ix) > radius_cells ||
+                std::abs(k.iy - center.iy) > radius_cells)
+                to_erase.push_back(k);
+        }
+        for (const auto& k : to_erase) cells_.erase(k);
+        return static_cast<int>(to_erase.size());
+    }
+
+    // 统计
+    int totalCells() const { return static_cast<int>(cells_.size()); }
+    int fittedCells() const {
+        int n = 0;
+        for (const auto& [k, c] : cells_) if (c.surf) ++n;
+        return n;
+    }
+
+    // 遍历所有已拟合格（用于 all_surfaces 导出）
+    const std::unordered_map<GroundCellKey, GroundCell, GroundCellKeyHash>& cells() const {
+        return cells_;
+    }
+
+    double cellSize() const { return cell_size_; }
+
+    // 全图地面高度统计（世界系 z）
+    struct HeightStats {
+        int total_cells = 0;
+        int fitted_cells = 0;
+        int total_pts = 0;
+        double pts_z_mean = 0;      // 所有格内点的 z 加权平均
+        double pts_z_min = 0;
+        double pts_z_max = 0;
+        double cell_z_mean = 0;     // 每格点云 z 均值的平均（每格等权）
+        double cell_z_min = 0;      // 各格 z 均值的最小
+        double cell_z_max = 0;      // 各格 z 均值的最大
+        double surf_cp_z_mean = 0;  // 已拟合格：控制点 z 均值的平均
+        double surf_cp_z_min = 0;
+        double surf_cp_z_max = 0;
+    };
+
+    HeightStats computeHeightStats() const
+    {
+        HeightStats s;
+        s.total_cells = totalCells();
+        s.fitted_cells = fittedCells();
+
+        double pts_z_sum = 0;
+        bool any_pts = false;
+        bool any_cell_mean = false;
+        bool any_surf = false;
+
+        for (const auto& [k, cell] : cells_) {
+            (void)k;
+            if (cell.pts.empty()) continue;
+
+            double cell_sum = 0;
+            for (const auto& pt : cell.pts) {
+                cell_sum += pt.z;
+                pts_z_sum += pt.z;
+                ++s.total_pts;
+                if (!any_pts) {
+                    s.pts_z_min = s.pts_z_max = pt.z;
+                    any_pts = true;
+                } else {
+                    s.pts_z_min = std::min(s.pts_z_min, static_cast<double>(pt.z));
+                    s.pts_z_max = std::max(s.pts_z_max, static_cast<double>(pt.z));
+                }
+            }
+
+            const double cell_mean = cell_sum / static_cast<double>(cell.pts.size());
+            if (!any_cell_mean) {
+                s.cell_z_min = s.cell_z_max = cell_mean;
+                any_cell_mean = true;
+            } else {
+                s.cell_z_min = std::min(s.cell_z_min, cell_mean);
+                s.cell_z_max = std::max(s.cell_z_max, cell_mean);
+            }
+            s.cell_z_mean += cell_mean;
+
+            if (!cell.surf) continue;
+            const auto& cps = cell.surf->getControls();
+            if (cps.empty()) continue;
+
+            double cp_sum = 0;
+            for (const auto& cp : cps) cp_sum += cp.z();
+            const double cp_mean = cp_sum / static_cast<double>(cps.size());
+            if (!any_surf) {
+                s.surf_cp_z_min = s.surf_cp_z_max = cp_mean;
+                any_surf = true;
+            } else {
+                s.surf_cp_z_min = std::min(s.surf_cp_z_min, cp_mean);
+                s.surf_cp_z_max = std::max(s.surf_cp_z_max, cp_mean);
+            }
+            s.surf_cp_z_mean += cp_mean;
+        }
+
+        if (s.total_pts > 0)
+            s.pts_z_mean = pts_z_sum / static_cast<double>(s.total_pts);
+        if (s.total_cells > 0)
+            s.cell_z_mean /= static_cast<double>(s.total_cells);
+        if (s.fitted_cells > 0)
+            s.surf_cp_z_mean /= static_cast<double>(s.fitted_cells);
+
+        return s;
+    }
+
+private:
+    static constexpr int MAX_FIT_PTS = 1000;  // 每格拟合时最多使用的点数
+
+    bool refitCell(const GroundCellKey& k, GroundCell& cell)
+    {
+        cell.needs_refit = false;
+        const int n = (int)cell.pts.size();
+        if (n < min_pts_) return false;
+
+        auto cloud = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+        const int skip = std::max(1, n / MAX_FIT_PTS);
+        for (int i = 0; i < n; i += skip)
+            cloud->push_back(cell.pts[i]);
+
+        cell.surf = std::make_shared<BSplineSurface>(3, 3, num_cp_, num_cp_, 0.25);
+        cell.surf->apply(cloud, 30, 1, 1, 0.05);
+        return true;
+    }
+
+    GroundCellKey toCellKey(double x, double y) const {
+        return {static_cast<int>(std::floor(x / cell_size_)),
+                static_cast<int>(std::floor(y / cell_size_))};
+    }
+
+    double cell_size_;
+    int    min_pts_;
+    int    num_cp_;
+    int    active_radius_;
+    std::unordered_map<GroundCellKey, GroundCell, GroundCellKeyHash> cells_;
+};

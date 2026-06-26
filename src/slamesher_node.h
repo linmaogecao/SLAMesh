@@ -8,6 +8,7 @@
 #include "RangeMap.h"
 #include "BSplineMap.h"
 #include "BSplineSDMErr.h"
+#include "GroundGridMap.h"
 #include <sensor_msgs/point_cloud_conversion.h>
 #include <pcl/registration/icp.h>
 #include <unordered_set>
@@ -23,6 +24,15 @@ public:
     double variance_register, variance_map_update, variance_map_show, variance_min, variance_sensor;
     double grid, voxel_size, converge_thr;
     double map_unmatched_ratio_min{0.30}; // 簇内未匹配比例 >= 此值才新建障碍曲面
+    double ground_near_x{0.0};    // 地面建图+配准：雷达系前后范围 |x| < 此值（m）；0=不限
+    double ground_near_y{0.0};    // 地面建图+配准：雷达系左右范围 |y| < 此值（m）；0=不限
+    // XY 栅格地面地图
+    double ground_cell_size{6.0};     // 每格 XY 边长（米）
+    int    ground_cell_min_pts{80};   // 格内点数达此值才拟合曲面
+    int    ground_cell_num_cp{5};     // BSpline 每维控制点数
+    int    ground_query_radius{1};    // 配准查询格半径（格数）
+    int    ground_skip_points{40};    // 地面配准采样间隔
+    double ground_clear_dist{150.0};  // 超过此距离（米）的旧格被清除
 
     double correction_x{0}, correction_y{0}, correction_z{0},
     correction_roll_degree{0}, correction_pitch_degree{0}, correction_yaw_degree{0};
@@ -181,6 +191,7 @@ private:
     Transf registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                              Transf T_guess,
                              BSplineMap& bspline_map,
+                             GroundGridMap& ground_grid,
                              int max_iters,
                              double converge_thr,
                              double match_dist_thr,
@@ -194,11 +205,13 @@ private:
                      const Transf& T_world,
                      RangeImageProcessor& range_proc,
                      BSplineMap& bspline_map,
+                     GroundGridMap& ground_grid,
                      double match_dist_thr,
                      double ground_z_min,
                      double ground_z_max);
 
     void printMapSummary(const BSplineMap& bspline_map) const;
+    void saveGroundGridZ(const GroundGridMap& ground_grid) const;
     void saveControlPointsToTxt(const BSplineMap& bspline_map,
                                 bool save_surface_samples,
                                 int step_begin = 0,

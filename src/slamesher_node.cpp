@@ -71,12 +71,28 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
+#include <algorithm>
 Parameter param;//parameters
 Log g_data;//global variables
 static ConsoleLogTee g_console_log_tee;
 
 namespace {
 constexpr const char* kBsplineBuildDir = "/home/albus/slam-math/Bspline/build";
+
+void saveFrame1GroundPoints(const std::vector<Eigen::Vector3d>& pts_lidar)
+{
+    if (pts_lidar.empty()) return;
+    std::vector<Eigen::Vector3d> sorted = pts_lidar;
+    std::sort(sorted.begin(), sorted.end(),
+              [](const Eigen::Vector3d& a, const Eigen::Vector3d& b) { return a.z() < b.z(); });
+
+    const std::string path = std::string(kBsplineBuildDir) + "/frame1_ground_points.txt";
+    std::ofstream fout(path);
+    if (!fout.is_open()) return;
+    fout << std::fixed << std::setprecision(5);
+    for (const auto& p : sorted)
+        fout << p.x() << " " << p.y() << " " << p.z() << "\n";
+}
 }  // namespace
 
 Log::Log(){
@@ -539,6 +555,20 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/map_update_interval", map_update_interval, 20);
     nh.param("slamesher/ground_build_interval", ground_build_interval, 20);
     nh.param("slamesher/map_unmatched_ratio_min", map_unmatched_ratio_min, 0.30);
+    nh.param("slamesher/ground_near_x", ground_near_x, 0.0);
+    nh.param("slamesher/ground_near_y", ground_near_y, 0.0);
+    nh.param("slamesher/ground_cell_size",    ground_cell_size,    6.0);
+    nh.param("slamesher/ground_cell_min_pts", ground_cell_min_pts, 80);
+    nh.param("slamesher/ground_cell_num_cp",  ground_cell_num_cp,  5);
+    nh.param("slamesher/ground_query_radius", ground_query_radius, 1);
+    nh.param("slamesher/ground_skip_points",  ground_skip_points,  40);
+    nh.param("slamesher/ground_clear_dist",   ground_clear_dist,   150.0);
+    std::cout << "ground_grid: cell=" << ground_cell_size
+              << "m min_pts=" << ground_cell_min_pts
+              << " num_cp=" << ground_cell_num_cp
+              << " query_r=" << ground_query_radius
+              << " skip=" << ground_skip_points
+              << " clear_dist=" << ground_clear_dist << "m" << std::endl;
     nh.param("slamesher/cross_overlap", cross_overlap, false);
     nh.param("slamesher/cross_cell_overlap_length", cross_cell_overlap_length, 0);
     nh.param("slamesher/num_margin_old_cell", num_margin_old_cell, -1);
@@ -902,6 +932,7 @@ void SLAMesher::processFirstFrame(Transf& T_world)
 Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                                     Transf T_guess,
                                     BSplineMap& bspline_map,
+                                    GroundGridMap& ground_grid,
                                     int max_iters,
                                     double converge_thr,
                                     double match_dist_thr,
@@ -962,18 +993,65 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         }
     };
 
+    // 地面匹配 lambda：使用 GroundGridMap 查询，key 为 BSplineSurface 指针
+    auto buildGroundMatches = [&](
+            const std::unordered_map<const BSplineSurface*, std::vector<int>>& surf_to_pts,
+            std::vector<RegMatch>& out) {
+        for (auto& [surf_ptr, indices] : surf_to_pts) {
+            if (!surf_ptr) continue;
+            const auto& knU  = surf_ptr->getKnotsU();
+            const auto& knV  = surf_ptr->getKnotsV();
+            const auto& cps  = surf_ptr->getControls();
+            int num_cpv      = surf_ptr->getNumCpV();
+
+            std::vector<Eigen::Vector3d> pts_world;
+            pts_world.reserve(indices.size());
+            for (int idx : indices)
+                pts_world.push_back(T_curr.block<3,3>(0,0) *
+                    Eigen::Vector3d(scan_local[idx].x, scan_local[idx].y, scan_local[idx].z) +
+                    T_curr.block<3,1>(0,3));
+
+            std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
+            std::vector<double> dists;
+            const_cast<BSplineSurface*>(surf_ptr)->findFootPrint(pts_world, footprints, dists);
+
+            for (int k = 0; k < (int)indices.size(); k++) {
+                double d = std::sqrt(std::abs(dists[k]));
+                if (d > match_dist_thr || d < 1e-6) continue;
+                auto [paraU, paraV] = footprints[k];
+                SurfaceCurvature curv = const_cast<BSplineSurface*>(surf_ptr)
+                    ->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
+                if (curv.normal.norm() < 1e-9) continue;
+                curv.normal.normalize();
+
+                RegMatch m;
+                m.p_local   = Eigen::Vector3d(scan_local[indices[k]].x,
+                                              scan_local[indices[k]].y,
+                                              scan_local[indices[k]].z);
+                m.p_world   = pts_world[k];
+                m.curvature = curv;
+                m.scan_idx  = indices[k];
+                m.is_ground = true;
+                out.push_back(m);
+            }
+        }
+    };
+
     for (int iter = 0; iter < max_iters && delta_scale > converge_thr; iter++) {
 
-        // ── 路 1：地面点 z ∈ [ground_z_min, ground_z_max] → 只匹配 is_ground 曲面 ──
-        std::unordered_map<int, std::vector<int>> gnd_surf_to_pts;
-        for (int i = 0; i < (int)scan_local.size(); i += skip_points) {
-            double z = scan_local[i].z;
-            if (z < ground_z_min || z > ground_z_max) continue;
+        // ── 路 1：地面点 z ∈ [ground_z_min, ground_z_max] → 查 GroundGridMap ──
+        // ground_near_x/y > 0 时只保留雷达系 |x|<near_x 且 |y|<near_y 的点
+        std::unordered_map<const BSplineSurface*, std::vector<int>> gnd_surf_to_pts;
+        const int gnd_skip = param.ground_skip_points > 0 ? param.ground_skip_points : skip_points;
+        for (int i = 0; i < (int)scan_local.size(); i += gnd_skip) {
+            const double lx = scan_local[i].x, ly = scan_local[i].y, lz = scan_local[i].z;
+            if (lz < ground_z_min || lz > ground_z_max) continue;
+            if (param.ground_near_x > 0 && std::abs(lx) > param.ground_near_x) continue;
+            if (param.ground_near_y > 0 && std::abs(ly) > param.ground_near_y) continue;
             Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
-                Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) +
-                T_curr.block<3,1>(0,3);
-            for (int sid : bspline_map.queryCandidates(p_w, 1))
-                gnd_surf_to_pts[sid].push_back(i);
+                Eigen::Vector3d(lx, ly, lz) + T_curr.block<3,1>(0,3);
+            const BSplineSurface* sp = ground_grid.queryNearestSurface(p_w);
+            if (sp) gnd_surf_to_pts[sp].push_back(i);
         }
 
         // ── 路 2：障碍点 z >= match_min_z → 只匹配非地面曲面 ──
@@ -990,14 +1068,52 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
         std::vector<RegMatch> matches;
         matches.reserve(scan_local.size() / skip_points);
-        buildMatches(gnd_surf_to_pts, true,  matches);   // 地面
-        buildMatches(obs_surf_to_pts, false, matches);   // 障碍物
+        buildGroundMatches(gnd_surf_to_pts, matches);    // 地面（GroundGridMap）
+        buildMatches(obs_surf_to_pts, false, matches);  // 障碍物
 
         const int n_gnd = [&]{
             int cnt = 0;
             for (auto& m : matches) if (m.is_ground) cnt++;
             return cnt;
         }();
+
+        // ── 地面匹配距离统计：每个 ground match 的法向距离写入 txt ──
+        {
+            static std::ofstream gnd_dist_file;
+            if (!gnd_dist_file.is_open()) {
+                gnd_dist_file.open(std::string(kBsplineBuildDir) + "/gnd_match_dist.txt",
+                                   std::ios::out | std::ios::trunc);
+                gnd_dist_file << std::fixed << std::setprecision(5);
+                gnd_dist_file << "# dist_normal  dist_abs"
+                              << "  p_w_x  p_w_y  p_w_z  surf_z\n";
+            }
+            int mi = 0;
+            double sum_d = 0, sum_dz = 0;
+            int cnt = 0;
+            for (const auto& m : matches) {
+                if (!m.is_ground) { ++mi; continue; }
+                // 有符号法向距离（点到曲面，沿法向）
+                const double d_n = (m.p_world - m.curvature.point).dot(m.curvature.normal);
+                const double d_abs = std::abs(d_n);
+                sum_d  += d_abs;
+                sum_dz += (m.p_world.z() - m.curvature.point.z());
+                ++cnt;
+                gnd_dist_file << d_n << "  " << d_abs
+                              << "  " << m.p_world.x()
+                              << "  " << m.p_world.y()
+                              << "  " << m.p_world.z()
+                              << "  " << m.curvature.point.z()
+                              << "\n";
+                ++mi;
+            }
+            if (cnt > 0) {
+                gnd_dist_file << "# step=" << g_data.step << " iter=" << iter
+                              << " n_gnd=" << cnt
+                              << " mean|d|=" << (sum_d / cnt)
+                              << " mean_dz=" << (sum_dz / cnt) << "\n";
+                gnd_dist_file.flush();
+            }
+        }
 
         if ((int)matches.size() < 10) {
             ROS_WARN("Registration iter %d: only %d matches (gnd~%d), skip",
@@ -1107,13 +1223,13 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                             const Transf& T_world,
                             RangeImageProcessor& range_proc,
                             BSplineMap& bspline_map,
+                            GroundGridMap& ground_grid,
                             double match_dist_thr,
                             double ground_z_min,
                             double ground_z_max)
 {
     constexpr int    MIN_CLUSTER_PTS  = 30;
     constexpr int    MAX_NEW_SURFACES = 70;
-    constexpr double MATCH_DIST_GND   = 0.5;   // 地面覆盖率检测距离阈值
 
     const bool dump_clusters = (param.dump_cluster_step > 0 && g_data.step == param.dump_cluster_step);
     const bool do_obstacle = (g_data.step == 1) || (g_data.step % param.map_update_interval  == 0);
@@ -1131,71 +1247,34 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
 
     int n_added_gnd = 0, n_added_obs = 0;
 
-    // ── 地面分支：直接扫 range image 地面像素，不经过 cluster ──
+    // ── 地面分支：地面点投入 GroundGridMap，每格积累后各自拟合 BSpline ──
     if (do_ground) {
-        constexpr int MIN_GND_PTS = 50;
-        constexpr int GND_NUM_CP  = 15;   // 控制点足够多，信任拟合算法
-
-        auto cloud_gnd_all = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+        // 收集世界系地面点（近邻矩形区域过滤）
+        pcl::PointCloud<pcl::PointXYZ> cloud_gnd_world;
+        std::vector<Eigen::Vector3d> gnd_lidar_pts;
+        gnd_lidar_pts.reserve(range_proc.range_image_.size());
         for (const auto& px : range_proc.range_image_) {
             if (!px.valid) continue;
             if (px.z < ground_z_min || px.z > ground_z_max) continue;
+            if (param.ground_near_x > 0 && std::abs(px.x) > param.ground_near_x) continue;
+            if (param.ground_near_y > 0 && std::abs(px.y) > param.ground_near_y) continue;
+            gnd_lidar_pts.emplace_back(px.x, px.y, px.z);
             Eigen::Vector3d pw = R_w * Eigen::Vector3d(px.x, px.y, px.z) + t_w;
-            cloud_gnd_all->push_back(pcl::PointXYZ(
+            cloud_gnd_world.push_back(pcl::PointXYZ(
                 static_cast<float>(pw.x()), static_cast<float>(pw.y()), static_cast<float>(pw.z())));
         }
 
-        if ((int)cloud_gnd_all->size() >= MIN_GND_PTS) {
-            // 步骤 2：对全帧地面点做采样，查已有地面面的 footprint 覆盖
-            const int n_all    = (int)cloud_gnd_all->size();
-            const int skip_cov = std::max(1, n_all / 2000);   // 最多约 2000 个采样点
+        if (g_data.step == 1)
+            saveFrame1GroundPoints(gnd_lidar_pts);
 
-            std::vector<bool> pt_covered(n_all, false);
-            std::unordered_map<int, std::vector<int>> gnd_surf_to_kidx;
-            for (int k = 0; k < n_all; k += skip_cov) {
-                const Eigen::Vector3d pw(cloud_gnd_all->points[k].x,
-                                         cloud_gnd_all->points[k].y,
-                                         cloud_gnd_all->points[k].z);
-                for (int sid : bspline_map.queryCandidates(pw, 1)) {
-                    const BSplineMapEntry* e = bspline_map.getEntry(sid);
-                    if (!e || !e->is_ground) continue;
-                    gnd_surf_to_kidx[sid].push_back(k);
-                }
-            }
-
-            for (auto& [sid, kidxs] : gnd_surf_to_kidx) {
-                const BSplineMapEntry* e = bspline_map.getEntry(sid);
-                if (!e || !e->surface) continue;
-                std::vector<Eigen::Vector3d> batch;
-                batch.reserve(kidxs.size());
-                for (int ki : kidxs)
-                    batch.emplace_back(cloud_gnd_all->points[ki].x,
-                                       cloud_gnd_all->points[ki].y,
-                                       cloud_gnd_all->points[ki].z);
-                std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> fps;
-                std::vector<double> dists;
-                e->surface->findFootPrint(batch, fps, dists);
-                for (int i = 0; i < (int)kidxs.size(); ++i) {
-                    double d = std::sqrt(std::abs(dists[i]));
-                    if (d > 1e-6 && d <= MATCH_DIST_GND)
-                        pt_covered[kidxs[i]] = true;
-                }
-            }
-
-            // 步骤 3：收集采样中未被已有地面面覆盖的点
-            auto cloud_gnd_new = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-            for (int k = 0; k < n_all; k += skip_cov) {
-                if (!pt_covered[k])
-                    cloud_gnd_new->push_back(cloud_gnd_all->points[k]);
-            }
-
-            // 步骤 4：未覆盖点足够多则拟合一张大地面（PCA 自动初始化）
-            if ((int)cloud_gnd_new->size() >= MIN_GND_PTS) {
-                auto surf = std::make_shared<BSplineSurface>(3, 3, GND_NUM_CP, GND_NUM_CP, 0.25);
-                surf->apply(cloud_gnd_new, 30, 1, 1, 0.05);
-                bspline_map.addSurface(surf, cloud_gnd_new, /*is_ground=*/true, g_data.step);
-                ++n_added_gnd;
-            }
+        if (!cloud_gnd_world.empty()) {
+            // 投格 + 标记需重拟合的格
+            auto touched = ground_grid.addPoints(cloud_gnd_world, g_data.step);
+            // 对积累点数达标的格重新拟合曲面
+            n_added_gnd = ground_grid.refitCells(touched);
+            // 定期清除远离车辆的旧格
+            Eigen::Vector3d veh_pos = T_world.block<3,1>(0,3);
+            ground_grid.removeDistant(veh_pos, param.ground_clear_dist);
         }
     }
 
@@ -1284,9 +1363,8 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
 
     std::cout << "  [MapBuild] step=" << g_data.step
               << " clusters=" << seg.clusters.size()
-              << " +gnd=" << n_added_gnd << " +obs=" << n_added_obs
-              << " total=" << bspline_map.size()
-              << " (gnd=" << bspline_map.groundSurfaceCount() << ")"
+              << " +gnd_cells_refit=" << n_added_gnd << " +obs=" << n_added_obs
+              << " obs_total=" << bspline_map.size()
               << " (" << t_upd.toc() << " ms)" << std::endl;
 }
 
@@ -1303,6 +1381,34 @@ void SLAMesher::printMapSummary(const BSplineMap& bspline_map) const
     std::cout << "Map summary: "
               << total_surfaces << " surfaces, "
               << total_control_points << " control points total" << std::endl;
+}
+
+void SLAMesher::saveGroundGridZ(const GroundGridMap& ground_grid) const
+{
+    const std::string out_path = std::string(kBsplineBuildDir) + "/ground_grid_z.txt";
+    std::ofstream fout(out_path);
+    if (!fout.is_open()) return;
+
+    fout << std::fixed << std::setprecision(5);
+
+    std::vector<GroundCellKey> keys;
+    keys.reserve(ground_grid.cells().size());
+    for (const auto& [k, cell] : ground_grid.cells()) {
+        if (cell.surf) keys.push_back(k);
+    }
+    std::sort(keys.begin(), keys.end(), [](const GroundCellKey& a, const GroundCellKey& b) {
+        return a.ix < b.ix || (a.ix == b.ix && a.iy < b.iy);
+    });
+
+    for (const auto& k : keys) {
+        const auto& cell = ground_grid.cells().at(k);
+        const auto& cps = cell.surf->getControls();
+        if (cps.empty()) continue;
+        double z_sum = 0;
+        for (const auto& cp : cps) z_sum += cp.z();
+        fout << (z_sum / static_cast<double>(cps.size()))
+             << " " << k.ix << " " << k.iy << "\n";
+    }
 }
 
 void SLAMesher::saveControlPointsToTxt(const BSplineMap& bspline_map,
@@ -1458,6 +1564,10 @@ void SLAMesher::process(){
 
     // ========== 全局地图 & 工具初始化 ==========
     BSplineMap bspline_map(param.grid);
+    GroundGridMap ground_grid(param.ground_cell_size,
+                              param.ground_cell_min_pts,
+                              param.ground_cell_num_cp,
+                              param.ground_query_radius);
     RangeImageProcessor range_proc;
 
     g_data.extendLog();
@@ -1497,14 +1607,14 @@ void SLAMesher::process(){
 
         if(g_data.step == 1){
             processFirstFrame(T_world);
-            runMapBuild(scan_local, T_world, range_proc, bspline_map, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
+            runMapBuild(scan_local, T_world, range_proc, bspline_map, ground_grid, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
             continue;
         }
 
         TicToc t_register;
         Transf T_guess = getOdom();
 
-        T_world = registerScanToMap(scan_local, T_guess, bspline_map,
+        T_world = registerScanToMap(scan_local, T_guess, bspline_map, ground_grid,
                                     max_rg_iters, converge_thr, match_dist_thr, skip_points,
                                     range_proc.MIN_Z, GROUND_Z_MIN, GROUND_Z_MAX);
 
@@ -1521,7 +1631,7 @@ void SLAMesher::process(){
             traj_file.flush();
         }
 
-        runMapBuild(scan_local, T_world, range_proc, bspline_map, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
+        runMapBuild(scan_local, T_world, range_proc, bspline_map, ground_grid, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
 
         path_pub.publish(g_data.path);
         std::cout << "===STEP " << g_data.step << "=== Total: " << t_step.toc() << " ms===" << std::endl;
@@ -1531,6 +1641,7 @@ void SLAMesher::process(){
     std::cout << "Process finished. Total time: " << t_whole.toc() / 1000.0 << " s" << std::endl;
 
     printMapSummary(bspline_map);
+    saveGroundGridZ(ground_grid);
     if (param.all_surfaces_max_step > 0) {
         saveControlPointsToTxt(bspline_map, true, 0, param.all_surfaces_max_step);
     } else if (param.map_save_step_begin > 0 || param.map_save_step_end > 0) {
