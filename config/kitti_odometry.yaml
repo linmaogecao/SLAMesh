@@ -7,7 +7,7 @@ slamesher:
   read_offline_pcd: true 
   dataset: 1
   max_steps: 10000
-  max_frames: 5        # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
+  max_frames: 0        # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
   dump_frame: 0          # 0=不保存；>0 时在对应 step 配准结束后导出 matched/unmatched 到 build/
   dump_cluster_step: 0   # 0=不保存；>0 时在该 step 建图分割后导出障碍 cluster 到 build/output_clusters/
   console_log_path: "/home/albus/catkin_ws/src/SLAMesh/debug.txt"   # 空=自动写到 file_loc_report/seq##_run_时间.log；也可填绝对路径如 debug.txt
@@ -17,12 +17,14 @@ slamesher:
   map_save_step_end:   0  # 0=不限；例 begin=100 end=150 只导出该区间新建的曲面
   save_mesh_map: false
   #register param
-  range_max: 100
+  range_max: 50
   range_min: 1.2
   register_times: 2
   map_update_interval: 10      # 障碍 MapUpdate 间隔（帧）；step % N == 0 时建障碍曲面
-  ground_build_interval: 5    # 地面 buildGroundMap 间隔（帧）；第1帧 + step % N == 0
+  ground_build_interval: 10    # 地面 buildGroundMap 间隔（帧）；第1帧 + step % N == 0
   map_unmatched_ratio_min: 0.30 # 簇内未匹配比例 >= 此值才新建障碍曲面
+  cluster_ds_min_pts:    80   # cluster 像素数 <= 此值不抽稀
+  cluster_ds_target_max: 200   # 大 cluster 按 range-image (u,v) 2D 均匀稀疏到此规模（0=关闭）
   ground_near_x: 15.0   # 地面建图+配准：雷达系前后 |x| < 此值（m）；0=不限
   ground_near_y: 5.0    # 地面建图+配准：雷达系左右 |y| < 此值（m）；0=不限
   # XY 栅格地面地图
@@ -30,7 +32,7 @@ slamesher:
   ground_cell_min_pts: 80    # 格内点数达此值才拟合曲面
   ground_cell_num_cp: 5      # BSpline 每维控制点数
   ground_query_radius: 1     # 配准查询格半径（格数）
-  ground_skip_points: 40     # 地面配准采样间隔
+  ground_skip_points: 80     # 地面配准采样间隔
   ground_clear_dist: 150.0   # 超过此距离（米）的旧格被清除
   cross_overlap: true
   cross_cell_overlap_length: 1

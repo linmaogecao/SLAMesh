@@ -36,6 +36,17 @@ struct CurvatureCenters {
     bool is_planar;
 };
 
+// 同一 (u,v) 下一次求值：position 基函数权重 + pos/各阶导
+struct SurfaceEval {
+    Eigen::RowVector4d w_pos_u, w_pos_v;
+    Eigen::Vector3d pos = Eigen::Vector3d::Zero();
+    Eigen::Vector3d Su  = Eigen::Vector3d::Zero();
+    Eigen::Vector3d Sv  = Eigen::Vector3d::Zero();
+    Eigen::Vector3d Suu = Eigen::Vector3d::Zero();
+    Eigen::Vector3d Svv = Eigen::Vector3d::Zero();
+    Eigen::Vector3d Suv = Eigen::Vector3d::Zero();
+};
+
 class BSplineSurface {
 public:
     typedef std::pair<int, double> Parameter;
@@ -113,6 +124,12 @@ public:
     Eigen::Vector3d getNormal(const Parameter& para, const vector<double> &knots,const std::vector<Eigen::Vector3d> &controls);
     Eigen::Vector3d getCurvCenter(const Parameter& para, const vector<double> &knots,const std::vector<Eigen::Vector3d> &controls);
     double findFootPrint(const vector<Eigen::Vector3d>& givepoints,vector<pair<Parameter, Parameter>>& footPrints, vector<double> &point_dists);
+    // UV warm-start 版本: uv_state 作为输入初始值并被更新为精化后的 (u,v)。
+    // 首次调用时若 uv_state 为空，自动从 PCA 平面投影做冷启动。
+    double findFootPrintWarm(const vector<Eigen::Vector3d>& givepoints,
+                             vector<pair<Parameter,Parameter>>& uv_state,
+                             vector<double>& point_dists,
+                             int newton_steps = 5);
     void initControlPoint(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,vector<Eigen::Vector3d>& controlPs,int num_u,int num_v);
     void initControlPointPCA(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
                              vector<Eigen::Vector3d>& controlPs, int num_u, int num_v,
@@ -146,6 +163,10 @@ private:
         span_sample_index_.clear();
     }
 
+    // 把 givepoints 投影到 PCA 平面，映射到 [0,1] B-spline 参数空间，作为 UV 冷启动。
+    void coldInitUVFromPCA(const vector<Eigen::Vector3d>& givepoints,
+                           vector<pair<Parameter,Parameter>>& uv_out) const;
+
     /** follow <<General Matrix Representations for B-Splines>> calculate BSpline coeff matrix
      *
      * @param i in which param interal  [ti,ti+1]
@@ -153,6 +174,11 @@ private:
      * @return
      */
     Eigen::Matrix4d ComputeNonUniformBsplineMatrix(int i, const vector<double>& knots);
+
+    SurfaceEval evaluateSurface(const Parameter& paraU, const Parameter& paraV,
+                                const vector<double>& knotsU, const vector<double>& knotsV,
+                                const std::vector<Eigen::Vector3d>& controls, int num_cp_v) const;
+    SurfaceCurvature curvatureFromEval(const SurfaceEval& eval) const;
 
     void computePlaneFrame(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud);
 public:
@@ -172,7 +198,6 @@ private:
     double max_x,max_y,max_z;
     double min_x,min_y,min_z;
     pcl::PointCloud<pcl::PointXYZ>::Ptr input_cloud_;
-    pcl::KdTreeFLANN<pcl::PointXYZ> input_kdtree_;
     vector<pair<Parameter, Parameter>> sampling_paras_;
     std::vector<std::vector<LocalRange>> range_grid_;
     int grid_res_x_ = 0;

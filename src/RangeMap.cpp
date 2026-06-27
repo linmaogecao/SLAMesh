@@ -4,8 +4,11 @@
 
 #include "RangeMap.h"
 #include "slamesher_node.h"
+#include <algorithm>
+#include <cmath>
 #include <omp.h>
 #include <sstream>
+#include <unordered_set>
 extern Parameter param;//in SLAMesh node
 extern Log g_data;//in SLAMesh node
 struct QueueItem {
@@ -226,6 +229,64 @@ SegmentationResult RangeImageProcessor::segmentRangeImage(double theta_deg, doub
     return result;
 }
 
+void RangeImageProcessor::downsampleClusters(SegmentationResult& result,
+                                             int min_pts,
+                                             int target_max,
+                                             int min_keep) const
+{
+    if (target_max <= 0 || min_pts <= 0) return;
+
+    for (auto& indices : result.clusters) {
+        const int n = static_cast<int>(indices.size());
+        if (n <= min_pts) continue;
+
+        int u_min = H_SCANS, u_max = 0;
+        int v_min = W_COLS, v_max = 0;
+        for (int idx : indices) {
+            if (idx < 0 || idx >= static_cast<int>(range_image_.size())) continue;
+            const int u = idx / W_COLS;
+            const int v = idx % W_COLS;
+            u_min = std::min(u_min, u);
+            u_max = std::max(u_max, u);
+            v_min = std::min(v_min, v);
+            v_max = std::max(v_max, v);
+        }
+        if (u_max < u_min || v_max < v_min) continue;
+
+        const int u_span = u_max - u_min + 1;
+        const int v_span = v_max - v_min + 1;
+        const double inv_keep = static_cast<double>(n) / static_cast<double>(target_max);
+        const int denom = std::max(u_span, v_span);
+        int row_step = std::max(1, static_cast<int>(std::lround(
+            std::sqrt(inv_keep * static_cast<double>(u_span) / denom))));
+        int col_step = std::max(1, static_cast<int>(std::lround(
+            std::sqrt(inv_keep * static_cast<double>(v_span) / denom))));
+
+        std::vector<int> kept;
+        kept.reserve(target_max + 8);
+        std::unordered_set<int> removed;
+        removed.reserve(static_cast<size_t>(n));
+
+        for (int idx : indices) {
+            if (idx < 0 || idx >= static_cast<int>(range_image_.size())) continue;
+            const int u = idx / W_COLS;
+            const int v = idx % W_COLS;
+            if (((u - u_min) % row_step == 0) && ((v - v_min) % col_step == 0)) {
+                kept.push_back(idx);
+            } else {
+                removed.insert(idx);
+            }
+        }
+
+        if (static_cast<int>(kept.size()) < min_keep) continue;
+
+        for (int idx : removed) {
+            if (idx >= 0 && idx < static_cast<int>(result.label_map.size()))
+                result.label_map[idx] = 0;
+        }
+        indices = std::move(kept);
+    }
+}
 
 void RangeImageProcessor::saveClustersToTxt(const SegmentationResult& result, const std::string& folder_path) {
     if (result.clusters.empty()) {

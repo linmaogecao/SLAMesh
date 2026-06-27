@@ -8,179 +8,184 @@
 #include "BSplineSDMErr.h"
 
 using namespace Eigen;
-Vector3d BSplineSurface::getPos(const Parameter& paraU, const Parameter& paraV, const vector<double>& knotsU, const vector<double>& knotsV, const std::vector<Vector3d>& controls, int num_cp_v) {
-    double tf_u = paraU.second;
-    int ki_u = paraU.first;
-    Matrix4d matU = ComputeNonUniformBsplineMatrix(ki_u, knotsU);
-    double dt_u = knotsU[ki_u+1] - knotsU[ki_u];
-    double u = (tf_u - knotsU[ki_u]) / dt_u;
-    Vector4d U_pos;
 
-    U_pos << 1.0, u, u * u, u * u * u;
-    RowVector4d weights_u = U_pos.transpose() * matU;
+namespace {
 
-    double tf_v = paraV.second;
-    int ki_v = paraV.first;
-    Matrix4d matV = ComputeNonUniformBsplineMatrix(ki_v, knotsV);
-    double dt_v = knotsV[ki_v+1] - knotsV[ki_v];
-    double v = (tf_v - knotsV[ki_v]) / dt_v;
-    Vector4d V_pos;
+constexpr int kBsplineMaxCp = 15;
 
-    V_pos << 1.0, v, v * v, v * v * v;
-    RowVector4d weights_v = V_pos.transpose() * matV;
+Eigen::Matrix4d g_bspline_mat_cache[16][16];
 
-
-    Vector3d pos = Vector3d::Zero();
-    for (int i = 0; i < 4; ++i) {
-        int global_u_idx = ki_u - 3 + i;
-        for (int j = 0; j < 4; ++j) {
-            int global_v_idx = ki_v - 3 + j;
-            int flat_index = global_u_idx * num_cp_v + global_v_idx;
-
-            if (flat_index >= 0 && flat_index < controls.size()) {
-                double weight = weights_u(i) * weights_v(j);
-                pos += weight * controls[flat_index];
-            }
+static void makeClampedUniformKnots(int num_cp, std::vector<double>& knots) {
+    knots.resize(num_cp + 4);
+    const double denom = static_cast<double>(num_cp - 3);
+    for (int i = 0; i < static_cast<int>(knots.size()); ++i) {
+        if (i <= 3) {
+            knots[i] = 0.0;
+        } else if (i >= num_cp) {
+            knots[i] = 1.0;
+        } else {
+            knots[i] = static_cast<double>(i - 3) / denom;
         }
     }
-    return pos;
 }
 
-Vector3d BSplineSurface::getFirstDiff(const Parameter& paraU, const Parameter& paraV, const vector<double>& knotsU, const vector<double>& knotsV, const std::vector<Vector3d>& controls,int num_cp_v, bool is_diff_u)
+static Eigen::Matrix4d computeBsplineMatrix(int i, const std::vector<double>& knots) {
+    Eigen::Matrix4d M = Eigen::Matrix4d::Zero();
+    double t_i   = knots[i];
+    double t_im1 = knots[i - 1];
+    double t_ip1 = knots[i + 1];
+    double t_ip2 = knots[i + 2];
+    double t_ip3 = knots[i + 3];
+
+    double dt_i_im1   = t_i - t_im1;
+    double dt_ip1_i   = t_ip1 - t_i;
+    double dt_ip1_im1 = t_ip1 - t_im1;
+    double dt_ip1_im2 = t_ip1 - knots[i - 2];
+    double dt_ip2_im1 = t_ip2 - t_im1;
+    double dt_ip2_i   = t_ip2 - t_i;
+    double dt_ip3_i   = t_ip3 - t_i;
+
+    double m00 = (dt_ip1_i * dt_ip1_i) / (dt_ip1_im1 * dt_ip1_im2);
+    double m02 = (dt_i_im1 * dt_i_im1) / (dt_ip2_im1 * dt_ip1_im1);
+    double m22 = 3.0 * (dt_ip1_i * dt_ip1_i) / (dt_ip2_im1 * dt_ip1_im1);
+    double m33 = (dt_ip1_i * dt_ip1_i) / (dt_ip3_i * dt_ip2_i);
+    double m12 = 3.0 * dt_ip1_i * dt_i_im1 / (dt_ip2_im1 * dt_ip1_im1);
+
+    M(0, 0) = m00;
+    M(0, 1) = 1.0 - m00 - m02;
+    M(0, 2) = m02;
+    M(0, 3) = 0.0;
+
+    M(1, 0) = -3.0 * m00;
+    M(1, 1) = 3.0 * m00 - m12;
+    M(1, 2) = m12;
+    M(1, 3) = 0.0;
+
+    M(2, 0) = 3.0 * m00;
+    M(2, 1) = -3.0 * m00 - m22;
+    M(2, 2) = m22;
+    M(2, 3) = 0.0;
+
+    M(3, 0) = -m00;
+    double term_extra = (dt_ip1_i * dt_ip1_i) / (dt_ip2_i * dt_ip2_im1);
+    M(3, 2) = -m22 / 3.0 - m33 - term_extra;
+    M(3, 1) = m00 - M(3, 2) - m33;
+    M(3, 3) = m33;
+
+    return M;
+}
+
+static void initBsplineMatrixCache() {
+    for (int num_cp = 4; num_cp <= kBsplineMaxCp; ++num_cp) {
+        std::vector<double> knots;
+        makeClampedUniformKnots(num_cp, knots);
+        for (int span = 3; span < num_cp; ++span) {
+            g_bspline_mat_cache[num_cp][span] = computeBsplineMatrix(span, knots);
+        }
+    }
+}
+
+struct BsplineMatrixCacheInit {
+    BsplineMatrixCacheInit() { initBsplineMatrixCache(); }
+};
+static BsplineMatrixCacheInit g_bspline_mat_cache_init;
+
+static const Eigen::Matrix4d& cachedBsplineMatrix(int num_cp, int span) {
+    if (num_cp >= 4 && num_cp <= kBsplineMaxCp && span >= 3 && span < num_cp) {
+        return g_bspline_mat_cache[num_cp][span];
+    }
+    static thread_local Eigen::Matrix4d fallback;
+    std::vector<double> knots;
+    makeClampedUniformKnots(num_cp, knots);
+    fallback = computeBsplineMatrix(span, knots);
+    return fallback;
+}
+
+static int numCpFromKnots(const std::vector<double>& knots) {
+    return static_cast<int>(knots.size()) - 4;
+}
+
+}  // namespace
+
+SurfaceEval BSplineSurface::evaluateSurface(
+        const Parameter& paraU, const Parameter& paraV,
+        const vector<double>& knotsU, const vector<double>& knotsV,
+        const std::vector<Vector3d>& controls, int num_cp_v) const
 {
-    double tf_u = paraU.second;
-    int ki_u = paraU.first;
-    Matrix4d matU = ComputeNonUniformBsplineMatrix(ki_u, knotsU);
-    double dt_u = knotsU[ki_u+1] - knotsU[ki_u];
-    double u = (dt_u > 1e-9) ? (tf_u - knotsU[ki_u]) / dt_u : 0.0;
+    SurfaceEval eval;
 
-    Vector4d vec_u;
-    RowVector4d weights_u;
+    const int ki_u = paraU.first;
+    const int ki_v = paraV.first;
+    const Matrix4d& matU = cachedBsplineMatrix(numCpFromKnots(knotsU), ki_u);
+    const Matrix4d& matV = cachedBsplineMatrix(numCpFromKnots(knotsV), ki_v);
 
-    if (is_diff_u) {
-        vec_u << 0.0, 1.0, 2.0 * u, 3.0 * u * u;
-        double scale = (dt_u > 1e-9) ? (1.0 / dt_u) : 0.0;
-        weights_u = (vec_u.transpose() * matU) * scale;
-    } else {
-        vec_u << 1.0, u, u * u, u * u * u;
-        weights_u = vec_u.transpose() * matU;
-    }
+    const double dt_u = knotsU[ki_u + 1] - knotsU[ki_u];
+    const double u = (dt_u > 1e-9) ? (paraU.second - knotsU[ki_u]) / dt_u : 0.0;
+    const double dt_v = knotsV[ki_v + 1] - knotsV[ki_v];
+    const double v = (dt_v > 1e-9) ? (paraV.second - knotsV[ki_v]) / dt_v : 0.0;
 
-    double tf_v = paraV.second;
-    int ki_v = paraV.first;
-    Matrix4d matV = ComputeNonUniformBsplineMatrix(ki_v, knotsV);
-    double dt_v = knotsV[ki_v+1] - knotsV[ki_v];
-    double v = (dt_v > 1e-9) ? (tf_v - knotsV[ki_v]) / dt_v : 0.0;
+    const double u2 = u * u, u3 = u2 * u;
+    const double v2 = v * v, v3 = v2 * v;
 
-    Vector4d vec_v;
-    RowVector4d weights_v;
+    Vector4d B0_u, B1_u, B2_u, B0_v, B1_v, B2_v;
+    B0_u << 1.0, u, u2, u3;
+    B1_u << 0.0, 1.0, 2.0 * u, 3.0 * u2;
+    B2_u << 0.0, 0.0, 2.0, 6.0 * u;
+    B0_v << 1.0, v, v2, v3;
+    B1_v << 0.0, 1.0, 2.0 * v, 3.0 * v2;
+    B2_v << 0.0, 0.0, 2.0, 6.0 * v;
 
-    if (!is_diff_u) {
-        vec_v << 0.0, 1.0, 2.0 * v, 3.0 * v * v;
-        double scale = (dt_v > 1e-9) ? (1.0 / dt_v) : 0.0;
-        weights_v = (vec_v.transpose() * matV) * scale;
-    } else {
-        vec_v << 1.0, v, v * v, v * v * v;
-        weights_v = vec_v.transpose() * matV;
-    }
-    Vector3d result = Vector3d::Zero();
+    const double inv_dt_u  = (dt_u > 1e-9) ? (1.0 / dt_u) : 0.0;
+    const double inv_dt2_u = inv_dt_u * inv_dt_u;
+    const double inv_dt_v  = (dt_v > 1e-9) ? (1.0 / dt_v) : 0.0;
+    const double inv_dt2_v = inv_dt_v * inv_dt_v;
+
+    eval.w_pos_u = B0_u.transpose() * matU;
+    const RowVector4d w_du_u  = (B1_u.transpose() * matU) * inv_dt_u;
+    const RowVector4d w_duu_u = (B2_u.transpose() * matU) * inv_dt2_u;
+    eval.w_pos_v = B0_v.transpose() * matV;
+    const RowVector4d w_dv_v  = (B1_v.transpose() * matV) * inv_dt_v;
+    const RowVector4d w_dvv_v = (B2_v.transpose() * matV) * inv_dt2_v;
 
     for (int i = 0; i < 4; ++i) {
         for (int j = 0; j < 4; ++j) {
-            int u_idx_global = ki_u - 3 + i;
-            int v_idx_global = ki_v - 3 + j;
-
-            int flat_idx = u_idx_global * num_cp_v + v_idx_global;
-
-            if (flat_idx >= 0 && flat_idx < controls.size()) {
-                double w = weights_u(i) * weights_v(j);
-                result += w * controls[flat_idx];
+            const int flat_idx = (ki_u - 3 + i) * num_cp_v + (ki_v - 3 + j);
+            if (flat_idx < 0 || flat_idx >= static_cast<int>(controls.size())) {
+                continue;
             }
+            const Vector3d& cp = controls[flat_idx];
+            const double w_pos = eval.w_pos_u(i) * eval.w_pos_v(j);
+            eval.pos += w_pos * cp;
+            eval.Su  += (w_du_u(i)  * eval.w_pos_v(j)) * cp;
+            eval.Sv  += (eval.w_pos_u(i) * w_dv_v(j)) * cp;
+            eval.Suu += (w_duu_u(i) * eval.w_pos_v(j)) * cp;
+            eval.Svv += (eval.w_pos_u(i) * w_dvv_v(j)) * cp;
+            eval.Suv += (w_du_u(i)  * w_dv_v(j)) * cp;
         }
     }
-    return result;
+    return eval;
 }
 
-Vector3d BSplineSurface::getSecondDiff(const Parameter& paraU, const Parameter& paraV, const vector<double>& knotsU, const vector<double>& knotsV, const std::vector<Vector3d>& controls,int num_cp_v, int type) {
-    double tf_u = paraU.second;
-    int ki_u = paraU.first;
-    Matrix4d matU = ComputeNonUniformBsplineMatrix(ki_u, knotsU);
-    double dt_u = knotsU[ki_u+1] - knotsU[ki_u];
-    double u = (dt_u > 1e-9) ? (tf_u - knotsU[ki_u]) / dt_u : 0.0;
-
-    Vector4d vec_u;
-    double scale_u = 1.0;
-
-    double tf_v = paraV.second;
-    int ki_v = paraV.first;
-    Matrix4d matV = ComputeNonUniformBsplineMatrix(ki_v, knotsV);
-    double dt_v = knotsV[ki_v+1] - knotsV[ki_v];
-    double v = (dt_v > 1e-9) ? (tf_v - knotsV[ki_v]) / dt_v : 0.0;
-
-    Vector4d vec_v;
-    double scale_v = 1.0;
-
-    if (type == 0) {
-        vec_u << 0.0, 0.0, 2.0, 6.0 * u;
-        scale_u = (dt_u > 1e-9) ? (1.0 / (dt_u * dt_u)) : 0.0;
-        vec_v << 1.0, v, v * v, v * v * v;
-        scale_v = 1.0;
-
-    } else if (type == 1) {
-        vec_u << 1.0, u, u * u, u * u * u;
-        scale_u = 1.0;
-        vec_v << 0.0, 0.0, 2.0, 6.0 * v;
-        scale_v = (dt_v > 1e-9) ? (1.0 / (dt_v * dt_v)) : 0.0;
-
-    } else if (type == 2) {
-        vec_u << 0.0, 1.0, 2.0 * u, 3.0 * u * u;
-        scale_u = (dt_u > 1e-9) ? (1.0 / dt_u) : 0.0;
-        vec_v << 0.0, 1.0, 2.0 * v, 3.0 * v * v;
-        scale_v = (dt_v > 1e-9) ? (1.0 / dt_v) : 0.0;
-    }
-
-    RowVector4d weights_u = (vec_u.transpose() * matU) * scale_u;
-    RowVector4d weights_v = (vec_v.transpose() * matV) * scale_v;
-
-    Vector3d result = Vector3d::Zero();
-
-    for (int i = 0; i < 4; ++i) {
-        for (int j = 0; j < 4; ++j) {
-            int u_idx_global = ki_u - 3 + i;
-            int v_idx_global = ki_v - 3 + j;
-            int flat_idx = u_idx_global * num_cp_v + v_idx_global;
-
-            if (flat_idx >= 0 && flat_idx < controls.size()) {
-                double w = weights_u(i) * weights_v(j);
-                result += w * controls[flat_idx];
-            }
-        }
-    }
-
-    return result;
-}
-
-
-SurfaceCurvature BSplineSurface::getCurvature(const Parameter& paraU, const Parameter& paraV, const vector<double>& knotsU, const vector<double>& knotsV, const std::vector<Vector3d>& controls,int num_cp_v) {
-
+SurfaceCurvature BSplineSurface::curvatureFromEval(const SurfaceEval& eval) const
+{
     SurfaceCurvature result;
-    Vector3d Su = getFirstDiff(paraU, paraV, knotsU, knotsV, controls, num_cp_v, true);  // true for u
-    Vector3d Sv = getFirstDiff(paraU, paraV, knotsU, knotsV, controls, num_cp_v, false); // false for v
-
-    Vector3d Suu = getSecondDiff(paraU, paraV, knotsU, knotsV, controls, num_cp_v, 0); // type 0 = Suu
-    Vector3d Svv = getSecondDiff(paraU, paraV, knotsU, knotsV, controls, num_cp_v, 1); // type 1 = Svv
-    Vector3d Suv = getSecondDiff(paraU, paraV, knotsU, knotsV, controls, num_cp_v, 2); // type 2 = Suv
+    const Vector3d& Su = eval.Su;
+    const Vector3d& Sv = eval.Sv;
+    const Vector3d& Suu = eval.Suu;
+    const Vector3d& Svv = eval.Svv;
+    const Vector3d& Suv = eval.Suv;
 
     Vector3d normal_raw = Su.cross(Sv);
     double area = normal_raw.norm();
 
     if (area < 1e-9) {
+        result.point = eval.pos;
         result.normal = Vector3d::UnitZ();
         result.tangent1 = Vector3d::UnitX();
         result.tangent2 = Vector3d::UnitY();
-        result.E=1; result.G=1; result.F=0;
-        result.L=0; result.M=0; result.N=0;
-        result.k1=0; result.k2=0; result.K=0; result.H=0;
+        result.E = 1; result.G = 1; result.F = 0;
+        result.L = 0; result.M = 0; result.N = 0;
+        result.k1 = 0; result.k2 = 0; result.K = 0; result.H = 0;
         return result;
     }
     result.normal = normal_raw / area;
@@ -193,17 +198,17 @@ SurfaceCurvature BSplineSurface::getCurvature(const Parameter& paraU, const Para
     result.M = Suv.dot(result.normal);
     result.N = Svv.dot(result.normal);
 
-    double det_I = result.E * result.G - result.F * result.F; // EG - F^2
+    double det_I = result.E * result.G - result.F * result.F;
     if (std::abs(det_I) < 1e-9) {
+        result.point = eval.pos;
         result.K = 0; result.H = 0; result.k1 = 0; result.k2 = 0;
         return result;
     }
 
-    double det_II = result.L * result.N - result.M * result.M; // LN - M^2
+    double det_II = result.L * result.N - result.M * result.M;
 
-    result.K = det_II / det_I; // Gaussian
-    result.H = (result.E * result.N + result.G * result.L - 2 * result.F * result.M) / (2 * det_I); // Mean
-
+    result.K = det_II / det_I;
+    result.H = (result.E * result.N + result.G * result.L - 2 * result.F * result.M) / (2 * det_I);
 
     double discriminant = result.H * result.H - result.K;
     discriminant = (discriminant < 0) ? 0 : discriminant;
@@ -222,13 +227,34 @@ SurfaceCurvature BSplineSurface::getCurvature(const Parameter& paraU, const Para
         T1 = (-B * Su + A * Sv).normalized();
     }
 
-    // T2 垂直于 T1 和 N
     Vector3d T2 = result.normal.cross(T1).normalized();
 
     result.tangent1 = T1;
     result.tangent2 = T2;
-    result.point = getPos(paraU, paraV, knotsU, knotsV, controls, num_cp_v);
+    result.point = eval.pos;
     return result;
+}
+
+Vector3d BSplineSurface::getPos(const Parameter& paraU, const Parameter& paraV, const vector<double>& knotsU, const vector<double>& knotsV, const std::vector<Vector3d>& controls, int num_cp_v) {
+    return evaluateSurface(paraU, paraV, knotsU, knotsV, controls, num_cp_v).pos;
+}
+
+Vector3d BSplineSurface::getFirstDiff(const Parameter& paraU, const Parameter& paraV, const vector<double>& knotsU, const vector<double>& knotsV, const std::vector<Vector3d>& controls,int num_cp_v, bool is_diff_u)
+{
+    const SurfaceEval eval = evaluateSurface(paraU, paraV, knotsU, knotsV, controls, num_cp_v);
+    return is_diff_u ? eval.Su : eval.Sv;
+}
+
+Vector3d BSplineSurface::getSecondDiff(const Parameter& paraU, const Parameter& paraV, const vector<double>& knotsU, const vector<double>& knotsV, const std::vector<Vector3d>& controls,int num_cp_v, int type) {
+    const SurfaceEval eval = evaluateSurface(paraU, paraV, knotsU, knotsV, controls, num_cp_v);
+    if (type == 0) return eval.Suu;
+    if (type == 1) return eval.Svv;
+    return eval.Suv;
+}
+
+
+SurfaceCurvature BSplineSurface::getCurvature(const Parameter& paraU, const Parameter& paraV, const vector<double>& knotsU, const vector<double>& knotsV, const std::vector<Vector3d>& controls,int num_cp_v) {
+    return curvatureFromEval(evaluateSurface(paraU, paraV, knotsU, knotsV, controls, num_cp_v));
 }
 
 void BSplineSurface::buildRangeGrid(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud, int grid_res) {
@@ -282,91 +308,85 @@ void BSplineSurface::buildRangeGrid(const pcl::PointCloud<pcl::PointXYZ>::Ptr& c
 }
 
 double BSplineSurface::findFootPrint(const vector<Vector3d> &givepoints, vector<pair<Parameter, Parameter>> &footPrints, vector<double> &point_dists) {
-    footPrints.assign(givepoints.size(), {Parameter(0, 0.0), Parameter(0, 0.0)});
-    point_dists.assign(givepoints.size(), 0.0);
+    // 用 PCA 投影冷启动 + Newton 精化，不再依赖 positions[] 采样点扫描
+    footPrints.clear();
+    coldInitUVFromPCA(givepoints, footPrints);
+    return findFootPrintWarm(givepoints, footPrints, point_dists, /*newton_steps=*/6);
+}
 
-    const int n_pos = (int)positions.size();
-    if (n_pos == 0 || givepoints.empty()) return 0.0;
+std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter> BSplineSurface:: getPara(int index) {
+    if (index < 0 || index >= (int)sampling_paras_.size()) {
+        return {Parameter(0, 0.0), Parameter(0, 0.0)};
+    }
+    return sampling_paras_[index];
+}
 
-    const int nu_spans = (int)span_sample_index_.size();
-    const int nv_spans = (nu_spans > 0) ? (int)span_sample_index_[0].size() : 0;
+// ─── UV 工具：给定全局参数 t ∈ [0,1]，找所在 knot span ───────────────────────
+static int findSpanGlobal(double t, const std::vector<double>& knots, int num_cp) {
+    if (t >= 1.0 - 1e-9) return num_cp - 1;
+    for (int k = 3; k < num_cp; ++k)
+        if (knots[k] <= t && t < knots[k + 1]) return k;
+    return 3;
+}
 
-    // Use UV-projected span lookup when plane_frame_ is valid and span index was built.
-    const bool use_span = (plane_frame_.valid
-                           && nu_spans > 0 && nv_spans > 0
-                           && (plane_frame_.u_hi - plane_frame_.u_lo) > 1e-9
-                           && (plane_frame_.v_hi - plane_frame_.v_lo) > 1e-9);
+// ─── PCA 冷启动：把 givepoints 投影到 PCA 平面，映射到 [0,1] BSpline 参数 ───
+void BSplineSurface::coldInitUVFromPCA(const vector<Vector3d>& givepoints,
+                                       vector<pair<Parameter,Parameter>>& uv_out) const
+{
+    const int n = static_cast<int>(givepoints.size());
+    uv_out.resize(n);
 
-    // Find knot span index for a normalized parameter t in [0,1].
-    auto findSpan = [&](double t, const vector<double>& knots, int num_cp) -> int {
-        if (t >= 1.0 - 1e-9) return num_cp - 1;
-        for (int k = 3; k < num_cp; ++k)
-            if (knots[k] <= t && t < knots[k + 1]) return k;
-        return 3;
-    };
+    // 若 plane_frame_ 无效，用域中心作为 fallback
+    const double u_fallback = 0.5, v_fallback = 0.5;
+    const int span_u_fb = findSpanGlobal(u_fallback, knots_u, controls_num_u);
+    const int span_v_fb = findSpanGlobal(v_fallback, knots_v, controls_num_v);
+    const Parameter para_u_fb(span_u_fb, u_fallback);
+    const Parameter para_v_fb(span_v_fb, v_fallback);
 
+    if (!plane_frame_.valid
+        || (plane_frame_.u_hi - plane_frame_.u_lo) < 1e-9
+        || (plane_frame_.v_hi - plane_frame_.v_lo) < 1e-9)
+    {
+        for (auto& uv : uv_out) uv = {para_u_fb, para_v_fb};
+        return;
+    }
+
+    const double inv_u = 1.0 / (plane_frame_.u_hi - plane_frame_.u_lo);
+    const double inv_v = 1.0 / (plane_frame_.v_hi - plane_frame_.v_lo);
+
+    for (int i = 0; i < n; ++i) {
+        Vector3d diff = givepoints[i] - plane_frame_.centroid;
+        double u_proj = diff.dot(plane_frame_.u_axis);
+        double v_proj = diff.dot(plane_frame_.v_axis);
+        double u_norm = std::max(0.0, std::min(1.0, (u_proj - plane_frame_.u_lo) * inv_u));
+        double v_norm = std::max(0.0, std::min(1.0, (v_proj - plane_frame_.v_lo) * inv_v));
+        int span_u = findSpanGlobal(u_norm, knots_u, controls_num_u);
+        int span_v = findSpanGlobal(v_norm, knots_v, controls_num_v);
+        uv_out[i] = {Parameter(span_u, u_norm), Parameter(span_v, v_norm)};
+    }
+}
+
+// ─── warm-start findFootPrint：从 uv_state 出发做 Newton 精化 ────────────────
+double BSplineSurface::findFootPrintWarm(const vector<Vector3d>& givepoints,
+                                         vector<pair<Parameter,Parameter>>& uv_state,
+                                         vector<double>& point_dists,
+                                         int newton_steps)
+{
+    if (uv_state.empty()) coldInitUVFromPCA(givepoints, uv_state);
+    const int n = static_cast<int>(givepoints.size());
+    point_dists.resize(n, 0.0);
     double squareSum = 0.0;
-    for (int i = 0; i < (int)givepoints.size(); ++i) {
+
+    for (int i = 0; i < n; ++i) {
         const Vector3d& p = givepoints[i];
+        auto [paraU, paraV] = uv_state[i];
 
-        // ---- Step 1: find best initial sample via UV-span lookup or brute force ----
-        int best_idx = 0;
-        double best_dist_sq = std::numeric_limits<double>::max();
+        for (int nr = 0; nr < newton_steps; ++nr) {
+            const SurfaceEval eval = evaluateSurface(paraU, paraV, knots_u, knots_v, controls, controls_num_v);
+            Vector3d r = eval.pos - p;
 
-        if (use_span) {
-            // Project query point onto PCA plane, map to normalized BSpline parameter.
-            Vector3d diff = p - plane_frame_.centroid;
-            double u_proj  = diff.dot(plane_frame_.u_axis);
-            double v_proj  = diff.dot(plane_frame_.v_axis);
-            double u_norm  = (u_proj - plane_frame_.u_lo) / (plane_frame_.u_hi - plane_frame_.u_lo);
-            double v_norm  = (v_proj - plane_frame_.v_lo) / (plane_frame_.v_hi - plane_frame_.v_lo);
-            u_norm = std::max(0.0, std::min(1.0, u_norm));
-            v_norm = std::max(0.0, std::min(1.0, v_norm));
-
-            // Estimate span indices (offset by -3 for span_sample_index_ indexing).
-            int sp_u = std::max(0, std::min(nu_spans - 1, findSpan(u_norm, knots_u, controls_num_u) - 3));
-            int sp_v = std::max(0, std::min(nv_spans - 1, findSpan(v_norm, knots_v, controls_num_v) - 3));
-
-            // Search estimated span ± 1 in both directions (~9 patches at most).
-            for (int dsi = -1; dsi <= 1; ++dsi) {
-                int si = sp_u + dsi;
-                if (si < 0 || si >= nu_spans) continue;
-                for (int dsj = -1; dsj <= 1; ++dsj) {
-                    int sj = sp_v + dsj;
-                    if (sj < 0 || sj >= nv_spans) continue;
-                    for (int idx : span_sample_index_[si][sj]) {
-                        double d = (positions[idx] - p).squaredNorm();
-                        if (d < best_dist_sq) { best_dist_sq = d; best_idx = idx; }
-                    }
-                }
-            }
-            // Fallback: shouldn't happen on a well-fitted surface, but be safe.
-            if (best_dist_sq == std::numeric_limits<double>::max()) {
-                for (int k = 0; k < n_pos; ++k) {
-                    double d = (positions[k] - p).squaredNorm();
-                    if (d < best_dist_sq) { best_dist_sq = d; best_idx = k; }
-                }
-            }
-        } else {
-            // Fallback: linear scan over all samples (no heap alloc, no ANN rebuild).
-            for (int k = 0; k < n_pos; ++k) {
-                double d = (positions[k] - p).squaredNorm();
-                if (d < best_dist_sq) { best_dist_sq = d; best_idx = k; }
-            }
-        }
-
-        // ---- Step 2: Newton refinement from best initial (u,v) ----
-        // Solves r·Su = 0, r·Sv = 0 where r = S(u,v) - p.
-        auto [paraU, paraV] = sampling_paras_[best_idx];
-
-        for (int nr = 0; nr < 3; ++nr) {
-            Vector3d S  = getPos(paraU, paraV, knots_u, knots_v, controls, controls_num_v);
-            Vector3d Su = getFirstDiff(paraU, paraV, knots_u, knots_v, controls, controls_num_v, true);
-            Vector3d Sv = getFirstDiff(paraU, paraV, knots_u, knots_v, controls, controls_num_v, false);
-            Vector3d r  = S - p;
-
-            double a00 = Su.dot(Su), a01 = Su.dot(Sv), a11 = Sv.dot(Sv);
-            double b0  = -r.dot(Su), b1  = -r.dot(Sv);
+            double a00 = eval.Su.dot(eval.Su), a01 = eval.Su.dot(eval.Sv), a11 = eval.Sv.dot(eval.Sv);
+            double b0  = -r.dot(eval.Su), b1  = -r.dot(eval.Sv);
             double det = a00 * a11 - a01 * a01;
             if (std::abs(det) < 1e-10) break;
 
@@ -375,29 +395,19 @@ double BSplineSurface::findFootPrint(const vector<Vector3d> &givepoints, vector<
 
             double new_tf_u = std::max(0.0, std::min(1.0, paraU.second + du));
             double new_tf_v = std::max(0.0, std::min(1.0, paraV.second + dv));
-
-            paraU = {findSpan(new_tf_u, knots_u, controls_num_u), new_tf_u};
-            paraV = {findSpan(new_tf_v, knots_v, controls_num_v), new_tf_v};
+            paraU = {findSpanGlobal(new_tf_u, knots_u, controls_num_u), new_tf_u};
+            paraV = {findSpanGlobal(new_tf_v, knots_v, controls_num_v), new_tf_v};
 
             if (std::abs(du) < 1e-6 && std::abs(dv) < 1e-6) break;
         }
 
-        Vector3d S_final    = getPos(paraU, paraV, knots_u, knots_v, controls, controls_num_v);
-        double true_dist_sq = (S_final - p).squaredNorm();
-
-        squareSum      += std::sqrt(true_dist_sq);
-        point_dists[i]  = true_dist_sq;
-        footPrints[i]   = {paraU, paraV};
+        uv_state[i] = {paraU, paraV};
+        const SurfaceEval final_eval = evaluateSurface(paraU, paraV, knots_u, knots_v, controls, controls_num_v);
+        double dist_sq = (final_eval.pos - p).squaredNorm();
+        point_dists[i] = dist_sq;
+        squareSum += std::sqrt(dist_sq);
     }
-
     return squareSum;
-}
-
-std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter> BSplineSurface:: getPara(int index) {
-    if (index < 0 || index >= sampling_paras_.size()) {
-        return {Parameter(0, 0.0), Parameter(0, 0.0)};
-    }
-    return sampling_paras_[index];
 }
 
 void BSplineSurface::pclToEigenVector(const pcl::PointCloud<pcl::PointXYZ>::Ptr &cloud,
@@ -507,10 +517,7 @@ void BSplineSurface::initControlPointPCA(const pcl::PointCloud<pcl::PointXYZ>::P
     max_y = max_pt_4f[1]; min_y = min_pt_4f[1];
     max_z = max_pt_4f[2]; min_z = min_pt_4f[2];
 
-    // ----- 3. KD-tree (3D) 用于每个控制点找最近邻 -> 估计法向偏移 h -----
-    //input_kdtree_.setInputCloud(cloud);
-
-    // ----- 4. (u, v) 矩形 + margin -----
+    // ----- 3. (u, v) 矩形 + margin -----
     const double u_range = plane_frame_.u_max - plane_frame_.u_min;
     const double v_range = plane_frame_.v_max - plane_frame_.v_min;
     const double u_lo = plane_frame_.u_min - margin_ratio * u_range;
@@ -527,35 +534,30 @@ void BSplineSurface::initControlPointPCA(const pcl::PointCloud<pcl::PointXYZ>::P
 
     controlPs.assign(num_u * num_v, Vector3d::Zero());
 
-    // ----- 5. 在 (u, v) 上均匀取点 -> 3D KD-tree 找最近邻 -> 用最近邻在 n 方向的投影做高度 -----
+    // ----- 4. 预计算所有输入点在 PCA 空间的 (u, v, h) 投影 -----
+    const int N_pts = static_cast<int>(cloud->points.size());
+    vector<double> pts_u(N_pts), pts_v(N_pts), pts_h(N_pts);
+    for (int k = 0; k < N_pts; ++k) {
+        Vector3d d(cloud->points[k].x - plane_frame_.centroid.x(),
+                   cloud->points[k].y - plane_frame_.centroid.y(),
+                   cloud->points[k].z - plane_frame_.centroid.z());
+        pts_u[k] = d.dot(plane_frame_.u_axis);
+        pts_v[k] = d.dot(plane_frame_.v_axis);
+        pts_h[k] = d.dot(plane_frame_.n_axis);
+    }
+
+    // ----- 5. 每个控制点网格位置 -> PCA 2D 最近邻 -> 用其法向投影高度 -----
     for (int i = 0; i < num_u; ++i) {
         for (int j = 0; j < num_v; ++j) {
             const double cu = u_lo + i * u_step;
             const double cv = v_lo + j * v_step;
-
-            // // 落在平面上的 3D 查询点 (高度先用 h_avg)
-            const Vector3d query_3d = plane_frame_.centroid
-                                    + cu * plane_frame_.u_axis
-                                    + cv * plane_frame_.v_axis
-                                    + plane_frame_.h_avg * plane_frame_.n_axis;
-
-            pcl::PointXYZ q;
-            q.x = static_cast<float>(query_3d.x());
-            q.y = static_cast<float>(query_3d.y());
-            q.z = static_cast<float>(query_3d.z());
-
-            std::vector<int>   idx(1);
-            std::vector<float> sqdist(1);
-
+            double best_d2 = std::numeric_limits<double>::max();
             double h = plane_frame_.h_avg;
-            if (input_kdtree_.nearestKSearch(q, 1, idx, sqdist) > 0) {
-                const auto& np = cloud->points[idx[0]];
-                Vector3d d(np.x - plane_frame_.centroid.x(),
-                           np.y - plane_frame_.centroid.y(),
-                           np.z - plane_frame_.centroid.z());
-                h = d.dot(plane_frame_.n_axis); // 最近邻在 n 方向的投影 -> 控制点高度
+            for (int k = 0; k < N_pts; ++k) {
+                const double du = pts_u[k] - cu, dv = pts_v[k] - cv;
+                const double d2 = du * du + dv * dv;
+                if (d2 < best_d2) { best_d2 = d2; h = pts_h[k]; }
             }
-
             const Vector3d cp = plane_frame_.centroid
                               + cu * plane_frame_.u_axis
                               + cv * plane_frame_.v_axis
@@ -632,51 +634,12 @@ bool BSplineSurface::isPointValid(const Vector3d& p) {
 }
 
 void BSplineSurface::setNewControl(const vector<Vector3d> &controlPs, int num_u, int num_v,bool isCut) {
-    clear();
     controls = controlPs;
     controls_num_u = num_u;
     controls_num_v = num_v;
-
-    const int start_u = 3;
-    const int end_u   = controls_num_u;
-    const int start_v = 3;
-    const int end_v   = controls_num_v;
-
-    // Pre-allocate span index grid: span i maps to index (i - 3)
-    const int nu_spans = std::max(0, controls_num_u - 3);
-    const int nv_spans = std::max(0, controls_num_v - 3);
-    if (nu_spans > 0 && nv_spans > 0)
-        span_sample_index_.assign(nu_spans, vector<vector<int>>(nv_spans));
-
-    int pos_idx = 0;
-    for (int i = start_u; i <= end_u; ++i) {
-        double dt_u = knots_u[i + 1] - knots_u[i];
-        if (dt_u <= 1e-6) continue;
-        const int si = i - 3;
-        for (int j = start_v; j <= end_v; ++j) {
-            double dt_v = knots_v[j + 1] - knots_v[j];
-            if (dt_v <= 1e-6) continue;
-            const int sj = j - 3;
-
-            for (double fu = 0.0; fu <= 1.0; fu += interal_) {
-                for (double fv = 0.0; fv <= 1.0; fv += interal_) {
-                    double global_u = knots_u[i] + fu * dt_u;
-                    double global_v = knots_v[j] + fv * dt_v;
-
-                    Parameter paraU(i, global_u);
-                    Parameter paraV(j, global_v);
-
-                    Vector3d p = getPos(paraU, paraV, knots_u, knots_v, controls, controls_num_v);
-                    positions.push_back(p);
-                    sampling_paras_.push_back({paraU, paraV});
-
-                    if (si >= 0 && si < nu_spans && sj >= 0 && sj < nv_spans)
-                        span_sample_index_[si][sj].push_back(pos_idx);
-                    ++pos_idx;
-                }
-            }
-        }
-    }
+    positions.clear();
+    sampling_paras_.clear();
+    span_sample_index_.clear();
 }
 
 void BSplineSurface::setKnotParams(int num_cp_u,int num_cp_v) {
@@ -712,54 +675,7 @@ void BSplineSurface::setKnotParams(int num_cp_u,int num_cp_v) {
 
 
 Eigen::Matrix4d BSplineSurface::ComputeNonUniformBsplineMatrix(int i, const vector<double> &knots) {
-    Eigen::Matrix4d M = Eigen::Matrix4d::Zero();
-    double t_i   = knots[i];
-    double t_im1 = knots[i - 1]; // i-1
-    double t_im2 = knots[i - 2]; // i-2
-    double t_ip1 = knots[i + 1]; // i+1
-    double t_ip2 = knots[i + 2]; // i+2
-    double t_ip3 = knots[i + 3]; // i+3
-
-    double dt_i_im1   = t_i - t_im1;
-    double dt_ip1_i   = t_ip1 - t_i;
-    double dt_ip1_im1 = t_ip1 - t_im1;
-    double dt_ip1_im2 = t_ip1 - t_im2;
-    double dt_ip2_im1 = t_ip2 - t_im1;
-    double dt_ip2_i   = t_ip2 - t_i;
-    double dt_ip3_i   = t_ip3 - t_i;
-
-    double m00 = (dt_ip1_i * dt_ip1_i) / (dt_ip1_im1 * dt_ip1_im2);
-    double m02 = (dt_i_im1 * dt_i_im1) / (dt_ip2_im1 * dt_ip1_im1);
-    double m22 = 3.0 * (dt_ip1_i * dt_ip1_i) / (dt_ip2_im1 * dt_ip1_im1);
-    double m33 = (dt_ip1_i * dt_ip1_i) / (dt_ip3_i * dt_ip2_i);
-    double m12 = 3.0 * dt_ip1_i * dt_i_im1 / (dt_ip2_im1 * dt_ip1_im1);
-
-    // Row 0
-    M(0, 0) = m00;
-    M(0, 1) = 1.0 - m00 - m02; // m01 = 1 - m00 - m02
-    M(0, 2) = m02;
-    M(0, 3) = 0.0;
-
-    // Row 1
-    M(1, 0) = -3.0 * m00;
-    M(1, 1) = 3.0 * m00 - m12;
-    M(1, 2) = m12;
-    M(1, 3) = 0.0;
-
-    // Row 2
-    M(2, 0) = 3.0 * m00;
-    M(2, 1) = -3.0 * m00 - m22;
-    M(2, 2) = m22;
-    M(2, 3) = 0.0;
-
-    // Row 3
-    M(3, 0) = -m00;
-    double term_extra = (dt_ip1_i * dt_ip1_i) / (dt_ip2_i * dt_ip2_im1);
-    M(3, 2) = -m22 / 3.0 - m33 - term_extra;
-    M(3, 1) = m00 - M(3, 2) - m33; // m31 = m00 - m32 - m33
-    M(3, 3) = m33;
-
-    return M;
+    return computeBsplineMatrix(i, knots);
 }
 
 
@@ -779,9 +695,6 @@ double BSplineSurface::apply(
 
     this->input_cloud_ = points;
 
-    //std::cout<<"point size<<"<<points->size()<<std::endl;
-    this->input_kdtree_.setInputCloud(points);
-    double t_kdtree = ms_since(t0); t0 = std::chrono::high_resolution_clock::now();
     vector<Vector3d> controlPs;
 
     const int expected = controls_num_u * controls_num_v;
@@ -794,6 +707,17 @@ double BSplineSurface::apply(
         max_x = max_pt_4f[0]; min_x = min_pt_4f[0];
         max_y = max_pt_4f[1]; min_y = min_pt_4f[1];
         max_z = max_pt_4f[2]; min_z = min_pt_4f[2];
+        // 为 UV warm-start 补充 PCA frame（地面 grid cell 走 ext_init 路径）
+        computePlaneFrame(points);
+        if (plane_frame_.valid) {
+            const double mr = 0.15;
+            const double ur = plane_frame_.u_max - plane_frame_.u_min;
+            const double vr = plane_frame_.v_max - plane_frame_.v_min;
+            plane_frame_.u_lo = plane_frame_.u_min - mr * ur;
+            plane_frame_.u_hi = plane_frame_.u_max + mr * ur;
+            plane_frame_.v_lo = plane_frame_.v_min - mr * vr;
+            plane_frame_.v_hi = plane_frame_.v_max + mr * vr;
+        }
     } else {
         controlPs.resize(expected);
         initControlPoint(points, controlPs, controls_num_u, controls_num_v);
@@ -803,41 +727,27 @@ double BSplineSurface::apply(
     buildRangeGrid(points, 50);
     double t_grid = ms_since(t0); t0 = std::chrono::high_resolution_clock::now();
     setKnotParams(controls_num_u, controls_num_v);
-    setNewControl(controlPs,controls_num_u,controls_num_v);
+    setNewControl(controlPs, controls_num_u, controls_num_v);
     double t_set = ms_since(t0); t0 = std::chrono::high_resolution_clock::now();
 
-    // update the control point
-    // compute P"(t)
-    // MatrixXd pm = spline_surface->getSIntegralSq();
-    // MatrixXd sm = spline_surface->getFIntegralSq();
-    // end test
-
-    // find the foot print, will result in error
-    double total_error = 1e9;
     double last_error = 1e9;
     vector<Vector3d> givepoints;
     pclToEigenVector(points, givepoints);
-    double t_vec = ms_since(t0);
-    // std::cout << std::fixed << std::setprecision(2)
-    //       << "[apply init] kdtree=" << t_kdtree << "ms initCP=" << t_init
-    //       << "ms grid=" << t_grid
-    //       << "ms pcl2eigen=" << t_vec << "ms"
-    //       << " pts=" << givepoints.size() << std::endl;
 
-    int point_num = givepoints.size();bool stop_flag = false;
-    double sum_fp = 0.0;
-    double sum_pre = 0.0;
-    double sum_data_res = 0.0;
-    double sum_smooth = 0.0;
-    double sum_bound = 0.0;
-    double sum_solve = 0.0;
-    double sum_set = 0.0;
+    // UV warm-start：第一次迭代用 PCA 投影冷启动，后续复用上次精化结果
+    vector<pair<Parameter, Parameter>> uv_cache;
+    coldInitUVFromPCA(givepoints, uv_cache);
+
+    int point_num = static_cast<int>(givepoints.size());
+    bool stop_flag = false;
+    double sum_fp = 0.0, sum_pre = 0.0, sum_data_res = 0.0;
+    double sum_smooth = 0.0, sum_bound = 0.0, sum_solve = 0.0;
     for(int iter = 0; iter < maxIterNum; ++iter) {
         ceres::Problem problem;
-        vector<pair<Parameter, Parameter>> parameters;
         vector<double> point_dists;
         auto t1 = std::chrono::high_resolution_clock::now();
-        double current_sq_dist = findFootPrint(givepoints, parameters,point_dists);
+        // uv_cache 既是输入（warm start）也是输出（精化后结果），下次迭代自动复用
+        double current_sq_dist = findFootPrintWarm(givepoints, uv_cache, point_dists, /*newton_steps=*/5);
         sum_fp += ms_since(t1);
         t1 = std::chrono::high_resolution_clock::now();
         double diff = last_error - current_sq_dist;
@@ -856,33 +766,14 @@ double BSplineSurface::apply(
         // 例如：如果你传入的 eplison 是 1e-3 (0.1%)，当提升小于这个比例时停止
         // iter > 0 是为了防止第一次 last_error 为初始值时的误判
         if (iter > 0 && relative_decrease < eplison) {
-            //std::cout << ">> Converged by Relative Decrease (" << relative_decrease << " < " << eplison << ")" << std::endl;
-            vector<Vector3d> controls_copy = controls; // <--- ✅ 先克隆一份
-
-            if (!stop_flag) {
-                stop_flag = true;
-                //std::cout<<"ready to stop "<<std::endl;
-            }
-            else {
-                setNewControl(controls_copy, controls_num_u, controls_num_v,true);
-                break;
-            }
+            if (!stop_flag) { stop_flag = true; }
+            else { break; }
         }
 
-        // 策略2: 绝对精度满足要求 (RMSE)
-        // 这里的 1e-3 代表平均误差小于 0.001 (假设单位是米，即1mm)
-        // 你可以根据你的点云尺度调整这个值
+        // 策略2: 绝对精度满足要求 (RMSE < 1cm)
         if (rmse < 1e-2) {
-            //std::cout << ">> Converged by RMSE (" << rmse << " < 1e-3)" << std::endl;
-            vector<Vector3d> controls_copy = controls; // <--- ✅ 先克隆一份
-            if (!stop_flag) {
-                stop_flag = true;
-                setNewControl(controls_copy, controls_num_u, controls_num_v,true);
-            }
-            else {
-                setNewControl(controls_copy, controls_num_u, controls_num_v,true);
-                break;
-            }
+            if (!stop_flag) { stop_flag = true; }
+            else { break; }
         }
 
         last_error = current_sq_dist;
@@ -905,32 +796,19 @@ double BSplineSurface::apply(
         std::vector<double*> active_cp_pointers;
         active_weights.reserve(16);
         active_cp_pointers.reserve(16);
-        for(int i = 0; i< parameters.size(); i++)
+        for(int i = 0; i < (int)uv_cache.size(); i++)
         {
             active_weights.clear();
             active_cp_pointers.clear();
             if (point_dists[i] > inlier_thresh) {
                 continue; // 直接当噪声，跳过
             }
-            Parameter paraU = parameters[i].first, paraV = parameters[i].second;
-            SurfaceCurvature surf_info = getCurvature(paraU, paraV, knots_u, knots_v, controls, controls_num_v);
+            Parameter paraU = uv_cache[i].first, paraV = uv_cache[i].second;
+            const SurfaceEval eval = evaluateSurface(paraU, paraV, knots_u, knots_v, controls, controls_num_v);
+            SurfaceCurvature surf_info = curvatureFromEval(eval);
 
-            surf_info.point = getPos(paraU, paraV, knots_u, knots_v,controls,controls_num_v);
-            int span_u = paraU.first;
-            int span_v = paraV.first;
-
-            Matrix4d mat_coeff_u = ComputeNonUniformBsplineMatrix(span_u, knots_u);
-            Matrix4d mat_coeff_v = ComputeNonUniformBsplineMatrix(span_v, knots_v);
-            double dt_u = knots_u[span_u + 1] - knots_u[span_u];
-            double u = (dt_u > 1e-9) ? (paraU.second - knots_u[span_u]) / dt_u : 0.0;
-            Vector4d U_vec;
-            U_vec << 1.0, u, u * u, u * u * u;
-            RowVector4d w_u = U_vec.transpose() * mat_coeff_u;
-            double dt_v = knots_v[span_v + 1] - knots_v[span_v];
-            double v = (dt_v > 1e-9) ? (paraV.second - knots_v[span_v]) / dt_v : 0.0;
-            Vector4d V_vec;
-            V_vec << 1.0, v, v * v, v * v * v;
-            RowVector4d w_v = V_vec.transpose() * mat_coeff_v;
+            const int span_u = paraU.first;
+            const int span_v = paraV.first;
             for (int l = 0; l < 4; ++l) {
                 for (int m = 0; m < 4; ++m)
                 {
@@ -939,7 +817,7 @@ double BSplineSurface::apply(
                         continue;
                     }
                     active_cp_pointers.push_back(controls[flat_index].data());
-                    active_weights.push_back(w_u(l)*w_v(m));
+                    active_weights.push_back(eval.w_pos_u(l) * eval.w_pos_v(m));
                 }
             }
 
@@ -1012,23 +890,10 @@ double BSplineSurface::apply(
         t1 = std::chrono::high_resolution_clock::now();
         ceres::Solve(options, &problem, &summary);
         sum_solve += ms_since(t1);
-        t1 = std::chrono::high_resolution_clock::now();
-        //std::cout << summary.FullReport() << std::endl;
-        vector<Vector3d> controls_copy = controls; // <--- ✅ 先克隆一份
-        setNewControl(controls_copy, controls_num_u, controls_num_v);
-        sum_set += ms_since(t1);
+        // Ceres 直接在 controls[].data() 上修改，无需再调 setNewControl 重建 positions[]
     }
-    // std::cout << std::fixed << std::setprecision(2)
-    //       << "sum_fp=" << sum_fp
-    //       << "ms sum_pre=" << sum_pre
-    //       << "ms sum_data_res=" << sum_data_res
-    //       << "ms sum_smooth=" << sum_smooth
-    //       << "ms sum_bound=" << sum_bound
-    //       << "ms sum_solve=" << sum_solve
-    //       << "ms sum_set=" << sum_set
-    //       << "ms" << std::endl;
-    // 在 apply 函数的 return last_error; 之前加入：
 
-
+    // 把最终控制点提交（同时清空过时的 positions[]）
+    setNewControl(controls, controls_num_u, controls_num_v);
     return 1.0;
 }

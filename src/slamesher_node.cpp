@@ -555,6 +555,8 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/map_update_interval", map_update_interval, 20);
     nh.param("slamesher/ground_build_interval", ground_build_interval, 20);
     nh.param("slamesher/map_unmatched_ratio_min", map_unmatched_ratio_min, 0.30);
+    nh.param("slamesher/cluster_ds_min_pts",    cluster_ds_min_pts,    100);
+    nh.param("slamesher/cluster_ds_target_max", cluster_ds_target_max, 200);
     nh.param("slamesher/ground_near_x", ground_near_x, 0.0);
     nh.param("slamesher/ground_near_y", ground_near_y, 0.0);
     nh.param("slamesher/ground_cell_size",    ground_cell_size,    6.0);
@@ -563,6 +565,9 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/ground_query_radius", ground_query_radius, 1);
     nh.param("slamesher/ground_skip_points",  ground_skip_points,  40);
     nh.param("slamesher/ground_clear_dist",   ground_clear_dist,   150.0);
+    std::cout << "cluster_ds: min_pts=" << cluster_ds_min_pts
+              << " target_max=" << cluster_ds_target_max
+              << (cluster_ds_target_max > 0 ? " (range-image 2D downsample on)" : " (off)") << std::endl;
     std::cout << "ground_grid: cell=" << ground_cell_size
               << "m min_pts=" << ground_cell_min_pts
               << " num_cp=" << ground_cell_num_cp
@@ -1241,6 +1246,11 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
     // 障碍聚类：地面高度带像素不参与 BFS
     SegmentationResult seg = range_proc.segmentRangeImage(
         5, 0.1, MIN_CLUSTER_PTS, ground_z_min, ground_z_max, true);
+    range_proc.downsampleClusters(
+        seg,
+        param.cluster_ds_min_pts,
+        param.cluster_ds_target_max,
+        MIN_CLUSTER_PTS);
 
     const Eigen::Matrix3d R_w = T_world.block<3,3>(0,0);
     const Eigen::Vector3d t_w = T_world.block<3,1>(0,3);

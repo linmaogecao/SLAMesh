@@ -120,6 +120,15 @@ public:
     SegmentationResult segmentRangeImage(double theta_deg, double max_dist, int min_cluster_size,
                                          double ground_z_min = -1e9, double ground_z_max = 1e9,
                                          bool exclude_ground_band = false);
+
+    // 分割后按 range-image (u,v) 网格对每个 cluster 做自适应均匀稀疏：
+    // 像素数 <= min_pts 不抽稀；否则 2D 步长使保留量约 target_max（0=关闭）。
+    // min_keep：抽稀后若少于该值则回退为原始 cluster。
+    void downsampleClusters(SegmentationResult& result,
+                            int min_pts,
+                            int target_max,
+                            int min_keep = 30) const;
+
     void saveClustersToTxt(const SegmentationResult& result, const std::string& folder_path);
 
     // 与 saveClustersToTxt 相同，但将每个点用 transform (4×4) 变换到目标坐标系后再写入。

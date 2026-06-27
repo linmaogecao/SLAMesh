@@ -24,6 +24,8 @@ public:
     double variance_register, variance_map_update, variance_map_show, variance_min, variance_sensor;
     double grid, voxel_size, converge_thr;
     double map_unmatched_ratio_min{0.30}; // 簇内未匹配比例 >= 此值才新建障碍曲面
+    int    cluster_ds_min_pts{100};     // cluster 像素数 <= 此值不抽稀
+    int    cluster_ds_target_max{200};  // 大 cluster 目标保留像素上限（0=关闭）
     double ground_near_x{0.0};    // 地面建图+配准：雷达系前后范围 |x| < 此值（m）；0=不限
     double ground_near_y{0.0};    // 地面建图+配准：雷达系左右范围 |y| < 此值（m）；0=不限
     // XY 栅格地面地图
