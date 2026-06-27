@@ -1289,6 +1289,12 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
     }
 
     // ── 障碍分支：仅对非地面 cluster 建图（地面已在分割前排除） ──
+    if (do_obstacle && g_data.step == 1) {
+        BSplineSurface::setApplyProfileLogPath(
+            std::string(kBsplineBuildDir) + "/frame1_apply_profile.txt");
+        std::cout << "  [ApplyProfile] logging frame-1 obstacle apply -> "
+                  << kBsplineBuildDir << "/frame1_apply_profile.txt" << std::endl;
+    }
     for (int cid = 0; cid < (int)seg.clusters.size(); cid++) {
         const auto& pixels = seg.clusters[cid];
         if ((int)pixels.size() < MIN_CLUSTER_PTS) continue;
@@ -1354,6 +1360,9 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
             bspline_map.addSurface(surf, cloud_world, /*is_ground=*/false, g_data.step);
             ++n_added_obs;
         }
+    }
+    if (do_obstacle && g_data.step == 1) {
+        BSplineSurface::clearApplyProfileLog();
     }
 
     if (dump_clusters) {

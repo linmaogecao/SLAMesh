@@ -2,6 +2,8 @@
 // Created by albus on 2026/1/18.
 //
 #include <fstream>
+#include <sstream>
+#include <iomanip>
 #include <ANN/ANN.h>
 
 #include "BSpline.h"
@@ -106,6 +108,32 @@ static int numCpFromKnots(const std::vector<double>& knots) {
 }
 
 }  // namespace
+
+namespace {
+std::string g_apply_profile_log_path;
+int g_apply_profile_index = 0;
+
+void appendApplyProfileLine(const std::string& line) {
+    if (g_apply_profile_log_path.empty()) return;
+    std::ofstream out(g_apply_profile_log_path, std::ios::out | std::ios::app);
+    out << line << '\n';
+}
+}  // namespace
+
+void BSplineSurface::setApplyProfileLogPath(const std::string& path) {
+    g_apply_profile_log_path = path;
+    g_apply_profile_index = 0;
+    if (path.empty()) return;
+    std::ofstream out(path, std::ios::trunc);
+    out << "# index num_cp_u num_cp_v n_pts max_iter loop_iters ceres_solves "
+           "exit_reason total_ms init_ms grid_ms set_ms fp_ms pre_ms data_res_ms "
+           "smooth_ms bound_ms solve_ms final_rmse\n";
+}
+
+void BSplineSurface::clearApplyProfileLog() {
+    g_apply_profile_log_path.clear();
+    g_apply_profile_index = 0;
+}
 
 SurfaceEval BSplineSurface::evaluateSurface(
         const Parameter& paraU, const Parameter& paraV,
@@ -742,7 +770,12 @@ double BSplineSurface::apply(
     bool stop_flag = false;
     double sum_fp = 0.0, sum_pre = 0.0, sum_data_res = 0.0;
     double sum_smooth = 0.0, sum_bound = 0.0, sum_solve = 0.0;
+    int loop_iters = 0;
+    int ceres_solves = 0;
+    std::string exit_reason = "max_iter";
+    double final_rmse = 0.0;
     for(int iter = 0; iter < maxIterNum; ++iter) {
+        ++loop_iters;
         ceres::Problem problem;
         vector<double> point_dists;
         auto t1 = std::chrono::high_resolution_clock::now();
@@ -765,15 +798,16 @@ double BSplineSurface::apply(
         // 策略1: 相对下降率极小 (收敛平台期)
         // 例如：如果你传入的 eplison 是 1e-3 (0.1%)，当提升小于这个比例时停止
         // iter > 0 是为了防止第一次 last_error 为初始值时的误判
+        final_rmse = rmse;
         if (iter > 0 && relative_decrease < eplison) {
             if (!stop_flag) { stop_flag = true; }
-            else { break; }
+            else { exit_reason = "rel_decrease"; break; }
         }
 
         // 策略2: 绝对精度满足要求 (RMSE < 1cm)
         if (rmse < 1e-2) {
             if (!stop_flag) { stop_flag = true; }
-            else { break; }
+            else { exit_reason = "rmse"; break; }
         }
 
         last_error = current_sq_dist;
@@ -883,14 +917,32 @@ double BSplineSurface::apply(
         sum_bound += ms_since(t1);
         ceres::Solver::Options options;
         options.linear_solver_type = ceres::ITERATIVE_SCHUR;
-        options.num_threads = 4;
+        options.num_threads = 1;
         options.max_num_iterations = 1; // 关键点！
         options.minimizer_progress_to_stdout = false;
         ceres::Solver::Summary summary;
         t1 = std::chrono::high_resolution_clock::now();
         ceres::Solve(options, &problem, &summary);
+        ++ceres_solves;
         sum_solve += ms_since(t1);
         // Ceres 直接在 controls[].data() 上修改，无需再调 setNewControl 重建 positions[]
+    }
+
+    if (!g_apply_profile_log_path.empty()) {
+        const double total_ms = t_init + t_grid + t_set + sum_fp + sum_pre + sum_data_res
+                              + sum_smooth + sum_bound + sum_solve;
+        std::ostringstream oss;
+        oss << std::fixed << std::setprecision(4)
+            << g_apply_profile_index++ << ' '
+            << controls_num_u << ' ' << controls_num_v << ' '
+            << point_num << ' ' << maxIterNum << ' '
+            << loop_iters << ' ' << ceres_solves << ' '
+            << exit_reason << ' '
+            << total_ms << ' ' << t_init << ' ' << t_grid << ' ' << t_set << ' '
+            << sum_fp << ' ' << sum_pre << ' ' << sum_data_res << ' '
+            << sum_smooth << ' ' << sum_bound << ' ' << sum_solve << ' '
+            << final_rmse;
+        appendApplyProfileLine(oss.str());
     }
 
     // 把最终控制点提交（同时清空过时的 positions[]）
