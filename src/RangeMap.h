@@ -86,6 +86,8 @@ public:
     // pixel_to_cloud_idx_[pixel_idx] = 对应点云中的点下标（-1 表示该 pixel 无效）
     // 由 generateRangeImage 填充，与 range_image_ 同步
     std::vector<int> pixel_to_cloud_idx_;
+    // 本次 generateRangeImage 中：已通过筛选但因同像素存在更近点而未写入 range image 的点（雷达系）
+    std::vector<Eigen::Vector3d> occluded_points_;
     pcl::PointCloud<pcl::PointXYZ> ouyt;
     RangeImageProcessor() {
         range_image_.resize(H_SCANS * W_COLS);
@@ -98,7 +100,12 @@ public:
     // -----------------------------------------------------------------
     // 2. 核心函数: PointCloud -> RangeImage
     // -----------------------------------------------------------------
-    void generateRangeImage(const pcl::PointCloud<pcl::PointXYZ>& cloud);
+    // exclude_ground_band=true 时，z∈[ground_z_min,ground_z_max] 的点不投影进 range image
+    void generateRangeImage(const pcl::PointCloud<pcl::PointXYZ>& cloud,
+                            double ground_z_min = -1e9, double ground_z_max = 1e9,
+                            bool exclude_ground_band = false);
+
+    const std::vector<Eigen::Vector3d>& getOccludedPoints() const { return occluded_points_; }
     bool getPoint(int u, int v, Eigen::Vector3d& out_point) const {
         // 处理 V 方向 (水平) 的周期性
         v = v % W_COLS;

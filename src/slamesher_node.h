@@ -16,7 +16,7 @@ class Parameter{
     //algorithm parameter
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-    int    max_steps{10000}, max_frames{0}, dump_frame{0}, dump_cluster_step{0}, register_times, num_test, min_points_num_to_gp, num_thread, cross_cell_overlap_length, dataset;
+    int    max_steps{10000}, max_frames{0}, dump_frame{0}, dump_cluster_step{0}, dump_occluded_step{0}, register_times, num_test, min_points_num_to_gp, num_thread, cross_cell_overlap_length, dataset;
     int    map_update_interval{20}, ground_build_interval{20};
     int    map_save_step_begin{0}, map_save_step_end{0};  // 0=不限；导出 created_step 在此闭区间内的曲面
     int    all_surfaces_max_step{0};  // 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面

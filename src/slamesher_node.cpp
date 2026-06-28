@@ -93,6 +93,51 @@ void saveFrame1GroundPoints(const std::vector<Eigen::Vector3d>& pts_lidar)
     for (const auto& p : sorted)
         fout << p.x() << " " << p.y() << " " << p.z() << "\n";
 }
+
+void saveOccludedPointsTxt(const std::vector<Eigen::Vector3d>& pts_lidar,
+                           const Transf& T_world,
+                           const std::string& base_dir)
+{
+    if (pts_lidar.empty()) return;
+    const Eigen::Matrix3d R = T_world.block<3, 3>(0, 0);
+    const Eigen::Vector3d t = T_world.block<3, 1>(0, 3);
+
+    std::ofstream f_lidar(base_dir + "/occluded_lidar.txt", std::ios::out | std::ios::trunc);
+    std::ofstream f_world(base_dir + "/occluded_world.txt", std::ios::out | std::ios::trunc);
+    if (!f_lidar.is_open() || !f_world.is_open()) return;
+
+    f_lidar << std::fixed << std::setprecision(6);
+    f_world << std::fixed << std::setprecision(6);
+    for (const auto& p : pts_lidar) {
+        f_lidar << p.x() << " " << p.y() << " " << p.z() << "\n";
+        const Eigen::Vector3d pw = R * p + t;
+        f_world << pw.x() << " " << pw.y() << " " << pw.z() << "\n";
+    }
+}
+
+int saveRangeImagePointsTxt(const RangeImageProcessor& range_proc,
+                            const Transf& T_world,
+                            const std::string& base_dir)
+{
+    const Eigen::Matrix3d R = T_world.block<3, 3>(0, 0);
+    const Eigen::Vector3d t = T_world.block<3, 1>(0, 3);
+
+    std::ofstream f_lidar(base_dir + "/rangeimage_lidar.txt", std::ios::out | std::ios::trunc);
+    std::ofstream f_world(base_dir + "/rangeimage_world.txt", std::ios::out | std::ios::trunc);
+    if (!f_lidar.is_open() || !f_world.is_open()) return 0;
+
+    f_lidar << std::fixed << std::setprecision(6);
+    f_world << std::fixed << std::setprecision(6);
+    int n = 0;
+    for (const auto& px : range_proc.range_image_) {
+        if (!px.valid) continue;
+        f_lidar << px.x << " " << px.y << " " << px.z << "\n";
+        const Eigen::Vector3d pw = R * Eigen::Vector3d(px.x, px.y, px.z) + t;
+        f_world << pw.x() << " " << pw.y() << " " << pw.z() << "\n";
+        ++n;
+    }
+    return n;
+}
 }  // namespace
 
 Log::Log(){
@@ -521,6 +566,7 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/max_frames", max_frames, 0);
     nh.param("slamesher/dump_frame", dump_frame, 0);
     nh.param("slamesher/dump_cluster_step", dump_cluster_step, 0);
+    nh.param("slamesher/dump_occluded_step", dump_occluded_step, 0);
     nh.param("slamesher/all_surfaces_max_step", all_surfaces_max_step, 0);
     std::cout<<"max_steps: "<<max_steps<<std::endl;
     std::cout<<"max_frames: "<<max_frames<<(max_frames > 0 ? " (debug stop)" : " (run full sequence)")<<std::endl;
@@ -529,6 +575,9 @@ void Parameter::initParameter(ros::NodeHandle & nh){
              <<std::endl;
     std::cout<<"dump_cluster_step: "<<dump_cluster_step
              <<(dump_cluster_step > 0 ? " (save clusters -> " + std::string(kBsplineBuildDir) + "/output_clusters)" : " (off)")
+             <<std::endl;
+    std::cout<<"dump_occluded_step: "<<dump_occluded_step
+             <<(dump_occluded_step > 0 ? " (save rangeimage+occluded -> " + std::string(kBsplineBuildDir) + "/rangeimage_*,occluded_*.txt)" : " (off)")
              <<std::endl;
     std::cout<<"all_surfaces_max_step: "<<all_surfaces_max_step
              <<(all_surfaces_max_step > 0 ? " (export surfaces with created_step <= N)" : " (off)")
@@ -1186,6 +1235,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             std::ofstream f_scan(base + "/scan_world.txt", std::ios::out | std::ios::trunc);
             f_scan << std::fixed << std::setprecision(6);
             for (const auto& pt : scan_local.points) {
+                if (pt.z >= ground_z_min && pt.z <= ground_z_max) continue;
                 const Eigen::Vector3d p_w = R * Eigen::Vector3d(pt.x, pt.y, pt.z) + t;
                 f_scan << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
             }
@@ -1237,13 +1287,34 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
     constexpr int    MAX_NEW_SURFACES = 70;
 
     const bool dump_clusters = (param.dump_cluster_step > 0 && g_data.step == param.dump_cluster_step);
+    const bool dump_occluded = (param.dump_occluded_step > 0 && g_data.step == param.dump_occluded_step);
     const bool do_obstacle = (g_data.step == 1) || (g_data.step % param.map_update_interval  == 0);
     const bool do_ground   = (g_data.step == 1) || (g_data.step % param.ground_build_interval == 0);
-    if (!do_obstacle && !do_ground && !dump_clusters) return;
+    if (!do_obstacle && !do_ground && !dump_clusters && !dump_occluded) return;
 
     TicToc t_upd;
-    range_proc.generateRangeImage(scan_local);
-    // 障碍聚类：地面高度带像素不参与 BFS
+    // 地面点不投影进 range image；仅非地面点用于障碍聚类
+    range_proc.generateRangeImage(scan_local, ground_z_min, ground_z_max, true);
+
+    if (dump_occluded) {
+        const std::string build_dir = std::string(kBsplineBuildDir);
+        std::error_code ec;
+        std::filesystem::create_directories(build_dir, ec);
+        if (ec) {
+            std::cerr << "  [DumpOccluded] failed to create dir: " << build_dir
+                      << " (" << ec.message() << ")\n";
+        } else {
+            const auto& occ = range_proc.getOccludedPoints();
+            saveOccludedPointsTxt(occ, T_world, build_dir);
+            const int n_in = saveRangeImagePointsTxt(range_proc, T_world, build_dir);
+            std::cout << "  [DumpOccluded] step=" << g_data.step
+                      << " occluded=" << occ.size()
+                      << " rangeimage=" << n_in
+                      << " -> " << build_dir
+                      << "/{occluded_*,rangeimage_*}.txt" << std::endl;
+        }
+    }
+
     SegmentationResult seg = range_proc.segmentRangeImage(
         5, 0.1, MIN_CLUSTER_PTS, ground_z_min, ground_z_max, true);
     range_proc.downsampleClusters(
@@ -1257,19 +1328,17 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
 
     int n_added_gnd = 0, n_added_obs = 0;
 
-    // ── 地面分支：地面点投入 GroundGridMap，每格积累后各自拟合 BSpline ──
+    // ── 地面分支：雷达系按 z 高度带直接筛点，不经过 range image ──
     if (do_ground) {
-        // 收集世界系地面点（近邻矩形区域过滤）
         pcl::PointCloud<pcl::PointXYZ> cloud_gnd_world;
         std::vector<Eigen::Vector3d> gnd_lidar_pts;
-        gnd_lidar_pts.reserve(range_proc.range_image_.size());
-        for (const auto& px : range_proc.range_image_) {
-            if (!px.valid) continue;
-            if (px.z < ground_z_min || px.z > ground_z_max) continue;
-            if (param.ground_near_x > 0 && std::abs(px.x) > param.ground_near_x) continue;
-            if (param.ground_near_y > 0 && std::abs(px.y) > param.ground_near_y) continue;
-            gnd_lidar_pts.emplace_back(px.x, px.y, px.z);
-            Eigen::Vector3d pw = R_w * Eigen::Vector3d(px.x, px.y, px.z) + t_w;
+        gnd_lidar_pts.reserve(scan_local.size() / 4);
+        for (const auto& pt : scan_local.points) {
+            if (pt.z < ground_z_min || pt.z > ground_z_max) continue;
+            if (param.ground_near_x > 0 && std::abs(pt.x) > param.ground_near_x) continue;
+            if (param.ground_near_y > 0 && std::abs(pt.y) > param.ground_near_y) continue;
+            gnd_lidar_pts.emplace_back(pt.x, pt.y, pt.z);
+            Eigen::Vector3d pw = R_w * Eigen::Vector3d(pt.x, pt.y, pt.z) + t_w;
             cloud_gnd_world.push_back(pcl::PointXYZ(
                 static_cast<float>(pw.x()), static_cast<float>(pw.y()), static_cast<float>(pw.z())));
         }
@@ -1606,7 +1675,7 @@ void SLAMesher::process(){
 
     // buildGroundMap 用：传感器系下地面点 z 范围
     const double GROUND_Z_MIN    = -3.0;
-    const double GROUND_Z_MAX    = -1.0;
+    const double GROUND_Z_MAX    = -1.5;
     while(nh.ok()){
         g_data.step++;
         if (param.max_frames > 0 && g_data.step > param.max_frames) {

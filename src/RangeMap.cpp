@@ -17,10 +17,13 @@ struct QueueItem {
     int step_count;
 };
 
-void RangeImageProcessor::generateRangeImage(const pcl::PointCloud<pcl::PointXYZ> &cloud)
+void RangeImageProcessor::generateRangeImage(const pcl::PointCloud<pcl::PointXYZ>& cloud,
+                                             double ground_z_min, double ground_z_max,
+                                             bool exclude_ground_band)
 {
     std::fill(range_image_.begin(), range_image_.end(), RangePixel());
     std::fill(pixel_to_cloud_idx_.begin(), pixel_to_cloud_idx_.end(), -1);
+    occluded_points_.clear();
 
     float fov_up_rad = FOV_UP * M_PI / 180.0f;
     float fov_down_rad = FOV_DOWN * M_PI / 180.0f;
@@ -29,6 +32,8 @@ void RangeImageProcessor::generateRangeImage(const pcl::PointCloud<pcl::PointXYZ
     for (size_t i = 0; i < cloud.size(); ++i) {
         const auto& pt = cloud.points[i];
         if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
+            continue;
+        if (exclude_ground_band && pt.z >= ground_z_min && pt.z <= ground_z_max)
             continue;
         double range = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
         if (range < MIN_RANGE || range > MAX_RANGE || pt.z < MIN_Z) {
@@ -55,7 +60,9 @@ void RangeImageProcessor::generateRangeImage(const pcl::PointCloud<pcl::PointXYZ
                 px.z = pt.z;
                 px.range = range;
                 px.valid = true;
-                pixel_to_cloud_idx_[idx] = static_cast<int>(i);  // 记录胜出点的点云下标
+                pixel_to_cloud_idx_[idx] = static_cast<int>(i);
+            } else if (px.valid) {
+                occluded_points_.emplace_back(pt.x, pt.y, pt.z);
             }
         }
     }
@@ -226,6 +233,7 @@ SegmentationResult RangeImageProcessor::segmentRangeImage(double theta_deg, doub
             result.clusters.push_back(std::move(current_cluster));
         }
     }
+    std::cout << "Total clusters:-------------- " << result.clusters.size() << std::endl;
     return result;
 }
 
