@@ -606,6 +606,8 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/map_unmatched_ratio_min", map_unmatched_ratio_min, 0.30);
     nh.param("slamesher/cluster_ds_min_pts",    cluster_ds_min_pts,    100);
     nh.param("slamesher/cluster_ds_target_max", cluster_ds_target_max, 200);
+    nh.param("slamesher/range_image_split",          range_image_split,          30.0);
+    nh.param("slamesher/range_image_far_min_cluster", range_image_far_min_cluster, 20);
     nh.param("slamesher/ground_near_x", ground_near_x, 0.0);
     nh.param("slamesher/ground_near_y", ground_near_y, 0.0);
     nh.param("slamesher/ground_cell_size",    ground_cell_size,    6.0);
@@ -617,6 +619,9 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     std::cout << "cluster_ds: min_pts=" << cluster_ds_min_pts
               << " target_max=" << cluster_ds_target_max
               << (cluster_ds_target_max > 0 ? " (range-image 2D downsample on)" : " (off)") << std::endl;
+    std::cout << "range_image_split: " << range_image_split
+              << (range_image_split > 0 ? " m (two-layer range image on)" : " (off, single layer)")
+              << "  far_min_cluster=" << range_image_far_min_cluster << std::endl;
     std::cout << "ground_grid: cell=" << ground_cell_size
               << "m min_pts=" << ground_cell_min_pts
               << " num_cp=" << ground_cell_num_cp
@@ -1277,6 +1282,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                             const Transf& T_world,
                             RangeImageProcessor& range_proc,
+                            RangeImageProcessor& range_proc_far,
                             BSplineMap& bspline_map,
                             GroundGridMap& ground_grid,
                             double match_dist_thr,
@@ -1293,8 +1299,16 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
     if (!do_obstacle && !do_ground && !dump_clusters && !dump_occluded) return;
 
     TicToc t_upd;
-    // 地面点不投影进 range image；仅非地面点用于障碍聚类
-    range_proc.generateRangeImage(scan_local, ground_z_min, ground_z_max, true);
+    // 近层：range ∈ [MIN_RANGE, range_image_split)；如不启用双层则全范围投影
+    const double split_dist = param.range_image_split;
+    const bool use_far_layer = (split_dist > 0.0);
+    range_proc.generateRangeImage(scan_local, ground_z_min, ground_z_max, true,
+                                  0.0, use_far_layer ? split_dist : 1e9);
+
+    // 远层：range ∈ [range_image_split, MAX_RANGE]
+    if (use_far_layer)
+        range_proc_far.generateRangeImage(scan_local, ground_z_min, ground_z_max, true,
+                                          split_dist, 1e9);
 
     if (dump_occluded) {
         const std::string build_dir = std::string(kBsplineBuildDir);
@@ -1304,14 +1318,44 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
             std::cerr << "  [DumpOccluded] failed to create dir: " << build_dir
                       << " (" << ec.message() << ")\n";
         } else {
+            // 近层
             const auto& occ = range_proc.getOccludedPoints();
             saveOccludedPointsTxt(occ, T_world, build_dir);
             const int n_in = saveRangeImagePointsTxt(range_proc, T_world, build_dir);
+            // 远层
+            int n_in_far = 0;
+            if (use_far_layer) {
+                const auto& occ_far = range_proc_far.getOccludedPoints();
+                // 保存到 occluded_far_* 和 rangeimage_far_*
+                std::ofstream fl(build_dir + "/occluded_far_lidar.txt", std::ios::trunc);
+                std::ofstream fw(build_dir + "/occluded_far_world.txt", std::ios::trunc);
+                const Eigen::Matrix3d R = T_world.block<3,3>(0,0);
+                const Eigen::Vector3d t = T_world.block<3,1>(0,3);
+                fl << std::fixed << std::setprecision(6);
+                fw << std::fixed << std::setprecision(6);
+                for (const auto& p : occ_far) {
+                    fl << p.x() << " " << p.y() << " " << p.z() << "\n";
+                    Eigen::Vector3d pw = R * p + t;
+                    fw << pw.x() << " " << pw.y() << " " << pw.z() << "\n";
+                }
+                // rangeimage_far_*
+                std::ofstream frl(build_dir + "/rangeimage_far_lidar.txt", std::ios::trunc);
+                std::ofstream frw(build_dir + "/rangeimage_far_world.txt", std::ios::trunc);
+                frl << std::fixed << std::setprecision(6);
+                frw << std::fixed << std::setprecision(6);
+                for (const auto& px : range_proc_far.range_image_) {
+                    if (!px.valid) continue;
+                    frl << px.x << " " << px.y << " " << px.z << "\n";
+                    Eigen::Vector3d pw = R * Eigen::Vector3d(px.x, px.y, px.z) + t;
+                    frw << pw.x() << " " << pw.y() << " " << pw.z() << "\n";
+                    ++n_in_far;
+                }
+            }
             std::cout << "  [DumpOccluded] step=" << g_data.step
-                      << " occluded=" << occ.size()
-                      << " rangeimage=" << n_in
-                      << " -> " << build_dir
-                      << "/{occluded_*,rangeimage_*}.txt" << std::endl;
+                      << " near: occluded=" << occ.size() << " rangeimage=" << n_in
+                      << (use_far_layer ? " far: occluded=" + std::to_string(range_proc_far.getOccludedPoints().size())
+                                              + " rangeimage=" + std::to_string(n_in_far) : "")
+                      << " -> " << build_dir << std::endl;
         }
     }
 
@@ -1322,6 +1366,19 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
         param.cluster_ds_min_pts,
         param.cluster_ds_target_max,
         MIN_CLUSTER_PTS);
+
+    // 远层分割（如果启用）
+    SegmentationResult seg_far;
+    if (use_far_layer) {
+        const int far_min = param.range_image_far_min_cluster;
+        seg_far = range_proc_far.segmentRangeImage(
+            5, 0.1, far_min, ground_z_min, ground_z_max, true);
+        range_proc_far.downsampleClusters(
+            seg_far,
+            param.cluster_ds_min_pts,
+            param.cluster_ds_target_max,
+            far_min);
+    }
 
     const Eigen::Matrix3d R_w = T_world.block<3,3>(0,0);
     const Eigen::Vector3d t_w = T_world.block<3,1>(0,3);
@@ -1364,19 +1421,24 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
         std::cout << "  [ApplyProfile] logging frame-1 obstacle apply -> "
                   << kBsplineBuildDir << "/frame1_apply_profile.txt" << std::endl;
     }
-    for (int cid = 0; cid < (int)seg.clusters.size(); cid++) {
-        const auto& pixels = seg.clusters[cid];
-        if ((int)pixels.size() < MIN_CLUSTER_PTS) continue;
 
-        if (do_obstacle && n_added_obs < MAX_NEW_SURFACES) {
+    // 障碍建图 lambda：近层 / 远层复用同一套逻辑
+    auto buildObsFromSeg = [&](RangeImageProcessor& proc, SegmentationResult& s, int min_pts) {
+        for (int cid = 0; cid < (int)s.clusters.size(); cid++) {
+            const auto& pixels = s.clusters[cid];
+            if ((int)pixels.size() < min_pts) continue;
+
+            if (!do_obstacle) break;
+            if (g_data.step != 1 && n_added_obs >= MAX_NEW_SURFACES) break;
+
             std::unordered_map<int, std::vector<int>> surf_to_kidx;
             std::vector<Eigen::Vector3d> pix_world(pixels.size(), Eigen::Vector3d::Zero());
             std::vector<bool> pix_valid(pixels.size(), false);
 
             for (int k = 0; k < (int)pixels.size(); ++k) {
-                const auto& px = range_proc.range_image_[pixels[k]];
+                const auto& px = proc.range_image_[pixels[k]];
                 if (!px.valid) continue;
-                if (px.z <= ground_z_max) continue;  // 排除地面高度带
+                if (px.z <= ground_z_max) continue;
                 Eigen::Vector3d pw = R_w * Eigen::Vector3d(px.x, px.y, px.z) + t_w;
                 pix_world[k] = pw;
                 pix_valid[k] = true;
@@ -1402,24 +1464,24 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
             }
 
             int n_valid = static_cast<int>(std::count(pix_valid.begin(), pix_valid.end(), true));
-            if (n_valid < MIN_CLUSTER_PTS) continue;
+            if (n_valid < min_pts) continue;
 
             auto cloud_local = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
             cloud_local->reserve(pixels.size());
             for (int k = 0; k < (int)pixels.size(); ++k) {
                 if (!pix_valid[k] || confirmed_matched[k]) continue;
-                const auto& px = range_proc.range_image_[pixels[k]];
+                const auto& px = proc.range_image_[pixels[k]];
                 cloud_local->push_back(pcl::PointXYZ(px.x, px.y, px.z));
             }
             const int n_unmatched = static_cast<int>(cloud_local->size());
-            if (n_unmatched < MIN_CLUSTER_PTS) continue;
+            if (n_unmatched < min_pts) continue;
             if (static_cast<double>(n_unmatched) / n_valid < param.map_unmatched_ratio_min) continue;
 
             const int num_cp = chooseControlGridSize(n_unmatched);
             auto cloud_world = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
             pcl::transformPointCloud(*cloud_local, *cloud_world, T_world.cast<float>());
 
-            auto init_cp = range_proc.computeInitControlPoints(seg, cid, num_cp, num_cp, 2);
+            auto init_cp = proc.computeInitControlPoints(s, cid, num_cp, num_cp, 2);
             if (init_cp.empty()) continue;
             for (auto& cp : init_cp) cp = R_w * cp + t_w;
 
@@ -1429,7 +1491,14 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
             bspline_map.addSurface(surf, cloud_world, /*is_ground=*/false, g_data.step);
             ++n_added_obs;
         }
-    }
+    };
+
+    // 近层建图
+    buildObsFromSeg(range_proc, seg, MIN_CLUSTER_PTS);
+    // 远层建图（如启用）
+    if (use_far_layer)
+        buildObsFromSeg(range_proc_far, seg_far, param.range_image_far_min_cluster);
+
     if (do_obstacle && g_data.step == 1) {
         BSplineSurface::clearApplyProfileLog();
     }
@@ -1443,14 +1512,27 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                       << " (" << ec.message() << ")\n";
         } else {
             range_proc.saveClustersWorldToTxt(seg, cluster_dir, T_world);
+            int n_far_clusters = 0;
+            if (use_far_layer) {
+                // 远层 cluster 文件名加 _far 前缀，写入同目录
+                const std::string far_dir = std::string(kBsplineBuildDir) + "/output_clusters_far";
+                std::error_code ec2;
+                std::filesystem::create_directories(far_dir, ec2);
+                if (!ec2) {
+                    range_proc_far.saveClustersWorldToTxt(seg_far, far_dir, T_world);
+                    n_far_clusters = (int)seg_far.clusters.size();
+                }
+            }
             std::cout << "  [DumpCluster] step=" << g_data.step
-                      << " clusters=" << seg.clusters.size()
-                      << " -> " << cluster_dir << "/cluster_*.txt (world frame)" << std::endl;
+                      << " near_clusters=" << seg.clusters.size()
+                      << (use_far_layer ? " far_clusters=" + std::to_string(n_far_clusters) : "")
+                      << " -> " << cluster_dir << "/ (world frame)" << std::endl;
         }
     }
 
     std::cout << "  [MapBuild] step=" << g_data.step
-              << " clusters=" << seg.clusters.size()
+              << " near_clusters=" << seg.clusters.size()
+              << (use_far_layer ? " far_clusters=" + std::to_string(seg_far.clusters.size()) : "")
               << " +gnd_cells_refit=" << n_added_gnd << " +obs=" << n_added_obs
               << " obs_total=" << bspline_map.size()
               << " (" << t_upd.toc() << " ms)" << std::endl;
@@ -1657,6 +1739,7 @@ void SLAMesher::process(){
                               param.ground_cell_num_cp,
                               param.ground_query_radius);
     RangeImageProcessor range_proc;
+    RangeImageProcessor range_proc_far;  // 远层（range >= range_image_split）
 
     g_data.extendLog();
     Transf T_world = g_data.initFirstTransf();
@@ -1695,7 +1778,7 @@ void SLAMesher::process(){
 
         if(g_data.step == 1){
             processFirstFrame(T_world);
-            runMapBuild(scan_local, T_world, range_proc, bspline_map, ground_grid, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
+            runMapBuild(scan_local, T_world, range_proc, range_proc_far, bspline_map, ground_grid, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
             continue;
         }
 
@@ -1719,7 +1802,7 @@ void SLAMesher::process(){
             traj_file.flush();
         }
 
-        runMapBuild(scan_local, T_world, range_proc, bspline_map, ground_grid, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
+        runMapBuild(scan_local, T_world, range_proc, range_proc_far, bspline_map, ground_grid, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
 
         path_pub.publish(g_data.path);
         std::cout << "===STEP " << g_data.step << "=== Total: " << t_step.toc() << " ms===" << std::endl;

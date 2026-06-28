@@ -101,9 +101,12 @@ public:
     // 2. 核心函数: PointCloud -> RangeImage
     // -----------------------------------------------------------------
     // exclude_ground_band=true 时，z∈[ground_z_min,ground_z_max] 的点不投影进 range image
+    // layer_range_min/max：只投影 range∈[layer_range_min, layer_range_max) 的点（默认全范围）
     void generateRangeImage(const pcl::PointCloud<pcl::PointXYZ>& cloud,
                             double ground_z_min = -1e9, double ground_z_max = 1e9,
-                            bool exclude_ground_band = false);
+                            bool exclude_ground_band = false,
+                            double layer_range_min = 0.0,
+                            double layer_range_max = 1e9);
 
     const std::vector<Eigen::Vector3d>& getOccludedPoints() const { return occluded_points_; }
     bool getPoint(int u, int v, Eigen::Vector3d& out_point) const {

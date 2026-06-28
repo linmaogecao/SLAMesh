@@ -7,15 +7,15 @@ slamesher:
   read_offline_pcd: true 
   dataset: 1
   max_steps: 10000
-  max_frames: 60        # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
-  dump_frame: 60          # 0=不保存；>0 时在对应 step 配准结束后导出 matched/unmatched 到 build/
-  dump_cluster_step: 60   # 0=不保存；>0 时导出 cluster 到 build/output_clusters/
-  dump_occluded_step: 60 # 0=不保存；>0 时导出 range image 入图点 + 被遮挡点到 build/rangeimage_*,occluded_*.txt
+  max_frames: 71       # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
+  dump_frame: 70         # 0=不保存；>0 时在对应 step 配准结束后导出 matched/unmatched 到 build/
+  dump_cluster_step: 0   # 0=不保存；>0 时导出 cluster 到 build/output_clusters/
+  dump_occluded_step: 0 # 0=不保存；>0 时导出 range image 入图点 + 被遮挡点到 build/rangeimage_*,occluded_*.txt
   console_log_path: "/home/albus/catkin_ws/src/SLAMesh/debug.txt"   # 空=自动写到 file_loc_report/seq##_run_时间.log；也可填绝对路径如 debug.txt
-  save_surface_samples: false  # true 时在 global_map/ 下按序号保存曲面稀疏采样点（全序列）
+  save_surface_samples: true  # true 时在 global_map/ 下按序号保存曲面稀疏采样点（全序列）
   all_surfaces_max_step: 0  # 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面（如 60）
   map_save_step_begin: 40  # 与 end 配合的 step 闭区间过滤（all_surfaces_max_step>0 时优先）
-  map_save_step_end:   80  # 0=不限；例 begin=100 end=150 只导出该区间新建的曲面
+  map_save_step_end:   70  # 0=不限；例 begin=100 end=150 只导出该区间新建的曲面
   save_mesh_map: false
   #register param
   range_max: 150
@@ -26,6 +26,8 @@ slamesher:
   map_unmatched_ratio_min: 0.30 # 簇内未匹配比例 >= 此值才新建障碍曲面
   cluster_ds_min_pts:    80   # cluster 像素数 <= 此值不抽稀
   cluster_ds_target_max: 200   # 大 cluster 按 range-image (u,v) 2D 均匀稀疏到此规模（0=关闭）
+  range_image_split: 30.0      # 两层 range image 分界距离（米）；0=禁用远层（退化为单层）
+  range_image_far_min_cluster: 20  # 远层 cluster 最小点数（建议略小于近层 30）
   ground_near_x: 15.0   # 地面建图+配准：雷达系前后 |x| < 此值（m）；0=不限
   ground_near_y: 5.0    # 地面建图+配准：雷达系左右 |y| < 此值（m）；0=不限
   # XY 栅格地面地图

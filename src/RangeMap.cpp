@@ -19,7 +19,8 @@ struct QueueItem {
 
 void RangeImageProcessor::generateRangeImage(const pcl::PointCloud<pcl::PointXYZ>& cloud,
                                              double ground_z_min, double ground_z_max,
-                                             bool exclude_ground_band)
+                                             bool exclude_ground_band,
+                                             double layer_range_min, double layer_range_max)
 {
     std::fill(range_image_.begin(), range_image_.end(), RangePixel());
     std::fill(pixel_to_cloud_idx_.begin(), pixel_to_cloud_idx_.end(), -1);
@@ -28,6 +29,11 @@ void RangeImageProcessor::generateRangeImage(const pcl::PointCloud<pcl::PointXYZ
     float fov_up_rad = FOV_UP * M_PI / 180.0f;
     float fov_down_rad = FOV_DOWN * M_PI / 180.0f;
     float fov_total_rad = std::abs(fov_up_rad - fov_down_rad);
+
+    // 有效 range 区间：类常量 ∩ 本层指定区间
+    const double eff_range_min = std::max((double)MIN_RANGE, layer_range_min);
+    const double eff_range_max = std::min((double)MAX_RANGE, layer_range_max);
+
     //#pragma omp parallel for schedule(static)
     for (size_t i = 0; i < cloud.size(); ++i) {
         const auto& pt = cloud.points[i];
@@ -36,7 +42,7 @@ void RangeImageProcessor::generateRangeImage(const pcl::PointCloud<pcl::PointXYZ
         if (exclude_ground_band && pt.z >= ground_z_min && pt.z <= ground_z_max)
             continue;
         double range = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
-        if (range < MIN_RANGE || range > MAX_RANGE || pt.z < MIN_Z) {
+        if (range < eff_range_min || range > eff_range_max || pt.z < MIN_Z) {
             continue;
         }
 

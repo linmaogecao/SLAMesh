@@ -26,6 +26,9 @@ public:
     double map_unmatched_ratio_min{0.30}; // 簇内未匹配比例 >= 此值才新建障碍曲面
     int    cluster_ds_min_pts{100};     // cluster 像素数 <= 此值不抽稀
     int    cluster_ds_target_max{200};  // 大 cluster 目标保留像素上限（0=关闭）
+    // 两层 range image 参数
+    double range_image_split{30.0};      // 近/远层分界距离（米）；0=禁用远层
+    int    range_image_far_min_cluster{20}; // 远层 cluster 最小点数（可比近层宽松）
     double ground_near_x{0.0};    // 地面建图+配准：雷达系前后范围 |x| < 此值（m）；0=不限
     double ground_near_y{0.0};    // 地面建图+配准：雷达系左右范围 |y| < 此值（m）；0=不限
     // XY 栅格地面地图
@@ -202,10 +205,11 @@ private:
                              double ground_z_min,
                              double ground_z_max);
 
-    // 统一建图：一次 range image 分割 → z 分流地面/障碍 → 按各自 interval 决定是否建图
+    // 统一建图：近/远两层 range image 分割 → z 分流地面/障碍 → 按各自 interval 决定是否建图
     void runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                      const Transf& T_world,
                      RangeImageProcessor& range_proc,
+                     RangeImageProcessor& range_proc_far,
                      BSplineMap& bspline_map,
                      GroundGridMap& ground_grid,
                      double match_dist_thr,
