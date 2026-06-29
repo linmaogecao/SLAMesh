@@ -145,9 +145,10 @@ public:
     void setKnotParams(int num_cp_u,int num_cp_v);
     pair<Parameter, Parameter> getPara(int index);
     void pclToEigenVector(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud, std::vector<Eigen::Vector3d>& out_vec);
-    double apply(pcl::PointCloud<pcl::PointXYZ>::Ptr& points,int maxIterNum,double alpha,double gama,double eplison);
-    // 非空时 apply() 每次结束追加一行 profile（用于第一帧建图诊断）
+    bool apply(pcl::PointCloud<pcl::PointXYZ>::Ptr& points,int maxIterNum,double alpha,double gama,double eplison);
+    // 非空时 apply() 每次结束打印并追加一行 profile（用于第一帧建图诊断）
     static void setApplyProfileLogPath(const std::string& path);
+    static void setApplyProfileLabel(const std::string& label);
     static void clearApplyProfileLog();
     const vector<Eigen::Vector3d>& getControls() const{return controls;}
     const vector<double>& getKnotsU() const{return knots_u;}

@@ -610,12 +610,13 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/range_image_far_min_cluster", range_image_far_min_cluster, 20);
     nh.param("slamesher/obs_rimg_col_step",           obs_rimg_col_step,           3);
     nh.param("slamesher/obs_match_per_surf_max",      obs_match_per_surf_max,      50);
-    nh.param("slamesher/ground_near_x", ground_near_x, 0.0);
-    nh.param("slamesher/ground_near_y", ground_near_y, 0.0);
     nh.param("slamesher/ground_cell_size",    ground_cell_size,    6.0);
     nh.param("slamesher/ground_cell_min_pts", ground_cell_min_pts, 80);
     nh.param("slamesher/ground_cell_num_cp",  ground_cell_num_cp,  5);
     nh.param("slamesher/ground_query_radius", ground_query_radius, 1);
+    nh.param("slamesher/ground_map_skip_points", ground_map_skip_points, 8);
+    nh.param("slamesher/ground_cell_max_pts",    ground_cell_max_pts,    400);
+    nh.param("slamesher/ground_fit_max_pts",     ground_fit_max_pts,     150);
     nh.param("slamesher/ground_skip_points",  ground_skip_points,  40);
     nh.param("slamesher/ground_clear_dist",   ground_clear_dist,   150.0);
     std::cout << "cluster_ds: min_pts=" << cluster_ds_min_pts
@@ -630,7 +631,10 @@ void Parameter::initParameter(ros::NodeHandle & nh){
               << "m min_pts=" << ground_cell_min_pts
               << " num_cp=" << ground_cell_num_cp
               << " query_r=" << ground_query_radius
-              << " skip=" << ground_skip_points
+              << " map_skip=" << ground_map_skip_points
+              << " cell_max=" << ground_cell_max_pts
+              << " fit_max=" << ground_fit_max_pts
+              << " reg_skip=" << ground_skip_points
               << " clear_dist=" << ground_clear_dist << "m" << std::endl;
     nh.param("slamesher/cross_overlap", cross_overlap, false);
     nh.param("slamesher/cross_cell_overlap_length", cross_cell_overlap_length, 0);
@@ -969,16 +973,16 @@ int SLAMesher::chooseControlGridSize(int num_fitting_points)
     int n;
     if (num_fitting_points < 50)
         n = 4;
-    else if (num_fitting_points < 100)
-        n = 5;
     else if (num_fitting_points < 150)
+        n = 5;
+    else if (num_fitting_points < 300)
         n = 6;
-    else if (num_fitting_points < 250)
+    else if (num_fitting_points < 500)
         n = 8;
-    else if (num_fitting_points < 400)
+    else if (num_fitting_points < 900)
+        n = 9;
+    else if (num_fitting_points < 1000)
         n = 10;
-    else if (num_fitting_points < 700)
-        n = 12;
     else
         n = 15;
 
@@ -1106,14 +1110,11 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
     for (int iter = 0; iter < max_iters && delta_scale > converge_thr; iter++) {
 
         // ── 路 1：地面点 z ∈ [ground_z_min, ground_z_max] → 查 GroundGridMap ──
-        // ground_near_x/y > 0 时只保留雷达系 |x|<near_x 且 |y|<near_y 的点
         std::unordered_map<const BSplineSurface*, std::vector<int>> gnd_surf_to_pts;
         const int gnd_skip = param.ground_skip_points > 0 ? param.ground_skip_points : skip_points;
         for (int i = 0; i < (int)scan_local.size(); i += gnd_skip) {
             const double lx = scan_local[i].x, ly = scan_local[i].y, lz = scan_local[i].z;
             if (lz < ground_z_min || lz > ground_z_max) continue;
-            if (param.ground_near_x > 0 && std::abs(lx) > param.ground_near_x) continue;
-            if (param.ground_near_y > 0 && std::abs(ly) > param.ground_near_y) continue;
             Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
                 Eigen::Vector3d(lx, ly, lz) + T_curr.block<3,1>(0,3);
             const BSplineSurface* sp = ground_grid.queryNearestSurface(p_w);
@@ -1420,15 +1421,23 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
 
     int n_added_gnd = 0, n_added_obs = 0;
 
+    const bool profile_frame1_apply = (g_data.step == 1);
+    if (profile_frame1_apply) {
+        BSplineSurface::setApplyProfileLogPath(
+            std::string(kBsplineBuildDir) + "/frame1_apply_profile.txt");
+        std::cout << "  [Frame1Apply] profiling frame-1 map build apply -> "
+                  << kBsplineBuildDir << "/frame1_apply_profile.txt" << std::endl;
+    }
+
     // ── 地面分支：雷达系按 z 高度带直接筛点，不经过 range image ──
     if (do_ground) {
         pcl::PointCloud<pcl::PointXYZ> cloud_gnd_world;
         std::vector<Eigen::Vector3d> gnd_lidar_pts;
-        gnd_lidar_pts.reserve(scan_local.size() / 4);
-        for (const auto& pt : scan_local.points) {
+        gnd_lidar_pts.reserve(scan_local.size() / 16);
+        const int gnd_map_skip = std::max(1, param.ground_map_skip_points);
+        for (int i = 0; i < (int)scan_local.size(); i += gnd_map_skip) {
+            const auto& pt = scan_local.points[i];
             if (pt.z < ground_z_min || pt.z > ground_z_max) continue;
-            if (param.ground_near_x > 0 && std::abs(pt.x) > param.ground_near_x) continue;
-            if (param.ground_near_y > 0 && std::abs(pt.y) > param.ground_near_y) continue;
             gnd_lidar_pts.emplace_back(pt.x, pt.y, pt.z);
             Eigen::Vector3d pw = R_w * Eigen::Vector3d(pt.x, pt.y, pt.z) + t_w;
             cloud_gnd_world.push_back(pcl::PointXYZ(
@@ -1442,6 +1451,8 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
             // 投格 + 标记需重拟合的格
             auto touched = ground_grid.addPoints(cloud_gnd_world, g_data.step);
             // 对积累点数达标的格重新拟合曲面
+            if (profile_frame1_apply)
+                BSplineSurface::setApplyProfileLabel("gnd");
             n_added_gnd = ground_grid.refitCells(touched);
             // 定期清除远离车辆的旧格
             Eigen::Vector3d veh_pos = T_world.block<3,1>(0,3);
@@ -1450,12 +1461,8 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
     }
 
     // ── 障碍分支：仅对非地面 cluster 建图（地面已在分割前排除） ──
-    if (do_obstacle && g_data.step == 1) {
-        BSplineSurface::setApplyProfileLogPath(
-            std::string(kBsplineBuildDir) + "/frame1_apply_profile.txt");
-        std::cout << "  [ApplyProfile] logging frame-1 obstacle apply -> "
-                  << kBsplineBuildDir << "/frame1_apply_profile.txt" << std::endl;
-    }
+    if (do_obstacle && profile_frame1_apply)
+        BSplineSurface::setApplyProfileLabel("obs");
 
     // 障碍建图 lambda：近层 / 远层复用同一套逻辑
     auto buildObsFromSeg = [&](RangeImageProcessor& proc, SegmentationResult& s, int min_pts) {
@@ -1522,7 +1529,8 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
 
             auto surf = std::make_shared<BSplineSurface>(3, 3, num_cp, num_cp, 0.25);
             surf->setExternalInitControls(init_cp);
-            surf->apply(cloud_world, 50, 1, 1, 0.05);
+            if (!surf->apply(cloud_world, 10, 1, 1, 0.05))
+                continue;  // 跑满迭代未收敛，丢弃该曲面
             bspline_map.addSurface(surf, cloud_world, /*is_ground=*/false, g_data.step);
             ++n_added_obs;
         }
@@ -1534,7 +1542,7 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
     if (use_far_layer)
         buildObsFromSeg(range_proc_far, seg_far, param.range_image_far_min_cluster);
 
-    if (do_obstacle && g_data.step == 1) {
+    if (profile_frame1_apply) {
         BSplineSurface::clearApplyProfileLog();
     }
 
@@ -1772,7 +1780,9 @@ void SLAMesher::process(){
     GroundGridMap ground_grid(param.ground_cell_size,
                               param.ground_cell_min_pts,
                               param.ground_cell_num_cp,
-                              param.ground_query_radius);
+                              param.ground_query_radius,
+                              param.ground_cell_max_pts,
+                              param.ground_fit_max_pts);
     RangeImageProcessor range_proc;
     RangeImageProcessor range_proc_far;  // 远层（range >= range_image_split）
 

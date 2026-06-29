@@ -2,6 +2,7 @@
 // Created by albus on 2026/1/18.
 //
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <iomanip>
 #include <ANN/ANN.h>
@@ -111,7 +112,10 @@ static int numCpFromKnots(const std::vector<double>& knots) {
 
 namespace {
 std::string g_apply_profile_log_path;
+std::string g_apply_profile_label = "surf";
 int g_apply_profile_index = 0;
+int g_apply_profile_count = 0;
+double g_apply_profile_total_ms = 0.0;
 
 void appendApplyProfileLine(const std::string& line) {
     if (g_apply_profile_log_path.empty()) return;
@@ -123,16 +127,32 @@ void appendApplyProfileLine(const std::string& line) {
 void BSplineSurface::setApplyProfileLogPath(const std::string& path) {
     g_apply_profile_log_path = path;
     g_apply_profile_index = 0;
+    g_apply_profile_count = 0;
+    g_apply_profile_total_ms = 0.0;
     if (path.empty()) return;
     std::ofstream out(path, std::ios::trunc);
-    out << "# index num_cp_u num_cp_v n_pts max_iter loop_iters ceres_solves "
+    out << "# index type num_cp_u num_cp_v n_pts max_iter loop_iters ceres_solves "
            "exit_reason total_ms init_ms grid_ms set_ms fp_ms pre_ms data_res_ms "
            "smooth_ms bound_ms solve_ms final_rmse\n";
 }
 
+void BSplineSurface::setApplyProfileLabel(const std::string& label) {
+    g_apply_profile_label = label.empty() ? "surf" : label;
+}
+
 void BSplineSurface::clearApplyProfileLog() {
+    if (!g_apply_profile_log_path.empty() && g_apply_profile_count > 0) {
+        const double mean_ms = g_apply_profile_total_ms / g_apply_profile_count;
+        std::cout << "  [Frame1Apply] summary: n=" << g_apply_profile_count
+                  << " total=" << std::fixed << std::setprecision(2) << g_apply_profile_total_ms
+                  << "ms mean=" << std::setprecision(3) << mean_ms
+                  << "ms -> " << g_apply_profile_log_path << std::endl;
+    }
     g_apply_profile_log_path.clear();
+    g_apply_profile_label = "surf";
     g_apply_profile_index = 0;
+    g_apply_profile_count = 0;
+    g_apply_profile_total_ms = 0.0;
 }
 
 SurfaceEval BSplineSurface::evaluateSurface(
@@ -707,7 +727,7 @@ Eigen::Matrix4d BSplineSurface::ComputeNonUniformBsplineMatrix(int i, const vect
 }
 
 
-double BSplineSurface::apply(
+bool BSplineSurface::apply(
         pcl::PointCloud<pcl::PointXYZ>::Ptr& points,
         int maxIterNum,
         double alpha,
@@ -931,9 +951,26 @@ double BSplineSurface::apply(
     if (!g_apply_profile_log_path.empty()) {
         const double total_ms = t_init + t_grid + t_set + sum_fp + sum_pre + sum_data_res
                               + sum_smooth + sum_bound + sum_solve;
+        const int idx = g_apply_profile_index++;
+        ++g_apply_profile_count;
+        g_apply_profile_total_ms += total_ms;
+
+        std::cout << "  [Frame1Apply] " << g_apply_profile_label
+                  << " #" << idx
+                  << " cp=" << controls_num_u << "x" << controls_num_v
+                  << " pts=" << point_num
+                  << " loops=" << loop_iters << "/" << maxIterNum
+                  << " total=" << std::fixed << std::setprecision(3) << total_ms << "ms"
+                  << " solve=" << sum_solve << "ms"
+                  << " fp=" << sum_fp << "ms"
+                  << " exit=" << exit_reason
+                  << " rmse=" << std::setprecision(4) << final_rmse
+                  << '\n';
+
         std::ostringstream oss;
         oss << std::fixed << std::setprecision(4)
-            << g_apply_profile_index++ << ' '
+            << idx << ' '
+            << g_apply_profile_label << ' '
             << controls_num_u << ' ' << controls_num_v << ' '
             << point_num << ' ' << maxIterNum << ' '
             << loop_iters << ' ' << ceres_solves << ' '
@@ -947,5 +984,5 @@ double BSplineSurface::apply(
 
     // 把最终控制点提交（同时清空过时的 positions[]）
     setNewControl(controls, controls_num_u, controls_num_v);
-    return 1.0;
+    return exit_reason != "max_iter";
 }

@@ -63,14 +63,20 @@ public:
     // min_pts     : 格内点数达到此值才触发拟合
     // num_cp      : BSpline 每维控制点数
     // active_radius : 配准查询时格坐标半径（格数）
+    // cell_max_pts: 每格最多保留点数（超出均匀下采样）
+    // fit_max_pts : 拟合 BSpline 时最多使用的点数
     explicit GroundGridMap(double cell_size   = 6.0,
                            int    min_pts     = 80,
                            int    num_cp      = 5,
-                           int    active_radius = 6)
+                           int    active_radius = 6,
+                           int    cell_max_pts = 400,
+                           int    fit_max_pts  = 150)
         : cell_size_(cell_size),
           min_pts_(min_pts),
           num_cp_(num_cp),
-          active_radius_(active_radius)
+          active_radius_(active_radius),
+          cell_max_pts_(std::max(1, cell_max_pts)),
+          fit_max_pts_(std::max(1, fit_max_pts))
     {}
 
     // -----------------------------------------------------------------------
@@ -89,6 +95,11 @@ public:
             cell.last_update_step = current_step;
             cell.needs_refit = true;
             touched.insert(k);
+        }
+        for (const auto& k : touched) {
+            auto it = cells_.find(k);
+            if (it != cells_.end())
+                capPointsInPlace(it->second.pts, cell_max_pts_);
         }
         return {touched.begin(), touched.end()};
     }
@@ -288,7 +299,33 @@ public:
     }
 
 private:
-    static constexpr int MAX_FIT_PTS = 1000;  // 每格拟合时最多使用的点数
+    static void capPointsInPlace(pcl::PointCloud<pcl::PointXYZ>& pts, int max_pts)
+    {
+        const int n = static_cast<int>(pts.size());
+        if (n <= max_pts) return;
+        pcl::PointCloud<pcl::PointXYZ> out;
+        out.reserve(static_cast<size_t>(max_pts));
+        const int step = std::max(1, (n + max_pts - 1) / max_pts);
+        for (int i = 0; i < n && static_cast<int>(out.size()) < max_pts; i += step)
+            out.push_back(pts[static_cast<size_t>(i)]);
+        pts.swap(out);
+    }
+
+    static void subsampleToCloud(const pcl::PointCloud<pcl::PointXYZ>& src,
+                                 int max_pts,
+                                 pcl::PointCloud<pcl::PointXYZ>& dst)
+    {
+        dst.clear();
+        const int n = static_cast<int>(src.size());
+        if (n <= max_pts) {
+            dst = src;
+            return;
+        }
+        dst.reserve(static_cast<size_t>(max_pts));
+        const int step = std::max(1, (n + max_pts - 1) / max_pts);
+        for (int i = 0; i < n && static_cast<int>(dst.size()) < max_pts; i += step)
+            dst.push_back(src[static_cast<size_t>(i)]);
+    }
 
     bool refitCell(const GroundCellKey& k, GroundCell& cell)
     {
@@ -297,12 +334,12 @@ private:
         if (n < min_pts_) return false;
 
         auto cloud = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
-        const int skip = std::max(1, n / MAX_FIT_PTS);
-        for (int i = 0; i < n; i += skip)
-            cloud->push_back(cell.pts[i]);
+        subsampleToCloud(cell.pts, fit_max_pts_, *cloud);
 
-        cell.surf = std::make_shared<BSplineSurface>(3, 3, num_cp_, num_cp_, 0.25);
-        cell.surf->apply(cloud, 30, 1, 1, 0.05);
+        auto new_surf = std::make_shared<BSplineSurface>(3, 3, num_cp_, num_cp_, 0.25);
+        if (!new_surf->apply(cloud, 30, 1, 1, 0.05))
+            return false;  // 跑满迭代未收敛，保留旧曲面（如有）
+        cell.surf = std::move(new_surf);
         return true;
     }
 
@@ -315,5 +352,7 @@ private:
     int    min_pts_;
     int    num_cp_;
     int    active_radius_;
+    int    cell_max_pts_;
+    int    fit_max_pts_;
     std::unordered_map<GroundCellKey, GroundCell, GroundCellKeyHash> cells_;
 };

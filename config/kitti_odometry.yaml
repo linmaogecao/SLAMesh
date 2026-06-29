@@ -30,13 +30,14 @@ slamesher:
   range_image_far_min_cluster: 20  # 远层 cluster 最小点数（建议略小于近层 30）
   obs_rimg_col_step: 3         # 障碍配准 range image 列采样间隔（1=全取，3=每3列1点）
   obs_match_per_surf_max: 50   # 每个障碍曲面最多保留的匹配点数（0=不限；防止长物体垄断）
-  ground_near_x: 15.0   # 地面建图+配准：雷达系前后 |x| < 此值（m）；0=不限
-  ground_near_y: 5.0    # 地面建图+配准：雷达系左右 |y| < 此值（m）；0=不限
   # XY 栅格地面地图
   ground_cell_size: 6.0      # 每格 XY 边长（米）
   ground_cell_min_pts: 80    # 格内点数达此值才拟合曲面
   ground_cell_num_cp: 5      # BSpline 每维控制点数
   ground_query_radius: 1     # 配准查询格半径（格数）
+  ground_map_skip_points: 8  # 建图：z 带内每隔 N 点取 1 点投格（1=不跳）
+  ground_cell_max_pts: 400   # 每格最多保留点数（超出均匀下采样）
+  ground_fit_max_pts: 150    # 每格 BSpline 拟合最多用点数
   ground_skip_points: 80     # 地面配准采样间隔
   ground_clear_dist: 150.0   # 超过此距离（米）的旧格被清除
   cross_overlap: true
