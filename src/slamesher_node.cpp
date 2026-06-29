@@ -608,6 +608,8 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/cluster_ds_target_max", cluster_ds_target_max, 200);
     nh.param("slamesher/range_image_split",          range_image_split,          30.0);
     nh.param("slamesher/range_image_far_min_cluster", range_image_far_min_cluster, 20);
+    nh.param("slamesher/obs_rimg_col_step",           obs_rimg_col_step,           3);
+    nh.param("slamesher/obs_match_per_surf_max",      obs_match_per_surf_max,      50);
     nh.param("slamesher/ground_near_x", ground_near_x, 0.0);
     nh.param("slamesher/ground_near_y", ground_near_y, 0.0);
     nh.param("slamesher/ground_cell_size",    ground_cell_size,    6.0);
@@ -622,6 +624,8 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     std::cout << "range_image_split: " << range_image_split
               << (range_image_split > 0 ? " m (two-layer range image on)" : " (off, single layer)")
               << "  far_min_cluster=" << range_image_far_min_cluster << std::endl;
+    std::cout << "obs_rimg_col_step=" << obs_rimg_col_step
+              << "  obs_match_per_surf_max=" << obs_match_per_surf_max << std::endl;
     std::cout << "ground_grid: cell=" << ground_cell_size
               << "m min_pts=" << ground_cell_min_pts
               << " num_cp=" << ground_cell_num_cp
@@ -998,7 +1002,10 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                                     int skip_points,
                                     double match_min_z,
                                     double ground_z_min,
-                                    double ground_z_max)
+                                    double ground_z_max,
+                                    const RangeImageProcessor& rp_near,
+                                    const RangeImageProcessor& rp_far,
+                                    bool use_far)
 {
     Transf T_curr = T_guess;
     double delta_scale = 100.0;
@@ -1113,20 +1120,48 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             if (sp) gnd_surf_to_pts[sp].push_back(i);
         }
 
-        // ── 路 2：障碍点 z >= match_min_z → 只匹配非地面曲面 ──
+        // ── 路 2：障碍点来自 range image 有效像素（近层 + 远层），按列间隔采样 ──
         std::unordered_map<int, std::vector<int>> obs_surf_to_pts;
-        for (int i = 0; i < (int)scan_local.size(); i += skip_points) {
-            double z = scan_local[i].z;
-            if (z < match_min_z) continue;
-            Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
-                Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) +
-                T_curr.block<3,1>(0,3);
-            for (int sid : bspline_map.queryCandidates(p_w, 2))
-                obs_surf_to_pts[sid].push_back(i);
+        const int col_step = std::max(1, param.obs_rimg_col_step);
+
+        auto collectFromRangeImage = [&](const RangeImageProcessor& rp) {
+            const int W = rp.W_COLS;
+            const int H = rp.H_SCANS;
+            for (int u = 0; u < H; ++u) {
+                for (int v = 0; v < W; v += col_step) {
+                    const int px_idx = u * W + v;
+                    const auto& px = rp.range_image_[px_idx];
+                    if (!px.valid) continue;
+                    if (px.z < match_min_z) continue;
+                    const int cloud_idx = rp.pixel_to_cloud_idx_[px_idx];
+                    if (cloud_idx < 0 || cloud_idx >= (int)scan_local.size()) continue;
+                    Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
+                        Eigen::Vector3d(px.x, px.y, px.z) + T_curr.block<3,1>(0,3);
+                    for (int sid : bspline_map.queryCandidates(p_w, 2))
+                        obs_surf_to_pts[sid].push_back(cloud_idx);
+                }
+            }
+        };
+        collectFromRangeImage(rp_near);
+        if (use_far) collectFromRangeImage(rp_far);
+
+        // 每曲面限流：均匀保留最多 obs_match_per_surf_max 个点
+        if (param.obs_match_per_surf_max > 0) {
+            for (auto& [sid, idxs] : obs_surf_to_pts) {
+                const int cap = param.obs_match_per_surf_max;
+                if ((int)idxs.size() > cap) {
+                    const int step = (int)idxs.size() / cap;
+                    std::vector<int> kept;
+                    kept.reserve(cap);
+                    for (int i = 0; i < (int)idxs.size() && (int)kept.size() < cap; i += step)
+                        kept.push_back(idxs[i]);
+                    idxs = std::move(kept);
+                }
+            }
         }
 
         std::vector<RegMatch> matches;
-        matches.reserve(scan_local.size() / skip_points);
+        matches.reserve(bspline_map.size() * param.obs_match_per_surf_max);
         buildGroundMatches(gnd_surf_to_pts, matches);    // 地面（GroundGridMap）
         buildMatches(obs_surf_to_pts, false, matches);  // 障碍物
 
@@ -1785,9 +1820,21 @@ void SLAMesher::process(){
         TicToc t_register;
         Transf T_guess = getOdom();
 
+        // 为配准生成 range image（近/远层），与 runMapBuild 同参数
+        {
+            const double split = param.range_image_split;
+            const bool use_far = (split > 0.0);
+            range_proc.generateRangeImage(scan_local, GROUND_Z_MIN, GROUND_Z_MAX, true,
+                                          0.0, use_far ? split : 1e9);
+            if (use_far)
+                range_proc_far.generateRangeImage(scan_local, GROUND_Z_MIN, GROUND_Z_MAX, true,
+                                                  split, 1e9);
+        }
+
         T_world = registerScanToMap(scan_local, T_guess, bspline_map, ground_grid,
                                     max_rg_iters, converge_thr, match_dist_thr, skip_points,
-                                    range_proc.MIN_Z, GROUND_Z_MIN, GROUND_Z_MAX);
+                                    range_proc.MIN_Z, GROUND_Z_MIN, GROUND_Z_MAX,
+                                    range_proc, range_proc_far, (param.range_image_split > 0.0));
 
         g_data.updatePose(T_world);
         pubTf();

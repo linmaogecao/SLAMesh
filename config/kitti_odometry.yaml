@@ -7,8 +7,8 @@ slamesher:
   read_offline_pcd: true 
   dataset: 1
   max_steps: 10000
-  max_frames: 71       # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
-  dump_frame: 70         # 0=不保存；>0 时在对应 step 配准结束后导出 matched/unmatched 到 build/
+  max_frames: 0       # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
+  dump_frame: 0         # 0=不保存；>0 时在对应 step 配准结束后导出 matched/unmatched 到 build/
   dump_cluster_step: 0   # 0=不保存；>0 时导出 cluster 到 build/output_clusters/
   dump_occluded_step: 0 # 0=不保存；>0 时导出 range image 入图点 + 被遮挡点到 build/rangeimage_*,occluded_*.txt
   console_log_path: "/home/albus/catkin_ws/src/SLAMesh/debug.txt"   # 空=自动写到 file_loc_report/seq##_run_时间.log；也可填绝对路径如 debug.txt
@@ -28,6 +28,8 @@ slamesher:
   cluster_ds_target_max: 200   # 大 cluster 按 range-image (u,v) 2D 均匀稀疏到此规模（0=关闭）
   range_image_split: 30.0      # 两层 range image 分界距离（米）；0=禁用远层（退化为单层）
   range_image_far_min_cluster: 20  # 远层 cluster 最小点数（建议略小于近层 30）
+  obs_rimg_col_step: 3         # 障碍配准 range image 列采样间隔（1=全取，3=每3列1点）
+  obs_match_per_surf_max: 50   # 每个障碍曲面最多保留的匹配点数（0=不限；防止长物体垄断）
   ground_near_x: 15.0   # 地面建图+配准：雷达系前后 |x| < 此值（m）；0=不限
   ground_near_y: 5.0    # 地面建图+配准：雷达系左右 |y| < 此值（m）；0=不限
   # XY 栅格地面地图

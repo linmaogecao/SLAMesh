@@ -29,6 +29,9 @@ public:
     // 两层 range image 参数
     double range_image_split{30.0};      // 近/远层分界距离（米）；0=禁用远层
     int    range_image_far_min_cluster{20}; // 远层 cluster 最小点数（可比近层宽松）
+    // 障碍配准采样（range image 模式）
+    int    obs_rimg_col_step{3};           // range image 列方向采样间隔（1=全取，3=每3列取1）
+    int    obs_match_per_surf_max{50};     // 每个障碍曲面最多保留的匹配点数（0=不限）
     double ground_near_x{0.0};    // 地面建图+配准：雷达系前后范围 |x| < 此值（m）；0=不限
     double ground_near_y{0.0};    // 地面建图+配准：雷达系左右范围 |y| < 此值（m）；0=不限
     // XY 栅格地面地图
@@ -203,7 +206,10 @@ private:
                              int skip_points,
                              double match_min_z,
                              double ground_z_min,
-                             double ground_z_max);
+                             double ground_z_max,
+                             const RangeImageProcessor& rp_near,
+                             const RangeImageProcessor& rp_far,
+                             bool use_far);
 
     // 统一建图：近/远两层 range image 分割 → z 分流地面/障碍 → 按各自 interval 决定是否建图
     void runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
