@@ -936,7 +936,17 @@ bool BSplineSurface::apply(
 
         sum_bound += ms_since(t1);
         ceres::Solver::Options options;
-        options.linear_solver_type = ceres::ITERATIVE_SCHUR;
+        const int total_cp = controls_num_u * controls_num_v;
+        if (total_cp <= 36) {
+            // 4×4 ~ 6×6：稠密系统小，DENSE_QR 最省
+            options.linear_solver_type = ceres::DENSE_QR;
+        } else if (total_cp <= 100) {
+            // 7×7 ~ 10×10：DENSE_NORMAL_CHOLESKY 通常比 Schur 快
+            options.linear_solver_type = ceres::DENSE_NORMAL_CHOLESKY;
+        } else {
+            // 11×11 以上：稀疏 Cholesky
+            options.linear_solver_type = ceres::SPARSE_NORMAL_CHOLESKY;
+        }
         options.num_threads = 1;
         options.max_num_iterations = 1; // 关键点！
         options.minimizer_progress_to_stdout = false;

@@ -7,20 +7,24 @@ slamesher:
   read_offline_pcd: true 
   dataset: 1
   max_steps: 10000
-  max_frames: 0       # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
+  max_frames: 0      # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
   dump_frame: 0         # 0=不保存；>0 时在对应 step 配准结束后导出 matched/unmatched 到 build/
   dump_cluster_step: 0   # 0=不保存；>0 时导出 cluster 到 build/output_clusters/
   dump_occluded_step: 0 # 0=不保存；>0 时导出 range image 入图点 + 被遮挡点到 build/rangeimage_*,occluded_*.txt
   console_log_path: "/home/albus/catkin_ws/src/SLAMesh/debug.txt"   # 空=自动写到 file_loc_report/seq##_run_时间.log；也可填绝对路径如 debug.txt
-  save_surface_samples: true  # true 时在 global_map/ 下按序号保存曲面稀疏采样点（全序列）
+  save_surface_samples: false  # true 时在 global_map/ 下按序号保存曲面稀疏采样点（全序列）
   all_surfaces_max_step: 0  # 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面（如 60）
-  map_save_step_begin: 40  # 与 end 配合的 step 闭区间过滤（all_surfaces_max_step>0 时优先）
-  map_save_step_end:   70  # 0=不限；例 begin=100 end=150 只导出该区间新建的曲面
+  map_save_step_begin: 0  # 与 end 配合的 step 闭区间过滤（all_surfaces_max_step>0 时优先）
+  map_save_step_end:   0  # 0=不限；例 begin=100 end=150 只导出该区间新建的曲面
   save_mesh_map: false
   #register param
   range_max: 150
   range_min: 1.2
   register_times: 2
+  # 无 odom 时第 2 帧配准初值：相对第 1 帧 Velodyne +X 方向平移 (m)
+  bootstrap_step2_tx: 1
+  bootstrap_step2_ty: 0.0
+  bootstrap_step2_tz: 0.0
   map_update_interval: 5      # 障碍 MapUpdate 间隔（帧）；step % N == 0 时建障碍曲面
   ground_build_interval: 10    # 地面 buildGroundMap 间隔（帧）；第1帧 + step % N == 0
   map_unmatched_ratio_min: 0.30 # 簇内未匹配比例 >= 此值才新建障碍曲面
@@ -49,7 +53,7 @@ slamesher:
   meshing_tsdf: false
   full_cover: false
   visualisation_type: 3
-  #gp param
+  #gp param / OMP 建图并行线程数（障碍 apply + 地面格 apply 均使用）
   num_thread: 8
   grid: 2
   min_points_num_to_gp: 11

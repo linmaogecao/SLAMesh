@@ -45,6 +45,8 @@ public:
 
     double correction_x{0}, correction_y{0}, correction_z{0},
     correction_roll_degree{0}, correction_pitch_degree{0}, correction_yaw_degree{0};
+    // 无 odom 时 step2 冷启动：相对上一帧的 Velodyne 系平移先验 (m)
+    double bootstrap_step2_tx{0.5}, bootstrap_step2_ty{0.0}, bootstrap_step2_tz{0.0};
     double test_param;
     double eigen_1, eigen_2, eigen_3;//PCA
 

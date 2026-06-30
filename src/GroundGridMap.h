@@ -28,6 +28,7 @@
 #include <Eigen/Core>
 #include <pcl/point_cloud.h>
 #include <pcl/point_types.h>
+#include <omp.h>
 #include "BSpline.h"   // BSplineSurface, SurfaceCurvature
 
 // -----------------------------------------------------------------------
@@ -118,14 +119,48 @@ public:
         return n_fit;
     }
 
-    // 仅重拟合本帧触及的格（避免扫全图）
-    int refitCells(const std::vector<GroundCellKey>& keys)
+    // 仅重拟合本帧触及的格（OMP 并行 apply，串行写回曲面）
+    int refitCells(const std::vector<GroundCellKey>& keys, int n_threads = 1)
     {
-        int n_fit = 0;
+        // A: 串行收集需要拟合的格及下采样点云
+        struct GndTask {
+            GroundCellKey key;
+            pcl::PointCloud<pcl::PointXYZ>::Ptr cloud;
+            std::shared_ptr<BSplineSurface> surf;
+            bool ok = false;
+        };
+        std::vector<GndTask> tasks;
+        tasks.reserve(keys.size());
         for (const auto& k : keys) {
             auto it = cells_.find(k);
             if (it == cells_.end() || !it->second.needs_refit) continue;
-            if (refitCell(k, it->second)) ++n_fit;
+            const int n = (int)it->second.pts.size();
+            if (n < min_pts_) continue;
+            GndTask t;
+            t.key   = k;
+            t.cloud = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+            subsampleToCloud(it->second.pts, fit_max_pts_, *t.cloud);
+            tasks.push_back(std::move(t));
+        }
+
+        // B: OMP 并行 apply
+        const int npar = std::max(1, n_threads);
+#pragma omp parallel for schedule(dynamic) num_threads(npar)
+        for (int i = 0; i < (int)tasks.size(); ++i) {
+            auto& t = tasks[i];
+            t.surf = std::make_shared<BSplineSurface>(3, 3, num_cp_, num_cp_, 0.25);
+            t.ok = t.surf->apply(t.cloud, 30, 1, 1, 0.05);
+        }
+
+        // C: 串行写回（不同 key 理论可并行，但 unordered_map 写不安全）
+        int n_fit = 0;
+        for (auto& t : tasks) {
+            auto it = cells_.find(t.key);
+            if (it == cells_.end()) continue;
+            it->second.needs_refit = false;
+            if (!t.ok) continue;
+            it->second.surf = std::move(t.surf);
+            ++n_fit;
         }
         return n_fit;
     }

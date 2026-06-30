@@ -20,7 +20,8 @@ struct QueueItem {
 void RangeImageProcessor::generateRangeImage(const pcl::PointCloud<pcl::PointXYZ>& cloud,
                                              double ground_z_min, double ground_z_max,
                                              bool exclude_ground_band,
-                                             double layer_range_min, double layer_range_max)
+                                             double layer_range_min, double layer_range_max,
+                                             double z_floor)
 {
     std::fill(range_image_.begin(), range_image_.end(), RangePixel());
     std::fill(pixel_to_cloud_idx_.begin(), pixel_to_cloud_idx_.end(), -1);
@@ -42,7 +43,7 @@ void RangeImageProcessor::generateRangeImage(const pcl::PointCloud<pcl::PointXYZ
         if (exclude_ground_band && pt.z >= ground_z_min && pt.z <= ground_z_max)
             continue;
         double range = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
-        if (range < eff_range_min || range > eff_range_max || pt.z < MIN_Z) {
+        if (range < eff_range_min || range > eff_range_max || pt.z < z_floor) {
             continue;
         }
 

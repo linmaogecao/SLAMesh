@@ -72,6 +72,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <fstream>
 #include <iomanip>
 #include <algorithm>
+#include <omp.h>
 Parameter param;//parameters
 Log g_data;//global variables
 static ConsoleLogTee g_console_log_tee;
@@ -113,6 +114,99 @@ void saveOccludedPointsTxt(const std::vector<Eigen::Vector3d>& pts_lidar,
         const Eigen::Vector3d pw = R * p + t;
         f_world << pw.x() << " " << pw.y() << " " << pw.z() << "\n";
     }
+}
+
+void saveClusterFilterStatsTxt(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                               int step,
+                               double ground_z_min,
+                               double ground_z_max,
+                               double split_dist,
+                               const RangeImageProcessor& range_proc,
+                               const RangeImageProcessor& range_proc_far)
+{
+    const bool use_far_layer = (split_dist > 0.0);
+    const double near_min = std::max((double)range_proc.MIN_RANGE, 0.0);
+    const double near_max = std::min((double)range_proc.MAX_RANGE, use_far_layer ? split_dist : 1e9);
+    const double far_min  = std::max((double)range_proc_far.MIN_RANGE, split_dist);
+    const double far_max  = std::min((double)range_proc_far.MAX_RANGE, 1e9);
+
+    struct FilterStats {
+        int total = 0;
+        int nonfinite = 0;
+        int ground_band = 0;
+        int below_min_z = 0;
+        int range_too_near = 0;
+        int range_too_far = 0;
+        int valid = 0;
+    };
+
+    FilterStats near_stats, far_stats;
+    int scan_world_kept = 0;
+
+    for (const auto& pt : scan_local.points) {
+        ++near_stats.total;
+        ++far_stats.total;
+
+        if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) {
+            ++near_stats.nonfinite;
+            ++far_stats.nonfinite;
+            continue;
+        }
+
+        const bool in_ground_band = (pt.z >= ground_z_min && pt.z <= ground_z_max);
+        if (!in_ground_band) ++scan_world_kept;
+        if (in_ground_band) {
+            ++near_stats.ground_band;
+            ++far_stats.ground_band;
+            continue;
+        }
+
+        const double range = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
+        if (pt.z < range_proc.MIN_Z) {
+            ++near_stats.below_min_z;
+            ++far_stats.below_min_z;
+            continue;
+        }
+
+        if (range < near_min) ++near_stats.range_too_near;
+        else if (range > near_max) ++near_stats.range_too_far;
+        else ++near_stats.valid;
+
+        if (use_far_layer) {
+            if (range < far_min) ++far_stats.range_too_near;
+            else if (range > far_max) ++far_stats.range_too_far;
+            else ++far_stats.valid;
+        }
+    }
+
+    const std::string path = std::string(kBsplineBuildDir) + "/cluster_filter_stats_step" + std::to_string(step) + ".txt";
+    std::ofstream fout(path, std::ios::out | std::ios::trunc);
+    if (!fout.is_open()) return;
+
+    fout << std::fixed << std::setprecision(6);
+    fout << "step: " << step << "\n";
+    fout << "ground_band_z: [" << ground_z_min << ", " << ground_z_max << "]\n";
+    fout << "min_z: " << range_proc.MIN_Z << "\n";
+    fout << "split_dist: " << split_dist << "\n";
+    fout << "scan_world_kept_non_ground: " << scan_world_kept << "\n";
+    fout << "\n";
+
+    auto dump_one = [&](const char* name, const FilterStats& s, double rmin, double rmax) {
+        fout << "[" << name << "]\n";
+        fout << "range_window: [" << rmin << ", " << rmax << "]\n";
+        fout << "total_raw: " << s.total << "\n";
+        fout << "nonfinite: " << s.nonfinite << "\n";
+        fout << "ground_band_excluded: " << s.ground_band << "\n";
+        fout << "below_min_z_excluded: " << s.below_min_z << "\n";
+        fout << "range_too_near: " << s.range_too_near << "\n";
+        fout << "range_too_far: " << s.range_too_far << "\n";
+        fout << "valid_for_range_image: " << s.valid << "\n";
+        fout << "\n";
+    };
+
+    dump_one("near", near_stats, near_min, near_max);
+    if (use_far_layer)
+        dump_one("far", far_stats, far_min, far_max);
 }
 
 int saveRangeImagePointsTxt(const RangeImageProcessor& range_proc,
@@ -619,6 +713,9 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/ground_fit_max_pts",     ground_fit_max_pts,     150);
     nh.param("slamesher/ground_skip_points",  ground_skip_points,  40);
     nh.param("slamesher/ground_clear_dist",   ground_clear_dist,   150.0);
+    nh.param("slamesher/bootstrap_step2_tx", bootstrap_step2_tx, 0.5);
+    nh.param("slamesher/bootstrap_step2_ty", bootstrap_step2_ty, 0.0);
+    nh.param("slamesher/bootstrap_step2_tz", bootstrap_step2_tz, 0.0);
     std::cout << "cluster_ds: min_pts=" << cluster_ds_min_pts
               << " target_max=" << cluster_ds_target_max
               << (cluster_ds_target_max > 0 ? " (range-image 2D downsample on)" : " (off)") << std::endl;
@@ -636,6 +733,8 @@ void Parameter::initParameter(ros::NodeHandle & nh){
               << " fit_max=" << ground_fit_max_pts
               << " reg_skip=" << ground_skip_points
               << " clear_dist=" << ground_clear_dist << "m" << std::endl;
+    std::cout << "bootstrap_step2 (velo m): [" << bootstrap_step2_tx << ", "
+              << bootstrap_step2_ty << ", " << bootstrap_step2_tz << "]" << std::endl;
     nh.param("slamesher/cross_overlap", cross_overlap, false);
     nh.param("slamesher/cross_cell_overlap_length", cross_cell_overlap_length, 0);
     nh.param("slamesher/num_margin_old_cell", num_margin_old_cell, -1);
@@ -703,11 +802,17 @@ Transf SLAMesher::getOdom(){
         if(g_data.step == 1){
             odom = g_data.T_seq[g_data.step - 1];
         }
-        else if (g_data.step > 1){
-            //const motion prior
+        else if (g_data.step == 2) {
+            // 第二帧无运动历史：用固定前进平移作初值（Velodyne +X）
+            Transf dT = Eigen::Matrix4d::Identity();
+            dT(0, 3) = param.bootstrap_step2_tx;
+            dT(1, 3) = param.bootstrap_step2_ty;
+            dT(2, 3) = param.bootstrap_step2_tz;
+            odom = g_data.T_seq[g_data.step - 1] * dT;
+        }
+        else if (g_data.step > 2) {
+            // 匀速外推：T_{t-1} * (T_{t-2}^{-1} T_{t-1})
             odom = g_data.T_seq[g_data.step - 1] * g_data.T_seq[g_data.step - 2].inverse() * g_data.T_seq[g_data.step - 1];
-            // no motion prior
-            // odom = g_data.T_seq[g_data.step-1];
         }
     }
     std::cout << "Pose Odom:" << "x: " << odom(0, 3) << "  y: " << odom(1, 3) << "  z: " << odom(2, 3) << "\n";
@@ -971,7 +1076,7 @@ int SLAMesher::chooseControlGridSize(int num_fitting_points)
     constexpr int kMaxCp = 15;
 
     int n;
-    if (num_fitting_points < 50)
+    if (num_fitting_points < 80)
         n = 4;
     else if (num_fitting_points < 150)
         n = 5;
@@ -984,7 +1089,7 @@ int SLAMesher::chooseControlGridSize(int num_fitting_points)
     else if (num_fitting_points < 1000)
         n = 10;
     else
-        n = 15;
+        n = 12;
 
     return std::max(kMinCp, std::min(n, kMaxCp));
 }
@@ -1338,13 +1443,19 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
     // 近层：range ∈ [MIN_RANGE, range_image_split)；如不启用双层则全范围投影
     const double split_dist = param.range_image_split;
     const bool use_far_layer = (split_dist > 0.0);
-    range_proc.generateRangeImage(scan_local, ground_z_min, ground_z_max, true,
-                                  0.0, use_far_layer ? split_dist : 1e9);
+    if (dump_clusters) {
+        saveClusterFilterStatsTxt(scan_local, g_data.step, ground_z_min, ground_z_max,
+                                  split_dist, range_proc, range_proc_far);
+    }
+    // range image 不再提前删地面带：地面链已由 z 带直接选点，障碍链需保留低矮障碍
+    // z_floor = ground_z_min：允许与地面带下沿齐平的低矮障碍进入 range image
+    range_proc.generateRangeImage(scan_local, ground_z_min, ground_z_max, false,
+                                  0.0, use_far_layer ? split_dist : 1e9, ground_z_min);
 
     // 远层：range ∈ [range_image_split, MAX_RANGE]
     if (use_far_layer)
-        range_proc_far.generateRangeImage(scan_local, ground_z_min, ground_z_max, true,
-                                          split_dist, 1e9);
+        range_proc_far.generateRangeImage(scan_local, ground_z_min, ground_z_max, false,
+                                          split_dist, 1e9, ground_z_min);
 
     if (dump_occluded) {
         const std::string build_dir = std::string(kBsplineBuildDir);
@@ -1395,8 +1506,9 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
         }
     }
 
+    // exclude_ground_band=false：地面链已独立走 z 带选点，障碍链不再预删地面
     SegmentationResult seg = range_proc.segmentRangeImage(
-        5, 0.1, MIN_CLUSTER_PTS, ground_z_min, ground_z_max, true);
+        5, 0.1, MIN_CLUSTER_PTS, ground_z_min, ground_z_max, false);
     range_proc.downsampleClusters(
         seg,
         param.cluster_ds_min_pts,
@@ -1408,7 +1520,7 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
     if (use_far_layer) {
         const int far_min = param.range_image_far_min_cluster;
         seg_far = range_proc_far.segmentRangeImage(
-            5, 0.1, far_min, ground_z_min, ground_z_max, true);
+            5, 0.1, far_min, ground_z_min, ground_z_max, false);
         range_proc_far.downsampleClusters(
             seg_far,
             param.cluster_ds_min_pts,
@@ -1453,7 +1565,7 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
             // 对积累点数达标的格重新拟合曲面
             if (profile_frame1_apply)
                 BSplineSurface::setApplyProfileLabel("gnd");
-            n_added_gnd = ground_grid.refitCells(touched);
+            n_added_gnd = ground_grid.refitCells(touched, param.num_thread);
             // 定期清除远离车辆的旧格
             Eigen::Vector3d veh_pos = T_world.block<3,1>(0,3);
             ground_grid.removeDistant(veh_pos, param.ground_clear_dist);
@@ -1464,23 +1576,58 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
     if (do_obstacle && profile_frame1_apply)
         BSplineSurface::setApplyProfileLabel("obs");
 
-    // 障碍建图 lambda：近层 / 远层复用同一套逻辑
+    // 障碍建图 task（用于 OMP 并行 apply）
+    struct ObsBuildTask {
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud_world;
+        std::vector<Eigen::Vector3d> init_cp;
+        int num_cp = 0;
+        std::shared_ptr<BSplineSurface> surf;
+        bool ok = false;
+    };
+
+    // 障碍建图 lambda：A 收集 → B 并行 apply → C 串行入库
     auto buildObsFromSeg = [&](RangeImageProcessor& proc, SegmentationResult& s, int min_pts) {
+        // ── 阶段 A：串行筛 cluster + footprint 匹配，打包 tasks ──
+        std::vector<ObsBuildTask> tasks;
         for (int cid = 0; cid < (int)s.clusters.size(); cid++) {
             const auto& pixels = s.clusters[cid];
             if ((int)pixels.size() < min_pts) continue;
 
             if (!do_obstacle) break;
-            if (g_data.step != 1 && n_added_obs >= MAX_NEW_SURFACES) break;
+            if (g_data.step != 1 && (n_added_obs + (int)tasks.size()) >= MAX_NEW_SURFACES) break;
 
             std::unordered_map<int, std::vector<int>> surf_to_kidx;
             std::vector<Eigen::Vector3d> pix_world(pixels.size(), Eigen::Vector3d::Zero());
             std::vector<bool> pix_valid(pixels.size(), false);
 
+            // ── PCA 法向检测：平坦水平面（地面类）→ 跳过障碍建图 ──
+            {
+                Eigen::Vector3d centroid = Eigen::Vector3d::Zero();
+                int n_pca = 0;
+                for (int k = 0; k < (int)pixels.size(); ++k) {
+                    const auto& px = proc.range_image_[pixels[k]];
+                    if (!px.valid) continue;
+                    centroid += Eigen::Vector3d(px.x, px.y, px.z);
+                    ++n_pca;
+                }
+                if (n_pca < min_pts) continue;
+                centroid /= n_pca;
+                Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+                for (int k = 0; k < (int)pixels.size(); ++k) {
+                    const auto& px = proc.range_image_[pixels[k]];
+                    if (!px.valid) continue;
+                    Eigen::Vector3d d = Eigen::Vector3d(px.x, px.y, px.z) - centroid;
+                    cov += d * d.transpose();
+                }
+                Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d> solver(cov);
+                // 特征值升序，最小特征值对应的特征向量即法向
+                const Eigen::Vector3d cluster_normal = solver.eigenvectors().col(0);
+                if (std::abs(cluster_normal.z()) > 0.85) continue;
+            }
+
             for (int k = 0; k < (int)pixels.size(); ++k) {
                 const auto& px = proc.range_image_[pixels[k]];
                 if (!px.valid) continue;
-                if (px.z <= ground_z_max) continue;
                 Eigen::Vector3d pw = R_w * Eigen::Vector3d(px.x, px.y, px.z) + t_w;
                 pix_world[k] = pw;
                 pix_valid[k] = true;
@@ -1527,11 +1674,30 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
             if (init_cp.empty()) continue;
             for (auto& cp : init_cp) cp = R_w * cp + t_w;
 
-            auto surf = std::make_shared<BSplineSurface>(3, 3, num_cp, num_cp, 0.25);
-            surf->setExternalInitControls(init_cp);
-            if (!surf->apply(cloud_world, 10, 1, 1, 0.05))
-                continue;  // 跑满迭代未收敛，丢弃该曲面
-            bspline_map.addSurface(surf, cloud_world, /*is_ground=*/false, g_data.step);
+            ObsBuildTask t;
+            t.cloud_world = cloud_world;
+            t.init_cp     = std::move(init_cp);
+            t.num_cp      = num_cp;
+            tasks.push_back(std::move(t));
+        }
+
+        // ── 阶段 B：OMP 并行 apply（每个 task 独立，无共享写） ──
+        const int n_omp = std::max(1, param.num_thread);
+        // Frame1Apply profile 在并行区不可用（全局变量），先暂停
+        const bool had_profile = profile_frame1_apply && do_obstacle;
+        if (had_profile) BSplineSurface::setApplyProfileLogPath("");
+#pragma omp parallel for schedule(dynamic) num_threads(n_omp)
+        for (int i = 0; i < (int)tasks.size(); ++i) {
+            auto& t = tasks[i];
+            t.surf = std::make_shared<BSplineSurface>(3, 3, t.num_cp, t.num_cp, 0.25);
+            t.surf->setExternalInitControls(t.init_cp);
+            t.ok = t.surf->apply(t.cloud_world, 10, 1, 1, 0.05);
+        }
+
+        // ── 阶段 C：串行入库 ──
+        for (auto& t : tasks) {
+            if (!t.ok) continue;
+            bspline_map.addSurface(t.surf, t.cloud_world, /*is_ground=*/false, g_data.step);
             ++n_added_obs;
         }
     };
@@ -1831,19 +1997,20 @@ void SLAMesher::process(){
         Transf T_guess = getOdom();
 
         // 为配准生成 range image（近/远层），与 runMapBuild 同参数
+        // 不再提前删地面带，地面配准走独立路径；z_floor = GROUND_Z_MIN 保留低矮障碍
         {
             const double split = param.range_image_split;
             const bool use_far = (split > 0.0);
-            range_proc.generateRangeImage(scan_local, GROUND_Z_MIN, GROUND_Z_MAX, true,
-                                          0.0, use_far ? split : 1e9);
+            range_proc.generateRangeImage(scan_local, GROUND_Z_MIN, GROUND_Z_MAX, false,
+                                          0.0, use_far ? split : 1e9, GROUND_Z_MIN);
             if (use_far)
-                range_proc_far.generateRangeImage(scan_local, GROUND_Z_MIN, GROUND_Z_MAX, true,
-                                                  split, 1e9);
+                range_proc_far.generateRangeImage(scan_local, GROUND_Z_MIN, GROUND_Z_MAX, false,
+                                                  split, 1e9, GROUND_Z_MIN);
         }
 
         T_world = registerScanToMap(scan_local, T_guess, bspline_map, ground_grid,
                                     max_rg_iters, converge_thr, match_dist_thr, skip_points,
-                                    range_proc.MIN_Z, GROUND_Z_MIN, GROUND_Z_MAX,
+                                    GROUND_Z_MIN, GROUND_Z_MIN, GROUND_Z_MAX,
                                     range_proc, range_proc_far, (param.range_image_split > 0.0));
 
         g_data.updatePose(T_world);
