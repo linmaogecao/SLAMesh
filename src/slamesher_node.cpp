@@ -79,6 +79,84 @@ static ConsoleLogTee g_console_log_tee;
 
 namespace {
 constexpr const char* kBsplineBuildDir = "/home/albus/slam-math/Bspline/build";
+constexpr double kMatchDropRatioThr = 0.70;
+constexpr int kMatchDropAbsThr = 150;
+
+inline double farLayerZFloor(double ground_z_min)
+{
+    return ground_z_min - param.range_image_far_z_floor_offset;
+}
+
+std::string seqIdFromParam(const std::string& seq)
+{
+    if (seq.size() >= 3 && seq[0] == '/') return seq.substr(1, 2);
+    if (seq.size() >= 2) return seq.substr(seq.size() - 2);
+    return seq.empty() ? "00" : seq;
+}
+
+std::string makeSeqSpecificLogPath(const std::string& raw_path, const std::string& seq)
+{
+    const std::filesystem::path p(raw_path);
+    const std::string seq_id = seqIdFromParam(seq);
+    const std::string stem = p.stem().string().empty() ? "debug" : p.stem().string();
+    const std::string ext = p.extension().string().empty() ? ".txt" : p.extension().string();
+    return (p.parent_path() / (stem + "-" + seq_id + ext)).string();
+}
+
+std::string matchDropLogPath(const std::string& report_dir, const std::string& seq)
+{
+    std::string dir = report_dir;
+    while (!dir.empty() && dir.back() == '/') dir.pop_back();
+    if (dir.empty()) dir = ".";
+    return dir + "/seq" + seqIdFromParam(seq) + "_match_drop.txt";
+}
+
+void appendMatchDropEvent(int step,
+                          int iter,
+                          int prev_matches,
+                          int curr_matches,
+                          int n_gnd,
+                          int n_obs)
+{
+    const int drop_abs = prev_matches - curr_matches;
+    if (prev_matches <= 0 || drop_abs < kMatchDropAbsThr) return;
+    const double ratio = static_cast<double>(curr_matches) / static_cast<double>(prev_matches);
+    if (ratio > kMatchDropRatioThr) return;
+
+    static std::string cached_path;
+    static std::ofstream fout;
+    const std::string path = matchDropLogPath(param.file_loc_report, param.seq);
+    if (cached_path != path) {
+        if (fout.is_open()) fout.close();
+        std::error_code ec;
+        std::filesystem::create_directories(std::filesystem::path(path).parent_path(), ec);
+        fout.open(path, std::ios::out | std::ios::trunc);
+        cached_path = path;
+        if (fout.is_open()) {
+            fout << "# step iter prev_matches curr_matches drop_abs curr_over_prev gnd obs\n";
+            fout << std::fixed << std::setprecision(4);
+        }
+    }
+    if (!fout.is_open()) return;
+
+    fout << step << " "
+         << iter << " "
+         << prev_matches << " "
+         << curr_matches << " "
+         << drop_abs << " "
+         << ratio << " "
+         << n_gnd << " "
+         << n_obs << "\n";
+    fout.flush();
+
+    std::cout << "  [MatchDrop] step=" << step
+              << " iter=" << iter
+              << " prev=" << prev_matches
+              << " curr=" << curr_matches
+              << " ratio=" << ratio
+              << " gnd=" << n_gnd
+              << " obs=" << n_obs << std::endl;
+}
 
 void saveFrame1GroundPoints(const std::vector<Eigen::Vector3d>& pts_lidar)
 {
@@ -207,6 +285,289 @@ void saveClusterFilterStatsTxt(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
     dump_one("near", near_stats, near_min, near_max);
     if (use_far_layer)
         dump_one("far", far_stats, far_min, far_max);
+}
+
+struct FarClusterVerdict {
+    std::string rimg_status;
+    std::string cluster_pre_ds;
+    std::string cluster_post_ds;
+    int pixel_u = -1;
+    int pixel_v = -1;
+    int pixel_idx = -1;
+    int cluster_id = -1;
+    int winner_idx = -1;
+};
+
+FarClusterVerdict classifyFarPointPipeline(
+    const pcl::PointXYZ& pt,
+    int cloud_idx,
+    const RangeImageProcessor& rp,
+    double split_dist,
+    double z_floor,
+    const SegmentationResult& seg_pre_ds,
+    const SegmentationResult& seg_post_ds,
+    const std::unordered_set<int>& pixels_in_cluster_pre,
+    const std::unordered_set<int>& pixels_in_cluster_post,
+    const std::unordered_map<int, int>& pixel_to_cid_pre,
+    const std::unordered_map<int, int>& pixel_to_cid_post,
+    const std::unordered_set<int>& kept_labels_pre)
+{
+    FarClusterVerdict v;
+    const double eff_range_min = std::max(rp.MIN_RANGE, split_dist);
+    const double eff_range_max = rp.MAX_RANGE;
+
+    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) {
+        v.rimg_status = "excluded_nonfinite";
+        v.cluster_pre_ds = "n/a";
+        v.cluster_post_ds = "n/a";
+        return v;
+    }
+    if (pt.z < z_floor) {
+        v.rimg_status = "excluded_below_z_floor";
+        v.cluster_pre_ds = "n/a";
+        v.cluster_post_ds = "n/a";
+        return v;
+    }
+
+    const double range = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
+    if (range < eff_range_min) {
+        v.rimg_status = "excluded_range_too_near";
+        v.cluster_pre_ds = "n/a";
+        v.cluster_post_ds = "n/a";
+        return v;
+    }
+    if (range > eff_range_max) {
+        v.rimg_status = "excluded_range_too_far";
+        v.cluster_pre_ds = "n/a";
+        v.cluster_post_ds = "n/a";
+        return v;
+    }
+
+    const float fov_up_rad = rp.FOV_UP * static_cast<float>(M_PI) / 180.0f;
+    const float fov_down_rad = rp.FOV_DOWN * static_cast<float>(M_PI) / 180.0f;
+    const float fov_total_rad = std::abs(fov_up_rad - fov_down_rad);
+    const double angle_vert = std::asin(pt.z / range);
+    const double row_ratio = (angle_vert - fov_down_rad) / fov_total_rad;
+    const int row = static_cast<int>(std::round(row_ratio * (rp.H_SCANS - 1)));
+    const double angle_horiz = std::atan2(pt.y, pt.x);
+    int col = static_cast<int>(std::round((angle_horiz + M_PI) / (2.0 * M_PI) * rp.W_COLS));
+    if (col >= rp.W_COLS) col -= rp.W_COLS;
+    if (col < 0) col += rp.W_COLS;
+
+    if (row < 0 || row >= rp.H_SCANS || col < 0 || col >= rp.W_COLS) {
+        v.rimg_status = "excluded_fov_out";
+        v.cluster_pre_ds = "n/a";
+        v.cluster_post_ds = "n/a";
+        return v;
+    }
+
+    v.pixel_u = row;
+    v.pixel_v = col;
+    v.pixel_idx = row * rp.W_COLS + col;
+    v.winner_idx = (v.pixel_idx >= 0 && v.pixel_idx < (int)rp.pixel_to_cloud_idx_.size())
+        ? rp.pixel_to_cloud_idx_[v.pixel_idx] : -1;
+
+    if (v.winner_idx != cloud_idx) {
+        v.rimg_status = "excluded_occluded";
+        v.cluster_pre_ds = "n/a";
+        v.cluster_post_ds = "n/a";
+        return v;
+    }
+
+    v.rimg_status = "entered_range_image";
+    const int px = v.pixel_idx;
+    if (pixels_in_cluster_pre.count(px)) {
+        v.cluster_pre_ds = "in_cluster";
+        auto it = pixel_to_cid_pre.find(px);
+        v.cluster_id = (it != pixel_to_cid_pre.end()) ? it->second : -1;
+    } else {
+        const int label = (px >= 0 && px < (int)seg_pre_ds.label_map.size())
+            ? seg_pre_ds.label_map[px] : 0;
+        if (label > 0 && !kept_labels_pre.count(label))
+            v.cluster_pre_ds = "cluster_too_small";
+        else
+            v.cluster_pre_ds = "not_in_cluster";
+    }
+
+    if (pixels_in_cluster_post.count(px)) {
+        v.cluster_post_ds = "in_cluster";
+        if (v.cluster_id < 0) {
+            auto it = pixel_to_cid_post.find(px);
+            v.cluster_id = (it != pixel_to_cid_post.end()) ? it->second : -1;
+        }
+    } else if (v.cluster_pre_ds == "in_cluster")
+        v.cluster_post_ds = "removed_by_downsample";
+    else if (v.cluster_pre_ds == "cluster_too_small")
+        v.cluster_post_ds = "cluster_too_small";
+    else
+        v.cluster_post_ds = "not_in_cluster";
+
+    return v;
+}
+
+std::unordered_set<int> buildClusterPixelSet(const SegmentationResult& seg)
+{
+    std::unordered_set<int> s;
+    for (const auto& cluster : seg.clusters)
+        for (int px : cluster) s.insert(px);
+    return s;
+}
+
+std::unordered_map<int, int> buildPixelToClusterId(const SegmentationResult& seg)
+{
+    std::unordered_map<int, int> m;
+    for (int cid = 0; cid < (int)seg.clusters.size(); ++cid)
+        for (int px : seg.clusters[cid]) m[px] = cid;
+    return m;
+}
+
+std::unordered_set<int> buildKeptLabels(const SegmentationResult& seg)
+{
+    std::unordered_set<int> labels;
+    for (const auto& cluster : seg.clusters) {
+        if (cluster.empty()) continue;
+        const int px = cluster.front();
+        if (px >= 0 && px < (int)seg.label_map.size())
+            labels.insert(seg.label_map[px]);
+    }
+    return labels;
+}
+
+void bumpCount(std::unordered_map<std::string, int>& m, const std::string& k) { ++m[k]; }
+
+void saveFarClusterPipelineAuditTxt(
+    const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+    int step,
+    const Transf& T_world,
+    double ground_z_min,
+    double ground_z_max,
+    double z_floor,
+    double split_dist,
+    int far_min_cluster,
+    const RangeImageProcessor& rp_far,
+    const SegmentationResult& seg_pre_ds,
+    const SegmentationResult& seg_post_ds)
+{
+    const Eigen::Matrix3d R_w = T_world.block<3, 3>(0, 0);
+    const Eigen::Vector3d t_w = T_world.block<3, 1>(0, 3);
+
+    const auto pixels_pre  = buildClusterPixelSet(seg_pre_ds);
+    const auto pixels_post = buildClusterPixelSet(seg_post_ds);
+    const auto px2cid_pre  = buildPixelToClusterId(seg_pre_ds);
+    const auto px2cid_post = buildPixelToClusterId(seg_post_ds);
+    const auto kept_labels = buildKeptLabels(seg_pre_ds);
+
+    const std::string path = std::string(kBsplineBuildDir) + "/far_cluster_funnel_step"
+                           + std::to_string(step) + ".txt";
+    std::error_code ec;
+    std::filesystem::create_directories(kBsplineBuildDir, ec);
+    std::ofstream fout(path, std::ios::out | std::ios::trunc);
+    if (!fout.is_open()) {
+        std::cerr << "  [FarClusterFunnel] failed to open: " << path << std::endl;
+        return;
+    }
+
+    fout << std::fixed << std::setprecision(6);
+    fout << "# Far-distance scan_world points: non-ground, range in [split_dist, MAX_RANGE]\n";
+    fout << "step: " << step << "\n";
+    fout << "ground_band_z: [" << ground_z_min << ", " << ground_z_max << "]\n";
+    fout << "z_floor: " << z_floor << "\n";
+    fout << "split_dist: " << split_dist << "\n";
+    fout << "far_range: [" << split_dist << ", " << rp_far.MAX_RANGE << "]\n";
+    fout << "far_min_cluster: " << far_min_cluster << "\n";
+    fout << "far_clusters_after_seg: " << seg_pre_ds.clusters.size() << "\n";
+    fout << "far_clusters_after_downsample: " << seg_post_ds.clusters.size() << "\n";
+    fout << "\n";
+    fout << "# idx wx wy wz lx ly lz range gnd_band"
+         << " rimg_status cluster_pre_ds cluster_post_ds"
+         << " pix_u pix_v cluster_id winner_idx\n";
+
+    int far_scope_total = 0;
+    int ground_skipped = 0;
+    int near_skipped = 0;
+    std::unordered_map<std::string, int> rimg_summary, pre_summary, post_summary;
+
+    for (int i = 0; i < (int)scan_local.size(); ++i) {
+        const auto& pt = scan_local.points[i];
+        const Eigen::Vector3d pw = R_w * Eigen::Vector3d(pt.x, pt.y, pt.z) + t_w;
+        const bool in_gnd = (pt.z >= ground_z_min && pt.z <= ground_z_max);
+        const double range = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
+
+        if (in_gnd) {
+            ++ground_skipped;
+            continue;
+        }
+        if (range < split_dist) {
+            ++near_skipped;
+            continue;
+        }
+
+        ++far_scope_total;
+        const FarClusterVerdict verdict = classifyFarPointPipeline(
+            pt, i, rp_far, split_dist, z_floor,
+            seg_pre_ds, seg_post_ds,
+            pixels_pre, pixels_post,
+            px2cid_pre, px2cid_post, kept_labels);
+
+        bumpCount(rimg_summary, verdict.rimg_status);
+        bumpCount(pre_summary, verdict.cluster_pre_ds);
+        bumpCount(post_summary, verdict.cluster_post_ds);
+
+        fout << i << " "
+             << pw.x() << " " << pw.y() << " " << pw.z() << " "
+             << pt.x << " " << pt.y << " " << pt.z << " "
+             << range << " " << (in_gnd ? 1 : 0) << " "
+             << verdict.rimg_status << " "
+             << verdict.cluster_pre_ds << " "
+             << verdict.cluster_post_ds << " "
+             << verdict.pixel_u << " " << verdict.pixel_v << " "
+             << verdict.cluster_id << " " << verdict.winner_idx << "\n";
+    }
+
+    fout << "\n========== SUMMARY ==========\n";
+    fout << "scan_total: " << scan_local.size() << "\n";
+    fout << "skipped_ground_band: " << ground_skipped << "\n";
+    fout << "skipped_near_range_lt_split: " << near_skipped << "\n";
+    fout << "far_scope_total: " << far_scope_total << "\n";
+    fout << "\n";
+    fout << "[far_layer_range_image]\n";
+    fout << "# Why point did not enter far range image\n";
+    for (const auto& kv : rimg_summary)
+        fout << "  " << kv.first << ": " << kv.second << "\n";
+    const int entered_rimg = rimg_summary.count("entered_range_image")
+        ? rimg_summary.at("entered_range_image") : 0;
+    fout << "  entered_ratio: "
+         << (far_scope_total > 0 ? 100.0 * entered_rimg / far_scope_total : 0.0) << "%\n";
+    fout << "\n";
+    fout << "[cluster_after_segmentation]\n";
+    fout << "# Among entered_range_image points only meaningful; n/a = did not enter range image\n";
+    for (const auto& kv : pre_summary)
+        fout << "  " << kv.first << ": " << kv.second << "\n";
+    const int in_cluster_pre = pre_summary.count("in_cluster") ? pre_summary.at("in_cluster") : 0;
+    fout << "  in_cluster_ratio_of_far_scope: "
+         << (far_scope_total > 0 ? 100.0 * in_cluster_pre / far_scope_total : 0.0) << "%\n";
+    fout << "  in_cluster_ratio_of_entered_rimg: "
+         << (entered_rimg > 0 ? 100.0 * in_cluster_pre / entered_rimg : 0.0) << "%\n";
+    fout << "\n";
+    fout << "[cluster_after_downsample]\n";
+    for (const auto& kv : post_summary)
+        fout << "  " << kv.first << ": " << kv.second << "\n";
+    const int in_cluster_post = post_summary.count("in_cluster") ? post_summary.at("in_cluster") : 0;
+    fout << "  in_cluster_ratio_of_far_scope: "
+         << (far_scope_total > 0 ? 100.0 * in_cluster_post / far_scope_total : 0.0) << "%\n";
+    fout << "\n";
+    fout << "[legend]\n";
+    fout << "  excluded_occluded: passed z/range but same pixel has closer point\n";
+    fout << "  cluster_too_small: in range image, BFS label exists but cluster size <= far_min_cluster\n";
+    fout << "  removed_by_downsample: was in cluster, dropped by cluster_ds_target_max grid thinning\n";
+
+    fout.close();
+    std::cout << "  [FarClusterFunnel] step=" << step
+              << " far_scope=" << far_scope_total
+              << " entered_rimg=" << entered_rimg
+              << " in_cluster_pre=" << in_cluster_pre
+              << " in_cluster_post=" << in_cluster_post
+              << " -> " << path << std::endl;
 }
 
 int saveRangeImagePointsTxt(const RangeImageProcessor& range_proc,
@@ -665,7 +1026,7 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     std::cout<<"max_steps: "<<max_steps<<std::endl;
     std::cout<<"max_frames: "<<max_frames<<(max_frames > 0 ? " (debug stop)" : " (run full sequence)")<<std::endl;
     std::cout<<"dump_frame: "<<dump_frame
-             <<(dump_frame > 0 ? " (save matched/unmatched -> " + std::string(kBsplineBuildDir) + ")" : " (off)")
+             <<(dump_frame > 0 ? " (save matched/unmatched + far_cluster_funnel -> " + std::string(kBsplineBuildDir) + ")" : " (off)")
              <<std::endl;
     std::cout<<"dump_cluster_step: "<<dump_cluster_step
              <<(dump_cluster_step > 0 ? " (save clusters -> " + std::string(kBsplineBuildDir) + "/output_clusters)" : " (off)")
@@ -701,6 +1062,7 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/cluster_ds_min_pts",    cluster_ds_min_pts,    100);
     nh.param("slamesher/cluster_ds_target_max", cluster_ds_target_max, 200);
     nh.param("slamesher/range_image_split",          range_image_split,          30.0);
+    nh.param("slamesher/range_image_far_z_floor_offset", range_image_far_z_floor_offset, 20.0);
     nh.param("slamesher/range_image_far_min_cluster", range_image_far_min_cluster, 20);
     nh.param("slamesher/obs_rimg_col_step",           obs_rimg_col_step,           3);
     nh.param("slamesher/obs_match_per_surf_max",      obs_match_per_surf_max,      50);
@@ -721,6 +1083,7 @@ void Parameter::initParameter(ros::NodeHandle & nh){
               << (cluster_ds_target_max > 0 ? " (range-image 2D downsample on)" : " (off)") << std::endl;
     std::cout << "range_image_split: " << range_image_split
               << (range_image_split > 0 ? " m (two-layer range image on)" : " (off, single layer)")
+              << "  far_z_floor_offset=" << range_image_far_z_floor_offset
               << "  far_min_cluster=" << range_image_far_min_cluster << std::endl;
     std::cout << "obs_rimg_col_step=" << obs_rimg_col_step
               << "  obs_match_per_surf_max=" << obs_match_per_surf_max << std::endl;
@@ -1118,7 +1481,12 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 {
     Transf T_curr = T_guess;
     double delta_scale = 100.0;
+    int prev_match_count = -1;
     std::vector<RegMatch> last_matches;
+    std::unordered_map<int, std::vector<int>> obs_prev_indices;
+    std::unordered_map<int, std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>>> obs_prev_uv;
+    std::unordered_map<const BSplineSurface*, std::vector<int>> gnd_prev_indices;
+    std::unordered_map<const BSplineSurface*, std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>>> gnd_prev_uv;
 
     // 匹配辅助 lambda：对 surf_to_pts 中所有 (sid, indices) 做 footprint 并写入 matches
     auto buildMatches = [&](const std::unordered_map<int, std::vector<int>>& surf_to_pts,
@@ -1144,7 +1512,17 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
             std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
             std::vector<double> dists;
-            surf->findFootPrint(pts_world, footprints, dists);
+            auto prev_idx_it = obs_prev_indices.find(sid);
+            auto prev_uv_it = obs_prev_uv.find(sid);
+            if (prev_idx_it != obs_prev_indices.end() &&
+                prev_uv_it != obs_prev_uv.end() &&
+                prev_idx_it->second == indices &&
+                prev_uv_it->second.size() == indices.size()) {
+                footprints = prev_uv_it->second;
+            }
+            surf->findFootPrintWarm(pts_world, footprints, dists, /*newton_steps=*/6);
+            obs_prev_indices[sid] = indices;
+            obs_prev_uv[sid] = footprints;
 
             for (int k = 0; k < (int)indices.size(); k++) {
                 double d = std::sqrt(std::abs(dists[k]));
@@ -1188,7 +1566,18 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
             std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
             std::vector<double> dists;
-            const_cast<BSplineSurface*>(surf_ptr)->findFootPrint(pts_world, footprints, dists);
+            auto prev_idx_it = gnd_prev_indices.find(surf_ptr);
+            auto prev_uv_it = gnd_prev_uv.find(surf_ptr);
+            if (prev_idx_it != gnd_prev_indices.end() &&
+                prev_uv_it != gnd_prev_uv.end() &&
+                prev_idx_it->second == indices &&
+                prev_uv_it->second.size() == indices.size()) {
+                footprints = prev_uv_it->second;
+            }
+            const_cast<BSplineSurface*>(surf_ptr)->findFootPrintWarm(
+                pts_world, footprints, dists, /*newton_steps=*/6);
+            gnd_prev_indices[surf_ptr] = indices;
+            gnd_prev_uv[surf_ptr] = footprints;
 
             for (int k = 0; k < (int)indices.size(); k++) {
                 double d = std::sqrt(std::abs(dists[k]));
@@ -1230,7 +1619,9 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         std::unordered_map<int, std::vector<int>> obs_surf_to_pts;
         const int col_step = std::max(1, param.obs_rimg_col_step);
 
-        auto collectFromRangeImage = [&](const RangeImageProcessor& rp) {
+        const double far_match_min_z = farLayerZFloor(ground_z_min);
+
+        auto collectFromRangeImage = [&](const RangeImageProcessor& rp, double obs_min_z) {
             const int W = rp.W_COLS;
             const int H = rp.H_SCANS;
             for (int u = 0; u < H; ++u) {
@@ -1238,18 +1629,18 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                     const int px_idx = u * W + v;
                     const auto& px = rp.range_image_[px_idx];
                     if (!px.valid) continue;
-                    if (px.z < match_min_z) continue;
+                    if (px.z < obs_min_z) continue;
                     const int cloud_idx = rp.pixel_to_cloud_idx_[px_idx];
                     if (cloud_idx < 0 || cloud_idx >= (int)scan_local.size()) continue;
                     Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
                         Eigen::Vector3d(px.x, px.y, px.z) + T_curr.block<3,1>(0,3);
-                    for (int sid : bspline_map.queryCandidates(p_w, 2))
+                    for (int sid : bspline_map.queryCandidates(p_w, 1))
                         obs_surf_to_pts[sid].push_back(cloud_idx);
                 }
             }
         };
-        collectFromRangeImage(rp_near);
-        if (use_far) collectFromRangeImage(rp_far);
+        collectFromRangeImage(rp_near, match_min_z);
+        if (use_far) collectFromRangeImage(rp_far, far_match_min_z);
 
         // 每曲面限流：均匀保留最多 obs_match_per_surf_max 个点
         if (param.obs_match_per_surf_max > 0) {
@@ -1276,6 +1667,10 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             for (auto& m : matches) if (m.is_ground) cnt++;
             return cnt;
         }();
+        const int n_obs = static_cast<int>(matches.size()) - n_gnd;
+
+        appendMatchDropEvent(g_data.step, iter, prev_match_count, static_cast<int>(matches.size()), n_gnd, n_obs);
+        prev_match_count = static_cast<int>(matches.size());
 
         // ── 地面匹配距离统计：每个 ground match 的法向距离写入 txt ──
         {
@@ -1322,7 +1717,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         }
         last_matches = matches;
         std::cout << "  iter " << iter << " [pre-solve] gnd=" << n_gnd
-                  << " obs=" << (matches.size() - n_gnd) << std::endl;
+                  << " obs=" << n_obs << std::endl;
 
         Eigen::Quaterniond q_init(T_curr.block<3,3>(0,0));
         double parameters[7];
@@ -1347,7 +1742,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
         ceres::Solver::Options opts;
         opts.linear_solver_type = ceres::DENSE_QR;
-        opts.max_num_iterations = 10;
+        opts.max_num_iterations = 1;
         opts.minimizer_progress_to_stdout = false;
         opts.num_threads = 4;
         ceres::Solver::Summary summary;
@@ -1365,7 +1760,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
         std::cout << "  iter " << iter << ": matches=" << matches.size()
                   << " delta=" << delta_scale
-                  << " (gnd~" << n_gnd << " obs~" << (matches.size() - n_gnd) << ")" << std::endl;
+                  << " (gnd~" << n_gnd << " obs~" << n_obs << ")" << std::endl;
     }
 
     if (param.dump_frame > 0 && g_data.step == param.dump_frame) {
@@ -1435,9 +1830,10 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
 
     const bool dump_clusters = (param.dump_cluster_step > 0 && g_data.step == param.dump_cluster_step);
     const bool dump_occluded = (param.dump_occluded_step > 0 && g_data.step == param.dump_occluded_step);
+    const bool dump_far_funnel = (param.dump_frame > 0 && g_data.step == param.dump_frame);
     const bool do_obstacle = (g_data.step == 1) || (g_data.step % param.map_update_interval  == 0);
     const bool do_ground   = (g_data.step == 1) || (g_data.step % param.ground_build_interval == 0);
-    if (!do_obstacle && !do_ground && !dump_clusters && !dump_occluded) return;
+    if (!do_obstacle && !do_ground && !dump_clusters && !dump_occluded && !dump_far_funnel) return;
 
     TicToc t_upd;
     // 近层：range ∈ [MIN_RANGE, range_image_split)；如不启用双层则全范围投影
@@ -1452,10 +1848,11 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
     range_proc.generateRangeImage(scan_local, ground_z_min, ground_z_max, false,
                                   0.0, use_far_layer ? split_dist : 1e9, ground_z_min);
 
-    // 远层：range ∈ [range_image_split, MAX_RANGE]
+    // 远层：range ∈ [range_image_split, MAX_RANGE]，z_floor 低于近层
+    const double far_z_floor = farLayerZFloor(ground_z_min);
     if (use_far_layer)
         range_proc_far.generateRangeImage(scan_local, ground_z_min, ground_z_max, false,
-                                          split_dist, 1e9, ground_z_min);
+                                          split_dist, 1e9, far_z_floor);
 
     if (dump_occluded) {
         const std::string build_dir = std::string(kBsplineBuildDir);
@@ -1517,15 +1914,24 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
 
     // 远层分割（如果启用）
     SegmentationResult seg_far;
+    SegmentationResult seg_far_pre_ds;
     if (use_far_layer) {
         const int far_min = param.range_image_far_min_cluster;
         seg_far = range_proc_far.segmentRangeImage(
             5, 0.1, far_min, ground_z_min, ground_z_max, false);
+        if (dump_far_funnel)
+            seg_far_pre_ds = seg_far;
         range_proc_far.downsampleClusters(
             seg_far,
             param.cluster_ds_min_pts,
             param.cluster_ds_target_max,
             far_min);
+        if (dump_far_funnel) {
+            saveFarClusterPipelineAuditTxt(scan_local, g_data.step, T_world,
+                                           ground_z_min, ground_z_max, far_z_floor,
+                                           split_dist, far_min,
+                                           range_proc_far, seg_far_pre_ds, seg_far);
+        }
     }
 
     const Eigen::Matrix3d R_w = T_world.block<3,3>(0,0);
@@ -1997,15 +2403,15 @@ void SLAMesher::process(){
         Transf T_guess = getOdom();
 
         // 为配准生成 range image（近/远层），与 runMapBuild 同参数
-        // 不再提前删地面带，地面配准走独立路径；z_floor = GROUND_Z_MIN 保留低矮障碍
         {
             const double split = param.range_image_split;
             const bool use_far = (split > 0.0);
+            const double far_z_floor = farLayerZFloor(GROUND_Z_MIN);
             range_proc.generateRangeImage(scan_local, GROUND_Z_MIN, GROUND_Z_MAX, false,
                                           0.0, use_far ? split : 1e9, GROUND_Z_MIN);
             if (use_far)
                 range_proc_far.generateRangeImage(scan_local, GROUND_Z_MIN, GROUND_Z_MAX, false,
-                                                  split, 1e9, GROUND_Z_MIN);
+                                                  split, 1e9, far_z_floor);
         }
 
         T_world = registerScanToMap(scan_local, T_guess, bspline_map, ground_grid,
@@ -2100,7 +2506,7 @@ int main(int argc, char **argv){
     nh.param("slamesher/seq", seq, std::string("/00"));
     nh.param("slamesher/console_log_path", console_log_path, std::string(""));
     if (!console_log_path.empty()) {
-        g_console_log_tee.enable(console_log_path);
+        g_console_log_tee.enable(makeSeqSpecificLogPath(console_log_path, seq));
     } else {
         g_console_log_tee.enableAuto(file_loc_report, seq);
     }

@@ -28,6 +28,7 @@ public:
     int    cluster_ds_target_max{200};  // 大 cluster 目标保留像素上限（0=关闭）
     // 两层 range image 参数
     double range_image_split{30.0};      // 近/远层分界距离（米）；0=禁用远层
+    double range_image_far_z_floor_offset{20.0}; // 远层 z_floor = ground_z_min - offset（建图/配准/审计统一）
     int    range_image_far_min_cluster{20}; // 远层 cluster 最小点数（可比近层宽松）
     // 障碍配准采样（range image 模式）
     int    obs_rimg_col_step{3};           // range image 列方向采样间隔（1=全取，3=每3列取1）
