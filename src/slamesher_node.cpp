@@ -158,6 +158,107 @@ void appendMatchDropEvent(int step,
               << " obs=" << n_obs << std::endl;
 }
 
+// 配准关联诊断：点到曲面的真实状态（与 Ceres 残差条数无关）
+enum class RegAssocStatus : int {
+    NoSurface = 0,      // 关联阶段未找到任何曲面
+    FootprintFail = 1,  // 有曲面但 footprint 失败 (d < 1e-6)
+    DistTooLarge = 2,   // footprint 成功但 d > match_dist_thr
+    Matched = 3,        // d <= match_dist_thr，真正匹配上曲面
+};
+
+struct RegPointAssoc {
+    int scan_idx = -1;
+    Eigen::Vector3d p_world = Eigen::Vector3d::Zero();
+    double best_dist = -1.0;
+    RegAssocStatus status = RegAssocStatus::NoSurface;
+    bool is_gnd_cand = false;
+    bool is_obs_cand = false;
+};
+
+struct RegMatchFunnel {
+    int gnd_cand = 0;
+    int gnd_surf = 0;
+    int gnd_fp_ok = 0;
+    int gnd_dist_fail = 0;
+    int gnd_ceres = 0;
+    int obs_cand_px = 0;
+    int obs_surf_px = 0;
+    int obs_no_surf_px = 0;
+    int obs_pairs = 0;
+    int obs_fp_ok = 0;
+    int obs_dist_fail = 0;
+    int obs_ceres = 0;
+};
+
+void applyFootprintToAssoc(RegPointAssoc& a,
+                           const Eigen::Vector3d& p_w,
+                           double d,
+                           double match_dist_thr)
+{
+    a.p_world = p_w;
+    if (d < 1e-6) {
+        if (a.status == RegAssocStatus::NoSurface)
+            a.status = RegAssocStatus::FootprintFail;
+        return;
+    }
+    if (a.best_dist < 0.0 || d < a.best_dist)
+        a.best_dist = d;
+    if (d <= match_dist_thr)
+        a.status = RegAssocStatus::Matched;
+    else if (a.status != RegAssocStatus::Matched)
+        a.status = RegAssocStatus::DistTooLarge;
+}
+
+void logRegMatchFunnel(int step, int iter, const RegMatchFunnel& f, bool snapshot_step)
+{
+    static std::ofstream fout;
+    static bool header_written = false;
+    if (!fout.is_open()) {
+        std::error_code ec;
+        std::filesystem::create_directories(kBsplineBuildDir, ec);
+        fout.open(std::string(kBsplineBuildDir) + "/reg_match_funnel.txt",
+                  std::ios::out | std::ios::trunc);
+        header_written = false;
+    }
+    if (fout.is_open() && !header_written) {
+        fout << "# step iter"
+             << " gnd_cand gnd_surf gnd_fp_ok gnd_dist_fail gnd_ceres"
+             << " obs_cand_px obs_surf_px obs_no_surf_px"
+             << " obs_pairs obs_fp_ok obs_dist_fail obs_ceres\n";
+        header_written = true;
+    }
+    if (fout.is_open()) {
+        fout << step << " " << iter << " "
+             << f.gnd_cand << " " << f.gnd_surf << " " << f.gnd_fp_ok << " "
+             << f.gnd_dist_fail << " " << f.gnd_ceres << " "
+             << f.obs_cand_px << " " << f.obs_surf_px << " " << f.obs_no_surf_px << " "
+             << f.obs_pairs << " " << f.obs_fp_ok << " " << f.obs_dist_fail << " "
+             << f.obs_ceres << "\n";
+        fout.flush();
+    }
+
+    std::cout << "  [MatchFunnel] step=" << step << " iter=" << iter
+              << " gnd " << f.gnd_cand << "->" << f.gnd_surf << "->"
+              << f.gnd_fp_ok << "->" << f.gnd_ceres
+              << " | obs_px " << f.obs_cand_px << "->" << f.obs_surf_px
+              << " | pairs " << f.obs_pairs << "->" << f.obs_fp_ok << "->"
+              << f.obs_ceres << std::endl;
+
+    if (snapshot_step) {
+        const std::string snap = std::string(kBsplineBuildDir) + "/reg_match_funnel_step"
+                                 + std::to_string(step) + ".txt";
+        std::ofstream fsnap(snap, std::ios::out | std::ios::trunc);
+        if (fsnap.is_open()) {
+            fsnap << "# step=" << step << " iter=" << iter << " (snapshot at dump_frame)\n";
+            fsnap << "# gnd: cand->surf->fp_ok->ceres | obs: cand_px->surf_px | pairs->fp_ok->ceres\n";
+            fsnap << f.gnd_cand << " " << f.gnd_surf << " " << f.gnd_fp_ok << " "
+                  << f.gnd_ceres << " " << f.obs_cand_px << " " << f.obs_surf_px << " "
+                  << f.obs_no_surf_px << " " << f.obs_pairs << " " << f.obs_fp_ok << " "
+                  << f.obs_ceres << "\n";
+        }
+    }
+}
+
 void saveFrame1GroundPoints(const std::vector<Eigen::Vector3d>& pts_lidar)
 {
     if (pts_lidar.empty()) return;
@@ -1482,285 +1583,326 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
     Transf T_curr = T_guess;
     double delta_scale = 100.0;
     int prev_match_count = -1;
-    std::vector<RegMatch> last_matches;
+    std::unordered_map<int, RegPointAssoc> last_point_assoc;
     std::unordered_map<int, std::vector<int>> obs_prev_indices;
     std::unordered_map<int, std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>>> obs_prev_uv;
     std::unordered_map<const BSplineSurface*, std::vector<int>> gnd_prev_indices;
     std::unordered_map<const BSplineSurface*, std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>>> gnd_prev_uv;
 
-    // 匹配辅助 lambda：对 surf_to_pts 中所有 (sid, indices) 做 footprint 并写入 matches
-    auto buildMatches = [&](const std::unordered_map<int, std::vector<int>>& surf_to_pts,
-                            bool want_ground,
-                            std::vector<RegMatch>& out) {
-        for (auto& [sid, indices] : surf_to_pts) {
-            const BSplineMapEntry* entry = bspline_map.getEntry(sid);
-            if (!entry || !entry->surface) continue;
-            if (entry->is_ground != want_ground) continue;
+    const int gnd_skip = param.ground_skip_points > 0 ? param.ground_skip_points : skip_points;
+    const int col_step = std::max(1, param.obs_rimg_col_step);
+    const double far_match_min_z = farLayerZFloor(ground_z_min);
 
-            auto& surf = entry->surface;
-            const auto& knU = surf->getKnotsU();
-            const auto& knV = surf->getKnotsV();
-            const auto& cps = surf->getControls();
-            int num_cpv     = surf->getNumCpV();
+    // ─────────────────────────────────────────────────────────────────────────
+    // 地面关联：仅用 z 带点 + GroundGridMap，不碰 range image / 障碍曲面
+    // ─────────────────────────────────────────────────────────────────────────
+    auto runGroundAssoc = [&](const Transf& T,
+                              std::vector<RegMatch>& gnd_out,
+                              RegMatchFunnel& funnel_out,
+                              std::unordered_map<int, RegPointAssoc>& assoc_out) {
+        gnd_out.clear();
+        assoc_out.clear();
+        funnel_out = {};
 
-            std::vector<Eigen::Vector3d> pts_world;
-            pts_world.reserve(indices.size());
-            for (int idx : indices)
-                pts_world.push_back(T_curr.block<3,3>(0,0) *
-                    Eigen::Vector3d(scan_local[idx].x, scan_local[idx].y, scan_local[idx].z) +
-                    T_curr.block<3,1>(0,3));
+        auto toWorld = [&](int idx) -> Eigen::Vector3d {
+            return T.block<3,3>(0,0) *
+                   Eigen::Vector3d(scan_local[idx].x, scan_local[idx].y, scan_local[idx].z) +
+                   T.block<3,1>(0,3);
+        };
 
-            std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
-            std::vector<double> dists;
-            auto prev_idx_it = obs_prev_indices.find(sid);
-            auto prev_uv_it = obs_prev_uv.find(sid);
-            if (prev_idx_it != obs_prev_indices.end() &&
-                prev_uv_it != obs_prev_uv.end() &&
-                prev_idx_it->second == indices &&
-                prev_uv_it->second.size() == indices.size()) {
-                footprints = prev_uv_it->second;
-            }
-            surf->findFootPrintWarm(pts_world, footprints, dists, /*newton_steps=*/6);
-            obs_prev_indices[sid] = indices;
-            obs_prev_uv[sid] = footprints;
+        std::unordered_map<const BSplineSurface*, std::vector<int>> gnd_surf_to_pts;
 
-            for (int k = 0; k < (int)indices.size(); k++) {
-                double d = std::sqrt(std::abs(dists[k]));
-                if (d > match_dist_thr || d < 1e-6) continue;
-
-                auto [paraU, paraV] = footprints[k];
-                SurfaceCurvature curv = surf->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
-                if (curv.normal.norm() < 1e-9) continue;
-                curv.normal.normalize();
-
-                RegMatch m;
-                m.p_local   = Eigen::Vector3d(scan_local[indices[k]].x,
-                                              scan_local[indices[k]].y,
-                                              scan_local[indices[k]].z);
-                m.p_world   = pts_world[k];
-                m.curvature = curv;
-                m.scan_idx  = indices[k];
-                m.is_ground = want_ground;
-                out.push_back(m);
-            }
+        for (int i = 0; i < (int)scan_local.size(); i += gnd_skip) {
+            const double lz = scan_local[i].z;
+            if (lz < ground_z_min || lz > ground_z_max) continue;
+            ++funnel_out.gnd_cand;
+            const Eigen::Vector3d p_w = toWorld(i);
+            auto& a = assoc_out[i];
+            a.scan_idx = i; a.p_world = p_w; a.is_gnd_cand = true;
+            const BSplineSurface* sp = ground_grid.queryNearestSurface(p_w);
+            if (!sp) continue;
+            ++funnel_out.gnd_surf;
+            gnd_surf_to_pts[sp].push_back(i);
         }
-    };
 
-    // 地面匹配 lambda：使用 GroundGridMap 查询，key 为 BSplineSurface 指针
-    auto buildGroundMatches = [&](
-            const std::unordered_map<const BSplineSurface*, std::vector<int>>& surf_to_pts,
-            std::vector<RegMatch>& out) {
-        for (auto& [surf_ptr, indices] : surf_to_pts) {
+        for (auto& [surf_ptr, indices] : gnd_surf_to_pts) {
             if (!surf_ptr) continue;
-            const auto& knU  = surf_ptr->getKnotsU();
-            const auto& knV  = surf_ptr->getKnotsV();
-            const auto& cps  = surf_ptr->getControls();
-            int num_cpv      = surf_ptr->getNumCpV();
+            const auto& knU = surf_ptr->getKnotsU();
+            const auto& knV = surf_ptr->getKnotsV();
+            const auto& cps = surf_ptr->getControls();
+            const int num_cpv = surf_ptr->getNumCpV();
 
             std::vector<Eigen::Vector3d> pts_world;
             pts_world.reserve(indices.size());
-            for (int idx : indices)
-                pts_world.push_back(T_curr.block<3,3>(0,0) *
-                    Eigen::Vector3d(scan_local[idx].x, scan_local[idx].y, scan_local[idx].z) +
-                    T_curr.block<3,1>(0,3));
+            for (int idx : indices) pts_world.push_back(toWorld(idx));
 
             std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
             std::vector<double> dists;
             auto prev_idx_it = gnd_prev_indices.find(surf_ptr);
-            auto prev_uv_it = gnd_prev_uv.find(surf_ptr);
+            auto prev_uv_it  = gnd_prev_uv.find(surf_ptr);
             if (prev_idx_it != gnd_prev_indices.end() &&
-                prev_uv_it != gnd_prev_uv.end() &&
+                prev_uv_it  != gnd_prev_uv.end() &&
                 prev_idx_it->second == indices &&
-                prev_uv_it->second.size() == indices.size()) {
+                prev_uv_it->second.size() == indices.size())
                 footprints = prev_uv_it->second;
-            }
+
             const_cast<BSplineSurface*>(surf_ptr)->findFootPrintWarm(
                 pts_world, footprints, dists, /*newton_steps=*/6);
             gnd_prev_indices[surf_ptr] = indices;
-            gnd_prev_uv[surf_ptr] = footprints;
+            gnd_prev_uv[surf_ptr]      = footprints;
 
-            for (int k = 0; k < (int)indices.size(); k++) {
-                double d = std::sqrt(std::abs(dists[k]));
-                if (d > match_dist_thr || d < 1e-6) continue;
+            for (int k = 0; k < (int)indices.size(); ++k) {
+                const double d = std::sqrt(std::abs(dists[k]));
+                applyFootprintToAssoc(assoc_out[indices[k]], pts_world[k], d, match_dist_thr);
+                if (d < 1e-6) continue;
+                ++funnel_out.gnd_fp_ok;
+                if (d > match_dist_thr) { ++funnel_out.gnd_dist_fail; continue; }
                 auto [paraU, paraV] = footprints[k];
                 SurfaceCurvature curv = const_cast<BSplineSurface*>(surf_ptr)
                     ->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
                 if (curv.normal.norm() < 1e-9) continue;
                 curv.normal.normalize();
-
+                ++funnel_out.gnd_ceres;
                 RegMatch m;
-                m.p_local   = Eigen::Vector3d(scan_local[indices[k]].x,
-                                              scan_local[indices[k]].y,
-                                              scan_local[indices[k]].z);
+                m.p_local = Eigen::Vector3d(scan_local[indices[k]].x,
+                                            scan_local[indices[k]].y,
+                                            scan_local[indices[k]].z);
                 m.p_world   = pts_world[k];
                 m.curvature = curv;
                 m.scan_idx  = indices[k];
                 m.is_ground = true;
-                out.push_back(m);
+                gnd_out.push_back(m);
             }
         }
     };
 
-    for (int iter = 0; iter < max_iters && delta_scale > converge_thr; iter++) {
+    // ─────────────────────────────────────────────────────────────────────────
+    // 障碍关联：用给定 T 把 range image 像素投世界 → queryCandidates → footprint
+    // ─────────────────────────────────────────────────────────────────────────
+    auto runObsAssoc = [&](const Transf& T,
+                           std::vector<RegMatch>& obs_out,
+                           RegMatchFunnel& funnel_out,
+                           std::unordered_map<int, RegPointAssoc>& assoc_out) {
+        obs_out.clear();
+        funnel_out.obs_cand_px = funnel_out.obs_surf_px = 0;
+        funnel_out.obs_no_surf_px = funnel_out.obs_pairs = 0;
+        funnel_out.obs_fp_ok = funnel_out.obs_dist_fail = funnel_out.obs_ceres = 0;
 
-        // ── 路 1：地面点 z ∈ [ground_z_min, ground_z_max] → 查 GroundGridMap ──
-        std::unordered_map<const BSplineSurface*, std::vector<int>> gnd_surf_to_pts;
-        const int gnd_skip = param.ground_skip_points > 0 ? param.ground_skip_points : skip_points;
-        for (int i = 0; i < (int)scan_local.size(); i += gnd_skip) {
-            const double lx = scan_local[i].x, ly = scan_local[i].y, lz = scan_local[i].z;
-            if (lz < ground_z_min || lz > ground_z_max) continue;
-            Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
-                Eigen::Vector3d(lx, ly, lz) + T_curr.block<3,1>(0,3);
-            const BSplineSurface* sp = ground_grid.queryNearestSurface(p_w);
-            if (sp) gnd_surf_to_pts[sp].push_back(i);
-        }
+        auto toWorld = [&](int idx) -> Eigen::Vector3d {
+            return T.block<3,3>(0,0) *
+                   Eigen::Vector3d(scan_local[idx].x, scan_local[idx].y, scan_local[idx].z) +
+                   T.block<3,1>(0,3);
+        };
 
-        // ── 路 2：障碍点来自 range image 有效像素（近层 + 远层），按列间隔采样 ──
         std::unordered_map<int, std::vector<int>> obs_surf_to_pts;
-        const int col_step = std::max(1, param.obs_rimg_col_step);
-
-        const double far_match_min_z = farLayerZFloor(ground_z_min);
 
         auto collectFromRangeImage = [&](const RangeImageProcessor& rp, double obs_min_z) {
-            const int W = rp.W_COLS;
-            const int H = rp.H_SCANS;
+            const int W = rp.W_COLS, H = rp.H_SCANS;
             for (int u = 0; u < H; ++u) {
                 for (int v = 0; v < W; v += col_step) {
                     const int px_idx = u * W + v;
                     const auto& px = rp.range_image_[px_idx];
-                    if (!px.valid) continue;
-                    if (px.z < obs_min_z) continue;
+                    if (!px.valid || px.z < obs_min_z) continue;
                     const int cloud_idx = rp.pixel_to_cloud_idx_[px_idx];
                     if (cloud_idx < 0 || cloud_idx >= (int)scan_local.size()) continue;
-                    Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
-                        Eigen::Vector3d(px.x, px.y, px.z) + T_curr.block<3,1>(0,3);
-                    for (int sid : bspline_map.queryCandidates(p_w, 1))
+                    ++funnel_out.obs_cand_px;
+                    const Eigen::Vector3d p_w = toWorld(cloud_idx);
+                    auto& a = assoc_out[cloud_idx];
+                    a.scan_idx = cloud_idx; a.p_world = p_w; a.is_obs_cand = true;
+                    std::vector<int> cands = bspline_map.queryCandidates(p_w, 1);
+                    if (cands.empty()) continue;
+                    ++funnel_out.obs_surf_px;
+                    for (int sid : cands)
                         obs_surf_to_pts[sid].push_back(cloud_idx);
                 }
             }
         };
         collectFromRangeImage(rp_near, match_min_z);
         if (use_far) collectFromRangeImage(rp_far, far_match_min_z);
+        funnel_out.obs_no_surf_px = funnel_out.obs_cand_px - funnel_out.obs_surf_px;
 
-        // 每曲面限流：均匀保留最多 obs_match_per_surf_max 个点
         if (param.obs_match_per_surf_max > 0) {
             for (auto& [sid, idxs] : obs_surf_to_pts) {
                 const int cap = param.obs_match_per_surf_max;
                 if ((int)idxs.size() > cap) {
                     const int step = (int)idxs.size() / cap;
-                    std::vector<int> kept;
-                    kept.reserve(cap);
+                    std::vector<int> kept; kept.reserve(cap);
                     for (int i = 0; i < (int)idxs.size() && (int)kept.size() < cap; i += step)
                         kept.push_back(idxs[i]);
                     idxs = std::move(kept);
                 }
             }
         }
+        for (const auto& [sid, idxs] : obs_surf_to_pts)
+            funnel_out.obs_pairs += static_cast<int>(idxs.size());
 
-        std::vector<RegMatch> matches;
-        matches.reserve(bspline_map.size() * param.obs_match_per_surf_max);
-        buildGroundMatches(gnd_surf_to_pts, matches);    // 地面（GroundGridMap）
-        buildMatches(obs_surf_to_pts, false, matches);  // 障碍物
+        for (auto& [sid, indices] : obs_surf_to_pts) {
+            const BSplineMapEntry* entry = bspline_map.getEntry(sid);
+            if (!entry || !entry->surface || entry->is_ground) continue;
+            auto& surf = entry->surface;
+            const auto& knU = surf->getKnotsU();
+            const auto& knV = surf->getKnotsV();
+            const auto& cps = surf->getControls();
+            const int num_cpv = surf->getNumCpV();
 
-        const int n_gnd = [&]{
-            int cnt = 0;
-            for (auto& m : matches) if (m.is_ground) cnt++;
-            return cnt;
-        }();
-        const int n_obs = static_cast<int>(matches.size()) - n_gnd;
+            std::vector<Eigen::Vector3d> pts_world;
+            pts_world.reserve(indices.size());
+            for (int idx : indices) pts_world.push_back(toWorld(idx));
 
-        appendMatchDropEvent(g_data.step, iter, prev_match_count, static_cast<int>(matches.size()), n_gnd, n_obs);
-        prev_match_count = static_cast<int>(matches.size());
+            std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
+            std::vector<double> dists;
+            auto prev_idx_it = obs_prev_indices.find(sid);
+            auto prev_uv_it  = obs_prev_uv.find(sid);
+            if (prev_idx_it != obs_prev_indices.end() &&
+                prev_uv_it  != obs_prev_uv.end() &&
+                prev_idx_it->second == indices &&
+                prev_uv_it->second.size() == indices.size())
+                footprints = prev_uv_it->second;
 
-        // ── 地面匹配距离统计：每个 ground match 的法向距离写入 txt ──
-        {
-            static std::ofstream gnd_dist_file;
-            if (!gnd_dist_file.is_open()) {
-                gnd_dist_file.open(std::string(kBsplineBuildDir) + "/gnd_match_dist.txt",
-                                   std::ios::out | std::ios::trunc);
-                gnd_dist_file << std::fixed << std::setprecision(5);
-                gnd_dist_file << "# dist_normal  dist_abs"
-                              << "  p_w_x  p_w_y  p_w_z  surf_z\n";
-            }
-            int mi = 0;
-            double sum_d = 0, sum_dz = 0;
-            int cnt = 0;
-            for (const auto& m : matches) {
-                if (!m.is_ground) { ++mi; continue; }
-                // 有符号法向距离（点到曲面，沿法向）
-                const double d_n = (m.p_world - m.curvature.point).dot(m.curvature.normal);
-                const double d_abs = std::abs(d_n);
-                sum_d  += d_abs;
-                sum_dz += (m.p_world.z() - m.curvature.point.z());
-                ++cnt;
-                gnd_dist_file << d_n << "  " << d_abs
-                              << "  " << m.p_world.x()
-                              << "  " << m.p_world.y()
-                              << "  " << m.p_world.z()
-                              << "  " << m.curvature.point.z()
-                              << "\n";
-                ++mi;
-            }
-            if (cnt > 0) {
-                gnd_dist_file << "# step=" << g_data.step << " iter=" << iter
-                              << " n_gnd=" << cnt
-                              << " mean|d|=" << (sum_d / cnt)
-                              << " mean_dz=" << (sum_dz / cnt) << "\n";
-                gnd_dist_file.flush();
+            surf->findFootPrintWarm(pts_world, footprints, dists, /*newton_steps=*/6);
+            obs_prev_indices[sid] = indices;
+            obs_prev_uv[sid]      = footprints;
+
+            for (int k = 0; k < (int)indices.size(); ++k) {
+                const double d = std::sqrt(std::abs(dists[k]));
+                applyFootprintToAssoc(assoc_out[indices[k]], pts_world[k], d, match_dist_thr);
+                if (d < 1e-6) { ++funnel_out.obs_dist_fail; continue; }
+                ++funnel_out.obs_fp_ok;
+                if (d > match_dist_thr) { ++funnel_out.obs_dist_fail; continue; }
+                auto [paraU, paraV] = footprints[k];
+                SurfaceCurvature curv = surf->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
+                if (curv.normal.norm() < 1e-9) continue;
+                curv.normal.normalize();
+                ++funnel_out.obs_ceres;
+                RegMatch m;
+                m.p_local = Eigen::Vector3d(scan_local[indices[k]].x,
+                                            scan_local[indices[k]].y,
+                                            scan_local[indices[k]].z);
+                m.p_world   = pts_world[k];
+                m.curvature = curv;
+                m.scan_idx  = indices[k];
+                m.is_ground = false;
+                obs_out.push_back(m);
             }
         }
+    };
 
-        if ((int)matches.size() < 10) {
-            ROS_WARN("Registration iter %d: only %d matches (gnd~%d), skip",
-                     iter, (int)matches.size(), n_gnd);
-            break;
-        }
-        last_matches = matches;
-        std::cout << "  iter " << iter << " [pre-solve] gnd=" << n_gnd
-                  << " obs=" << n_obs << std::endl;
-
+    // ─────────────────────────────────────────────────────────────────────────
+    // 辅助：运行单步 Ceres，更新 T_curr，返回 delta_scale
+    // ─────────────────────────────────────────────────────────────────────────
+    auto solvePose = [&](const std::vector<RegMatch>& ms, const char* tag) -> double {
         Eigen::Quaterniond q_init(T_curr.block<3,3>(0,0));
         double parameters[7];
-        parameters[0] = q_init.x();
-        parameters[1] = q_init.y();
-        parameters[2] = q_init.z();
-        parameters[3] = q_init.w();
-        parameters[4] = T_curr(0, 3);
-        parameters[5] = T_curr(1, 3);
-        parameters[6] = T_curr(2, 3);
+        parameters[0] = q_init.x(); parameters[1] = q_init.y();
+        parameters[2] = q_init.z(); parameters[3] = q_init.w();
+        parameters[4] = T_curr(0,3);
+        parameters[5] = T_curr(1,3);
+        parameters[6] = T_curr(2,3);
 
         ceres::LossFunction* loss = new ceres::HuberLoss(0.5);
         ceres::Problem problem;
         problem.AddParameterBlock(parameters, 7, new PoseSE3Parameterization());
-
-        // 地面和障碍统一用 SDM 残差
-        for (auto& m : matches) {
-            ceres::CostFunction* cost = new SDMRegistrationCostFunction(
-                m.p_local, m.p_world, m.curvature);
-            problem.AddResidualBlock(cost, loss, parameters);
-        }
+        for (const auto& m : ms)
+            problem.AddResidualBlock(
+                new SDMRegistrationCostFunction(m.p_local, m.p_world, m.curvature),
+                loss, parameters);
 
         ceres::Solver::Options opts;
-        opts.linear_solver_type = ceres::DENSE_QR;
-        opts.max_num_iterations = 1;
+        opts.linear_solver_type          = ceres::DENSE_QR;
+        opts.max_num_iterations          = 1;
         opts.minimizer_progress_to_stdout = false;
-        opts.num_threads = 4;
+        opts.num_threads                 = 4;
         ceres::Solver::Summary summary;
         ceres::Solve(opts, &problem, &summary);
 
         Eigen::Map<Eigen::Quaterniond> q_opt(parameters);
-        Eigen::Map<Eigen::Vector3d> t_opt(parameters + 4);
+        Eigen::Map<Eigen::Vector3d>    t_opt(parameters + 4);
         Transf T_new = Eigen::Matrix4d::Identity();
         T_new.block<3,3>(0,0) = q_opt.normalized().toRotationMatrix();
         T_new.block<3,1>(0,3) = t_opt;
-
-        delta_scale = (T_new.block<3,1>(0,3) - T_curr.block<3,1>(0,3)).norm()
-                    + 5.0 * (T_new.block<3,3>(0,0) - T_curr.block<3,3>(0,0)).norm();
+        const double ds = (T_new.block<3,1>(0,3) - T_curr.block<3,1>(0,3)).norm() +
+                          5.0 * (T_new.block<3,3>(0,0) - T_curr.block<3,3>(0,0)).norm();
         T_curr = T_new;
+        std::cout << "    [" << tag << "] n=" << ms.size() << " delta=" << ds << std::endl;
+        return ds;
+    };
 
-        std::cout << "  iter " << iter << ": matches=" << matches.size()
-                  << " delta=" << delta_scale
-                  << " (gnd~" << n_gnd << " obs~" << n_obs << ")" << std::endl;
+    // ─────────────────────────────────────────────────────────────────────────
+    // gnd_match_dist 日志
+    // ─────────────────────────────────────────────────────────────────────────
+    static std::ofstream gnd_dist_file;
+    if (!gnd_dist_file.is_open()) {
+        gnd_dist_file.open(std::string(kBsplineBuildDir) + "/gnd_match_dist.txt",
+                           std::ios::out | std::ios::trunc);
+        gnd_dist_file << std::fixed << std::setprecision(5);
+        gnd_dist_file << "# dist_normal  dist_abs  p_w_x  p_w_y  p_w_z  surf_z\n";
+    }
+    auto logGndDist = [&](const std::vector<RegMatch>& ms, int iter) {
+        double sum_d = 0, sum_dz = 0; int cnt = 0;
+        for (const auto& m : ms) {
+            if (!m.is_ground) continue;
+            const double d_n = (m.p_world - m.curvature.point).dot(m.curvature.normal);
+            gnd_dist_file << d_n << "  " << std::abs(d_n)
+                          << "  " << m.p_world.x() << "  " << m.p_world.y()
+                          << "  " << m.p_world.z() << "  " << m.curvature.point.z() << "\n";
+            sum_d += std::abs(d_n); sum_dz += m.p_world.z() - m.curvature.point.z(); ++cnt;
+        }
+        if (cnt > 0) {
+            gnd_dist_file << "# step=" << g_data.step << " iter=" << iter
+                          << " n_gnd=" << cnt << " mean|d|=" << sum_d/cnt
+                          << " mean_dz=" << sum_dz/cnt << "\n";
+            gnd_dist_file.flush();
+        }
+    };
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 阶段 1：地面点 → 地面曲面关联 → Ceres（1 次）→ T_gnd
+    // ─────────────────────────────────────────────────────────────────────────
+    {
+        std::vector<RegMatch> gnd_matches;
+        RegMatchFunnel gnd_funnel{};
+        std::unordered_map<int, RegPointAssoc> gnd_assoc;
+        runGroundAssoc(T_curr, gnd_matches, gnd_funnel, gnd_assoc);
+        logRegMatchFunnel(g_data.step, -2, gnd_funnel, false);
+        last_point_assoc = gnd_assoc;
+
+        std::cout << "  [gnd-assoc] cand=" << gnd_funnel.gnd_cand
+                  << " surf=" << gnd_funnel.gnd_surf
+                  << " ceres=" << gnd_funnel.gnd_ceres << std::endl;
+
+        if ((int)gnd_matches.size() >= 5) {
+            delta_scale = solvePose(gnd_matches, "gnd");
+            logGndDist(gnd_matches, -1);
+        } else {
+            std::cout << "  [gnd] skip, too few matches=" << gnd_matches.size() << std::endl;
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // 阶段 2：障碍点（用 T_gnd 投世界）→ 障碍曲面关联 → Ceres × max_iters
+    // ─────────────────────────────────────────────────────────────────────────
+    delta_scale = 100.0;
+    for (int iter = 0; iter < max_iters && delta_scale > converge_thr; iter++) {
+        std::vector<RegMatch> obs_matches;
+        RegMatchFunnel obs_funnel{};
+        std::unordered_map<int, RegPointAssoc> obs_assoc = last_point_assoc;
+        runObsAssoc(T_curr, obs_matches, obs_funnel, obs_assoc);
+        last_point_assoc = obs_assoc;
+
+        appendMatchDropEvent(g_data.step, iter, prev_match_count,
+                             static_cast<int>(obs_matches.size()), 0,
+                             static_cast<int>(obs_matches.size()));
+        prev_match_count = static_cast<int>(obs_matches.size());
+        logRegMatchFunnel(g_data.step, iter, obs_funnel, false);
+
+        if ((int)obs_matches.size() < 5) {
+            ROS_WARN("Obs iter %d: only %d obs matches, skip", iter, (int)obs_matches.size());
+            break;
+        }
+
+        delta_scale = solvePose(obs_matches, "obs");
+        std::cout << "  iter " << iter << ": obs=" << obs_matches.size()
+                  << " delta=" << delta_scale << std::endl;
     }
 
     if (param.dump_frame > 0 && g_data.step == param.dump_frame) {
@@ -1770,6 +1912,27 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         if (ec) {
             std::cerr << "  [Dump] failed to create dir: " << base << " (" << ec.message() << ")\n";
         } else {
+            // 用最终位姿再跑一遍地面 + 障碍关联，保证 dump 与配准候选集一致
+            std::vector<RegMatch> dump_gnd, dump_obs;
+            RegMatchFunnel dump_gnd_funnel{}, dump_obs_funnel{};
+            std::unordered_map<int, RegPointAssoc> dump_assoc;
+            runGroundAssoc(T_curr, dump_gnd, dump_gnd_funnel, dump_assoc);
+            runObsAssoc(T_curr, dump_obs, dump_obs_funnel, dump_assoc);
+            last_point_assoc = std::move(dump_assoc);
+            // 合并漏斗用于日志
+            RegMatchFunnel dump_funnel = dump_gnd_funnel;
+            dump_funnel.obs_cand_px    = dump_obs_funnel.obs_cand_px;
+            dump_funnel.obs_surf_px    = dump_obs_funnel.obs_surf_px;
+            dump_funnel.obs_no_surf_px = dump_obs_funnel.obs_no_surf_px;
+            dump_funnel.obs_pairs      = dump_obs_funnel.obs_pairs;
+            dump_funnel.obs_fp_ok      = dump_obs_funnel.obs_fp_ok;
+            dump_funnel.obs_dist_fail  = dump_obs_funnel.obs_dist_fail;
+            dump_funnel.obs_ceres      = dump_obs_funnel.obs_ceres;
+            std::vector<RegMatch> dump_matches;
+            dump_matches.insert(dump_matches.end(), dump_gnd.begin(), dump_gnd.end());
+            dump_matches.insert(dump_matches.end(), dump_obs.begin(), dump_obs.end());
+            logRegMatchFunnel(g_data.step, -1, dump_funnel, true);
+
             const Eigen::Matrix3d R = T_curr.block<3, 3>(0, 0);
             const Eigen::Vector3d t = T_curr.block<3, 1>(0, 3);
 
@@ -1782,34 +1945,57 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             }
             f_scan.close();
 
-            std::ofstream f_matched(base + "/matched.txt", std::ios::out | std::ios::trunc);
-            f_matched << std::fixed << std::setprecision(6);
-            for (const auto& m : last_matches)
-                f_matched << m.p_world.x() << " " << m.p_world.y() << " " << m.p_world.z() << "\n";
-            f_matched.close();
-
-            std::unordered_set<int> matched_set;
-            for (const auto& m : last_matches) matched_set.insert(m.scan_idx);
-
-            int n_unmatched = 0;
-            std::ofstream f_unmatched(base + "/unmatched.txt", std::ios::out | std::ios::trunc);
-            f_unmatched << std::fixed << std::setprecision(6);
-            for (int i = 0; i < (int)scan_local.size(); i += skip_points) {
-                const double z = scan_local[i].z;
-                const bool is_gnd = (z >= ground_z_min && z <= ground_z_max);
-                const bool is_obs = (z >= match_min_z);
-                if (!is_gnd && !is_obs) continue;
-                if (matched_set.count(i)) continue;
-                const Eigen::Vector3d p_w = R * Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) + t;
-                f_unmatched << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
-                ++n_unmatched;
+            std::ofstream f_gnd(base + "/scan_gnd.txt", std::ios::out | std::ios::trunc);
+            std::ofstream f_obs(base + "/scan_obs.txt", std::ios::out | std::ios::trunc);
+            f_gnd << std::fixed << std::setprecision(6);
+            f_obs << std::fixed << std::setprecision(6);
+            for (const auto& [idx, a] : last_point_assoc) {
+                if (a.is_gnd_cand)
+                    f_gnd << a.p_world.x() << " " << a.p_world.y() << " " << a.p_world.z() << "\n";
+                if (a.is_obs_cand)
+                    f_obs << a.p_world.x() << " " << a.p_world.y() << " " << a.p_world.z() << "\n";
             }
+            f_gnd.close();
+            f_obs.close();
+
+            int n_matched_pts = 0, n_unmatched_pts = 0;
+            int n_no_surf = 0, n_fp_fail = 0, n_dist_fail = 0;
+            std::ofstream f_matched(base + "/matched.txt", std::ios::out | std::ios::trunc);
+            std::ofstream f_unmatched(base + "/unmatched.txt", std::ios::out | std::ios::trunc);
+            std::ofstream f_dist(base + "/match_dist.txt", std::ios::out | std::ios::trunc);
+            f_matched << std::fixed << std::setprecision(6);
+            f_unmatched << std::fixed << std::setprecision(6);
+            f_dist << std::fixed << std::setprecision(6);
+            f_dist << "# x y z dist status  (status: 0=no_surf 1=fp_fail 2=dist>thr 3=matched)\n";
+
+            for (const auto& [idx, a] : last_point_assoc) {
+                f_dist << a.p_world.x() << " " << a.p_world.y() << " " << a.p_world.z()
+                       << " " << a.best_dist << " " << static_cast<int>(a.status) << "\n";
+                if (a.status == RegAssocStatus::Matched) {
+                    f_matched << a.p_world.x() << " " << a.p_world.y() << " " << a.p_world.z() << "\n";
+                    ++n_matched_pts;
+                } else {
+                    f_unmatched << a.p_world.x() << " " << a.p_world.y() << " " << a.p_world.z() << "\n";
+                    ++n_unmatched_pts;
+                    if (a.status == RegAssocStatus::NoSurface) ++n_no_surf;
+                    else if (a.status == RegAssocStatus::FootprintFail) ++n_fp_fail;
+                    else if (a.status == RegAssocStatus::DistTooLarge) ++n_dist_fail;
+                }
+            }
+            f_matched.close();
             f_unmatched.close();
+            f_dist.close();
 
             std::cout << "  [Dump] step=" << g_data.step
-                      << " matched=" << last_matches.size()
-                      << " unmatched=" << n_unmatched
-                      << " -> " << base << "/{matched,unmatched,scan_world}.txt" << std::endl;
+                      << " candidates=" << last_point_assoc.size()
+                      << " matched_pts=" << n_matched_pts
+                      << " unmatched_pts=" << n_unmatched_pts
+                      << " (no_surf=" << n_no_surf
+                      << " fp_fail=" << n_fp_fail
+                      << " d>thr=" << n_dist_fail << ")"
+                      << " ceres_residuals=" << dump_matches.size()
+                      << " -> " << base
+                      << "/{matched,unmatched,match_dist,scan_gnd,scan_obs}.txt" << std::endl;
         }
     }
     return T_curr;
@@ -1972,9 +2158,6 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
             if (profile_frame1_apply)
                 BSplineSurface::setApplyProfileLabel("gnd");
             n_added_gnd = ground_grid.refitCells(touched, param.num_thread);
-            // 定期清除远离车辆的旧格
-            Eigen::Vector3d veh_pos = T_world.block<3,1>(0,3);
-            ground_grid.removeDistant(veh_pos, param.ground_clear_dist);
         }
     }
 
