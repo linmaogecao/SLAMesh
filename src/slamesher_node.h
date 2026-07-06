@@ -188,6 +188,21 @@ public:
     SLAMesher(ros::NodeHandle & nh_, Parameter & param_, Log & g_data_);
     void process();
 
+    struct MatchQualityStats {
+        int n = 0;
+        double mean_dist = 0, std_dist = 0, max_dist = 0;
+        double mean_dz = 0, p25_dz = 0, p75_dz = 0;
+    };
+
+    struct RegFrameDiag {
+        MatchQualityStats gnd;
+        MatchQualityStats obs;
+        double delta_gnd = 0;
+        double delta_obs_iter0 = 0;
+        double delta_obs_final = 0;
+        bool valid = false;
+    };
+
 private:
     struct RegMatch {
         Eigen::Vector3d p_local;
@@ -196,6 +211,9 @@ private:
         int scan_idx  = -1;
         bool is_ground = false;
     };
+
+    static MatchQualityStats computeGndMatchQuality(const std::vector<RegMatch>& ms);
+    static MatchQualityStats computeObsMatchQuality(const std::vector<RegMatch>& ms);
 
     // 第 1 帧：初始化位姿并建图
     void processFirstFrame(Transf& T_world);
@@ -213,7 +231,8 @@ private:
                              double ground_z_max,
                              const RangeImageProcessor& rp_near,
                              const RangeImageProcessor& rp_far,
-                             bool use_far);
+                             bool use_far,
+                             RegFrameDiag* diag_out = nullptr);
 
     // 统一建图：近/远两层 range image 分割 → z 分流地面/障碍 → 按各自 interval 决定是否建图
     void runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,

@@ -72,13 +72,16 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <fstream>
 #include <iomanip>
 #include <algorithm>
+#include <sstream>
+#include <unordered_map>
 #include <omp.h>
 Parameter param;//parameters
 Log g_data;//global variables
 static ConsoleLogTee g_console_log_tee;
 
-namespace {
 constexpr const char* kBsplineBuildDir = "/home/albus/slam-math/Bspline/build";
+
+namespace {
 constexpr double kMatchDropRatioThr = 0.70;
 constexpr int kMatchDropAbsThr = 150;
 
@@ -158,6 +161,251 @@ void appendMatchDropEvent(int step,
               << " obs=" << n_obs << std::endl;
 }
 
+Transf kittiVelo2CamExtrinsic()
+{
+    Transf T_velo2cam = Eigen::Matrix4d::Identity();
+    if (param.seq == "/00" || param.seq == "/01" || param.seq == "/02" || param.seq == "/13" ||
+        param.seq == "/14" || param.seq == "/15" || param.seq == "/16" || param.seq == "/17" ||
+        param.seq == "/18" || param.seq == "/19" || param.seq == "/20" || param.seq == "/21") {
+        T_velo2cam << 4.276802385584e-04, -9.999672484946e-01, -8.084491683471e-03, -1.198459927713e-02,
+                      -7.210626507497e-03, 8.081198471645e-03, -9.999413164504e-01, -5.403984729748e-02,
+                      9.999738645903e-01, 4.859485810390e-04, -7.206933692422e-03, -2.921968648686e-01,
+                      0.0, 0.0, 0.0, 1.0;
+    } else if (param.seq == "/03") {
+        T_velo2cam << 2.347736981471e-04, -9.999441545438e-01, -1.056347781105e-02, -2.796816941295e-03,
+                      1.044940741659e-02, 1.056535364138e-02, -9.998895741176e-01, -7.510879138296e-02,
+                      9.999453885620e-01, 1.243653783865e-04, 1.045130299567e-02, -2.721327964059e-01,
+                      0.0, 0.0, 0.0, 1.0;
+    } else if (param.seq == "/04" || param.seq == "/05" || param.seq == "/06" || param.seq == "/07" ||
+               param.seq == "/08" || param.seq == "/09" || param.seq == "/10" || param.seq == "/11" ||
+               param.seq == "/12") {
+        T_velo2cam << -1.857739385241e-03, -9.999659513510e-01, -8.039975204516e-03, -4.784029760483e-03,
+                      -6.481465826011e-03, 8.051860151134e-03, -9.999466081774e-01, -7.337429464231e-02,
+                      9.999773098287e-01, -1.805528627661e-03, -6.496203536139e-03, -3.339968064433e-01,
+                      0.0, 0.0, 0.0, 1.0;
+    }
+    return T_velo2cam;
+}
+
+double poseDeltaNorm(const Transf& T_from, const Transf& T_to)
+{
+    const Transf dT = T_from.inverse() * T_to;
+    return dT.block<3, 1>(0, 3).norm() +
+           5.0 * (dT.block<3, 3>(0, 0) - Eigen::Matrix3d::Identity()).norm();
+}
+
+void poseAlignedError(const Transf& T_gt, const Transf& T_pred,
+                      Transf& T_gt_align_ref, Transf& T_pred_align_ref,
+                      bool& align_init,
+                      double& ape_t, double& ape_r,
+                      double& err_tx, double& err_ty, double& err_tz)
+{
+    if (!align_init) {
+        T_gt_align_ref = T_gt;
+        T_pred_align_ref = T_pred;
+        align_init = true;
+    }
+    const Transf T_gt_rel = T_gt_align_ref.inverse() * T_gt;
+    const Transf T_pred_rel = T_pred_align_ref.inverse() * T_pred;
+    const Transf T_err = T_gt_rel.inverse() * T_pred_rel;
+    const Eigen::Vector3d et = T_err.block<3, 1>(0, 3);
+    err_tx = et.x();
+    err_ty = et.y();
+    err_tz = et.z();
+    ape_t = et.norm();
+    const Eigen::Matrix3d R_err = T_err.block<3, 3>(0, 0);
+    ape_r = Eigen::AngleAxisd(R_err).angle();
+}
+
+bool loadKittiGtPoseCam(int frame_idx, Transf& T_cam_out)
+{
+    if (param.dataset != 1) return false;
+    const std::filesystem::path poses_dir =
+        std::filesystem::path(param.file_loc_dataset).parent_path() / "poses";
+    const std::string pose_path = (poses_dir / (seqIdFromParam(param.seq) + ".txt")).string();
+    std::ifstream fin(pose_path);
+    if (!fin) return false;
+    std::string line;
+    for (int i = 0; i <= frame_idx; ++i) {
+        if (!std::getline(fin, line)) return false;
+    }
+    std::istringstream iss(line);
+    T_cam_out = Eigen::Matrix4d::Identity();
+    for (int r = 0; r < 3; ++r)
+        for (int c = 0; c < 4; ++c)
+            if (!(iss >> T_cam_out(r, c))) return false;
+    return true;
+}
+
+bool getGtPoseVelo(int step, Transf& T_gt_velo_out)
+{
+    const int frame_idx = step - 1;
+    if (frame_idx < 0) return false;
+    if (param.odom_available && param.read_offline_pcd &&
+        frame_idx < static_cast<int>(g_data.odom_offline.size())) {
+        T_gt_velo_out = state2quat2trans3(g_data.odom_offline[frame_idx]);
+        return true;
+    }
+    Transf T_cam;
+    if (!loadKittiGtPoseCam(frame_idx, T_cam)) return false;
+    const Transf T_velo2cam = kittiVelo2CamExtrinsic();
+    T_gt_velo_out = T_velo2cam.inverse() * T_cam * T_velo2cam;
+    return true;
+}
+
+std::ofstream& diagLogFile(const char* filename, const char* header)
+{
+    static std::unordered_map<std::string, std::ofstream> files;
+    static std::unordered_map<std::string, bool> header_written;
+    const std::string key(filename);
+    auto it = files.find(key);
+    if (it == files.end()) {
+        std::error_code ec;
+        std::filesystem::create_directories(kBsplineBuildDir, ec);
+        std::ofstream f(std::string(kBsplineBuildDir) + "/" + filename,
+                        std::ios::out | std::ios::trunc);
+        it = files.emplace(key, std::move(f)).first;
+        header_written[key] = false;
+    }
+    if (it->second.is_open() && !header_written[key]) {
+        it->second << header << "\n";
+        it->second << std::fixed << std::setprecision(6);
+        header_written[key] = true;
+    }
+    return it->second;
+}
+
+void logPerFrameDiagnostics(int step,
+                            const Transf& T_world,
+                            const Transf& T_guess,
+                            const SLAMesher::RegFrameDiag* reg_diag,
+                            double delta_guess_vs_last)
+{
+    static Transf T_gt_align_ref = Eigen::Matrix4d::Identity();
+    static Transf T_pred_align_ref = Eigen::Matrix4d::Identity();
+    static bool align_init = false;
+    static double prev_ape_t = 0;
+    static bool prev_ape_valid = false;
+
+    const auto& gnd = reg_diag ? reg_diag->gnd : SLAMesher::MatchQualityStats{};
+    const auto& obs = reg_diag ? reg_diag->obs : SLAMesher::MatchQualityStats{};
+    const double delta_gnd = reg_diag ? reg_diag->delta_gnd : 0;
+    const double delta_obs_iter0 = reg_diag ? reg_diag->delta_obs_iter0 : 0;
+    const double delta_obs_final = reg_diag ? reg_diag->delta_obs_final : 0;
+
+    auto& f_gnd = diagLogFile("per_frame_gnd_quality.txt",
+        "# step n_gnd mean_dist std_dist max_dist mean_dz p25_dz p75_dz");
+    f_gnd << step << " " << gnd.n << " " << gnd.mean_dist << " " << gnd.std_dist << " "
+          << gnd.max_dist << " " << gnd.mean_dz << " " << gnd.p25_dz << " " << gnd.p75_dz << "\n";
+    f_gnd.flush();
+
+    auto& f_obs = diagLogFile("per_frame_obs_quality.txt",
+        "# step n_obs mean_dist std_dist max_dist delta_obs_final");
+    f_obs << step << " " << obs.n << " " << obs.mean_dist << " " << obs.std_dist << " "
+          << obs.max_dist << " " << delta_obs_final << "\n";
+    f_obs.flush();
+
+    auto& f_stage = diagLogFile("per_frame_stage_delta.txt",
+        "# step delta_gnd delta_obs_iter0 delta_obs_final");
+    f_stage << step << " " << delta_gnd << " " << delta_obs_iter0 << " " << delta_obs_final << "\n";
+    f_stage.flush();
+
+    auto& f_zbias = diagLogFile("per_frame_gnd_z_bias.txt",
+        "# step mean_dz p25_dz p75_dz");
+    f_zbias << step << " " << gnd.mean_dz << " " << gnd.p25_dz << " " << gnd.p75_dz << "\n";
+    f_zbias.flush();
+
+    auto& f_guess = diagLogFile("per_frame_guess_quality.txt",
+        "# step delta_guess_vs_last delta_gnd delta_obs_final");
+    f_guess << step << " " << delta_guess_vs_last << " " << delta_gnd << " "
+            << delta_obs_final << "\n";
+    f_guess.flush();
+
+    auto& f_debug = diagLogFile("per_frame_debug.txt",
+        "# step n_gnd mean_gnd_dist mean_gnd_dz n_obs mean_obs_dist delta_gnd delta_obs_final");
+    f_debug << step << " " << gnd.n << " " << gnd.mean_dist << " " << gnd.mean_dz << " "
+            << obs.n << " " << obs.mean_dist << " " << delta_gnd << " " << delta_obs_final << "\n";
+    f_debug.flush();
+
+    Transf T_gt_velo;
+    if (!getGtPoseVelo(step, T_gt_velo)) return;
+
+    double ape_t = 0, ape_r = 0, err_tx = 0, err_ty = 0, err_tz = 0;
+    poseAlignedError(T_gt_velo, T_world, T_gt_align_ref, T_pred_align_ref, align_init,
+                     ape_t, ape_r, err_tx, err_ty, err_tz);
+    const double delta_ape_t = prev_ape_valid ? (ape_t - prev_ape_t) : 0;
+    prev_ape_t = ape_t;
+    prev_ape_valid = true;
+
+    Eigen::Quaterniond q_pred(T_world.block<3, 3>(0, 0));
+    auto& f_ape = diagLogFile("per_frame_ape.txt",
+        "# step tx ty tz qx qy qz qw ape_t ape_r err_tx err_ty err_tz delta_ape_t");
+    f_ape << step << " "
+          << T_world(0, 3) << " " << T_world(1, 3) << " " << T_world(2, 3) << " "
+          << q_pred.x() << " " << q_pred.y() << " " << q_pred.z() << " " << q_pred.w() << " "
+          << ape_t << " " << ape_r << " "
+          << err_tx << " " << err_ty << " " << err_tz << " "
+          << delta_ape_t << "\n";
+    f_ape.flush();
+}
+
+}  // namespace
+
+SLAMesher::MatchQualityStats SLAMesher::computeGndMatchQuality(const std::vector<RegMatch>& ms)
+{
+    MatchQualityStats q;
+    std::vector<double> dists, dzs;
+    dists.reserve(ms.size());
+    dzs.reserve(ms.size());
+    for (const auto& m : ms) {
+        if (!m.is_ground) continue;
+        const double d_n = std::abs((m.p_world - m.curvature.point).dot(m.curvature.normal));
+        dists.push_back(d_n);
+        dzs.push_back(m.p_world.z() - m.curvature.point.z());
+    }
+    q.n = static_cast<int>(dists.size());
+    if (q.n == 0) return q;
+    double sum = 0, sum2 = 0, sum_dz = 0;
+    q.max_dist = 0;
+    for (int i = 0; i < q.n; ++i) {
+        sum += dists[i];
+        sum2 += dists[i] * dists[i];
+        q.max_dist = std::max(q.max_dist, dists[i]);
+        sum_dz += dzs[i];
+    }
+    q.mean_dist = sum / q.n;
+    q.std_dist = std::sqrt(std::max(0.0, sum2 / q.n - q.mean_dist * q.mean_dist));
+    q.mean_dz = sum_dz / q.n;
+    std::sort(dzs.begin(), dzs.end());
+    q.p25_dz = dzs[std::max(0, q.n / 4 - 1)];
+    q.p75_dz = dzs[std::min(q.n - 1, (q.n * 3) / 4)];
+    return q;
+}
+
+SLAMesher::MatchQualityStats SLAMesher::computeObsMatchQuality(const std::vector<RegMatch>& ms)
+{
+    MatchQualityStats q;
+    std::vector<double> dists;
+    dists.reserve(ms.size());
+    for (const auto& m : ms) {
+        if (m.is_ground) continue;
+        const double d_n = std::abs((m.p_world - m.curvature.point).dot(m.curvature.normal));
+        dists.push_back(d_n);
+    }
+    q.n = static_cast<int>(dists.size());
+    if (q.n == 0) return q;
+    double sum = 0, sum2 = 0;
+    q.max_dist = 0;
+    for (double d : dists) {
+        sum += d;
+        sum2 += d * d;
+        q.max_dist = std::max(q.max_dist, d);
+    }
+    q.mean_dist = sum / q.n;
+    q.std_dist = std::sqrt(std::max(0.0, sum2 / q.n - q.mean_dist * q.mean_dist));
+    return q;
+}
+
 // 配准关联诊断：点到曲面的真实状态（与 Ceres 残差条数无关）
 enum class RegAssocStatus : int {
     NoSurface = 0,      // 关联阶段未找到任何曲面
@@ -181,6 +429,7 @@ struct RegMatchFunnel {
     int gnd_fp_ok = 0;
     int gnd_dist_fail = 0;
     int gnd_ceres = 0;
+    double gnd_mean_dist = -1;
     int obs_cand_px = 0;
     int obs_surf_px = 0;
     int obs_no_surf_px = 0;
@@ -188,6 +437,7 @@ struct RegMatchFunnel {
     int obs_fp_ok = 0;
     int obs_dist_fail = 0;
     int obs_ceres = 0;
+    double obs_mean_dist = -1;
 };
 
 void applyFootprintToAssoc(RegPointAssoc& a,
@@ -222,27 +472,28 @@ void logRegMatchFunnel(int step, int iter, const RegMatchFunnel& f, bool snapsho
     }
     if (fout.is_open() && !header_written) {
         fout << "# step iter"
-             << " gnd_cand gnd_surf gnd_fp_ok gnd_dist_fail gnd_ceres"
+             << " gnd_cand gnd_surf gnd_fp_ok gnd_dist_fail gnd_ceres gnd_mean_dist"
              << " obs_cand_px obs_surf_px obs_no_surf_px"
-             << " obs_pairs obs_fp_ok obs_dist_fail obs_ceres\n";
+             << " obs_pairs obs_fp_ok obs_dist_fail obs_ceres obs_mean_dist\n";
         header_written = true;
     }
     if (fout.is_open()) {
         fout << step << " " << iter << " "
              << f.gnd_cand << " " << f.gnd_surf << " " << f.gnd_fp_ok << " "
-             << f.gnd_dist_fail << " " << f.gnd_ceres << " "
+             << f.gnd_dist_fail << " " << f.gnd_ceres << " " << f.gnd_mean_dist << " "
              << f.obs_cand_px << " " << f.obs_surf_px << " " << f.obs_no_surf_px << " "
              << f.obs_pairs << " " << f.obs_fp_ok << " " << f.obs_dist_fail << " "
-             << f.obs_ceres << "\n";
+             << f.obs_ceres << " " << f.obs_mean_dist << "\n";
         fout.flush();
     }
 
     std::cout << "  [MatchFunnel] step=" << step << " iter=" << iter
               << " gnd " << f.gnd_cand << "->" << f.gnd_surf << "->"
               << f.gnd_fp_ok << "->" << f.gnd_ceres
+              << " md=" << f.gnd_mean_dist
               << " | obs_px " << f.obs_cand_px << "->" << f.obs_surf_px
               << " | pairs " << f.obs_pairs << "->" << f.obs_fp_ok << "->"
-              << f.obs_ceres << std::endl;
+              << f.obs_ceres << " md=" << f.obs_mean_dist << std::endl;
 
     if (snapshot_step) {
         const std::string snap = std::string(kBsplineBuildDir) + "/reg_match_funnel_step"
@@ -694,7 +945,6 @@ int saveRangeImagePointsTxt(const RangeImageProcessor& range_proc,
     }
     return n;
 }
-}  // namespace
 
 Log::Log(){
     log_length =  param.max_steps;
@@ -1578,8 +1828,10 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                                     double ground_z_max,
                                     const RangeImageProcessor& rp_near,
                                     const RangeImageProcessor& rp_far,
-                                    bool use_far)
+                                    bool use_far,
+                                    RegFrameDiag* diag_out)
 {
+    const Transf T_guess_in = T_guess;
     Transf T_curr = T_guess;
     double delta_scale = 100.0;
     int prev_match_count = -1;
@@ -1858,13 +2110,17 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
     // ─────────────────────────────────────────────────────────────────────────
     // 阶段 1：地面点 → 地面曲面关联 → Ceres（1 次）→ T_gnd
     // ─────────────────────────────────────────────────────────────────────────
+    std::vector<RegMatch> gnd_matches_final;
+    Transf T_after_gnd = T_curr;
     {
         std::vector<RegMatch> gnd_matches;
         RegMatchFunnel gnd_funnel{};
         std::unordered_map<int, RegPointAssoc> gnd_assoc;
         runGroundAssoc(T_curr, gnd_matches, gnd_funnel, gnd_assoc);
+        gnd_funnel.gnd_mean_dist = computeGndMatchQuality(gnd_matches).mean_dist;
         logRegMatchFunnel(g_data.step, -2, gnd_funnel, false);
         last_point_assoc = gnd_assoc;
+        gnd_matches_final = gnd_matches;
 
         std::cout << "  [gnd-assoc] cand=" << gnd_funnel.gnd_cand
                   << " surf=" << gnd_funnel.gnd_surf
@@ -1876,18 +2132,23 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         } else {
             std::cout << "  [gnd] skip, too few matches=" << gnd_matches.size() << std::endl;
         }
+        T_after_gnd = T_curr;
     }
 
     // ─────────────────────────────────────────────────────────────────────────
     // 阶段 2：障碍点（用 T_gnd 投世界）→ 障碍曲面关联 → Ceres × max_iters
     // ─────────────────────────────────────────────────────────────────────────
+    std::vector<RegMatch> obs_matches_final;
+    double delta_obs_iter0 = 0;
     delta_scale = 100.0;
     for (int iter = 0; iter < max_iters && delta_scale > converge_thr; iter++) {
         std::vector<RegMatch> obs_matches;
         RegMatchFunnel obs_funnel{};
         std::unordered_map<int, RegPointAssoc> obs_assoc = last_point_assoc;
         runObsAssoc(T_curr, obs_matches, obs_funnel, obs_assoc);
+        obs_funnel.obs_mean_dist = computeObsMatchQuality(obs_matches).mean_dist;
         last_point_assoc = obs_assoc;
+        obs_matches_final = obs_matches;
 
         appendMatchDropEvent(g_data.step, iter, prev_match_count,
                              static_cast<int>(obs_matches.size()), 0,
@@ -1901,8 +2162,19 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         }
 
         delta_scale = solvePose(obs_matches, "obs");
+        if (iter == 0)
+            delta_obs_iter0 = poseDeltaNorm(T_after_gnd, T_curr);
         std::cout << "  iter " << iter << ": obs=" << obs_matches.size()
                   << " delta=" << delta_scale << std::endl;
+    }
+
+    if (diag_out) {
+        diag_out->valid = true;
+        diag_out->gnd = computeGndMatchQuality(gnd_matches_final);
+        diag_out->obs = computeObsMatchQuality(obs_matches_final);
+        diag_out->delta_gnd = poseDeltaNorm(T_guess_in, T_after_gnd);
+        diag_out->delta_obs_iter0 = delta_obs_iter0;
+        diag_out->delta_obs_final = poseDeltaNorm(T_after_gnd, T_curr);
     }
 
     if (param.dump_frame > 0 && g_data.step == param.dump_frame) {
@@ -2579,11 +2851,14 @@ void SLAMesher::process(){
         if(g_data.step == 1){
             processFirstFrame(T_world);
             runMapBuild(scan_local, T_world, range_proc, range_proc_far, bspline_map, ground_grid, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
+            logPerFrameDiagnostics(g_data.step, T_world, T_world, nullptr, 0.0);
             continue;
         }
 
         TicToc t_register;
         Transf T_guess = getOdom();
+        const double delta_guess_vs_last = (g_data.step >= 2)
+            ? poseDeltaNorm(g_data.T_seq[g_data.step - 1], T_guess) : 0.0;
 
         // 为配准生成 range image（近/远层），与 runMapBuild 同参数
         {
@@ -2597,13 +2872,16 @@ void SLAMesher::process(){
                                                   split, 1e9, far_z_floor);
         }
 
+        RegFrameDiag reg_diag;
         T_world = registerScanToMap(scan_local, T_guess, bspline_map, ground_grid,
                                     max_rg_iters, converge_thr, match_dist_thr, skip_points,
                                     GROUND_Z_MIN, GROUND_Z_MIN, GROUND_Z_MAX,
-                                    range_proc, range_proc_far, (param.range_image_split > 0.0));
+                                    range_proc, range_proc_far, (param.range_image_split > 0.0),
+                                    &reg_diag);
 
         g_data.updatePose(T_world);
         pubTf();
+        logPerFrameDiagnostics(g_data.step, T_world, T_guess, &reg_diag, delta_guess_vs_last);
 
         std::cout << "  Registration: " << t_register.toc() << " ms | Pose: "
                   << T_world(0,3) << " " << T_world(1,3) << " " << T_world(2,3) << std::endl;
