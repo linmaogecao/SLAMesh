@@ -30,9 +30,18 @@ public:
     double range_image_split{30.0};      // 近/远层分界距离（米）；0=禁用远层
     double range_image_far_z_floor_offset{20.0}; // 远层 z_floor = ground_z_min - offset（建图/配准/审计统一）
     int    range_image_far_min_cluster{20}; // 远层 cluster 最小点数（可比近层宽松）
-    // 障碍配准采样（range image 模式）
-    int    obs_rimg_col_step{3};           // range image 列方向采样间隔（1=全取，3=每3列取1）
-    int    obs_match_per_surf_max{50};     // 每个障碍曲面最多保留的匹配点数（0=不限）
+    // 障碍配准：range-image 聚类 → 体素提名 → 几何中位距离选最近曲面
+    int    obs_rimg_col_step{3};           // 旧均匀采样列间隔（保留兼容；簇模式下不用）
+    int    obs_match_per_surf_max{80};     // 每个障碍曲面最多保留的匹配点数（0=不限；多簇绑同一面时再限流）
+    int    obs_cluster_min_pts{30};        // 配准聚类最小点数
+    int    obs_cluster_vote_samples{60};   // 每簇几何打分采样点数
+    int    obs_cluster_query_radius{1};    // 体素候选半径（只提名）
+    int    obs_cluster_top_k{6};           // 已弃用（保留读参；不再按票数截断）
+    double obs_cluster_score_dist{0.50};   // 选面 inlier 距离门限（m）
+    double obs_cluster_select_dist_max{0.80}; // 中位距离超过则整簇不绑
+    int    obs_cluster_match_max_pts{80};  // 每簇绑定后最多保留点数
+    bool   obs_cluster_skip_flat{true};    // |法向z|>0.85 的水平簇不参与障碍匹配
+    double obs_cluster_vote_ratio_min{0.0}; // 已弃用（保留读参）
     // XY 栅格地面地图
     double ground_cell_size{6.0};     // 每格 XY 边长（米）
     int    ground_cell_min_pts{80};   // 格内点数达此值才拟合曲面
@@ -211,8 +220,8 @@ private:
                              double match_min_z,
                              double ground_z_min,
                              double ground_z_max,
-                             const RangeImageProcessor& rp_near,
-                             const RangeImageProcessor& rp_far,
+                             RangeImageProcessor& rp_near,
+                             RangeImageProcessor& rp_far,
                              bool use_far);
 
     // 统一建图：近/远两层 range image 分割 → z 分流地面/障碍 → 按各自 interval 决定是否建图
