@@ -52,6 +52,22 @@ public:
     int    ground_fit_max_pts{150};   // 每格 BSpline 拟合最多用点数
     int    ground_skip_points{40};    // 地面配准采样间隔
     double ground_clear_dist{150.0};  // 超过此距离（米）的旧格被清除
+    // 雷达系地面点：配准用 +x≤roi_x、-x≤roi_x_rear、|y|≤roi_y；z 下界 z_min，上界随 r=hypot(x,y) 分段
+    double ground_z_min{-3.0};
+    double ground_z_max{-1.5};       // r < ground_z_r_near
+    double ground_z_max_mid{-1.0};   // ground_z_r_near ≤ r < ground_z_r_mid
+    double ground_z_max_far{-0.5};   // r ≥ ground_z_r_mid（至 r_far）
+    double ground_z_r_near{10.0};
+    double ground_z_r_mid{20.0};
+    double ground_z_r_far{40.0};
+    double ground_roi_x{40.0};        // 前方 +x 上限（米）
+    double ground_roi_x_rear{10.0};   // 后方 -x 上限绝对值（配准用；建图仍可用 ground_roi_x）
+    double ground_roi_y{20.0};        // 左右 |y|
+
+    GroundZSchedule groundZSchedule() const {
+        return GroundZSchedule{ground_z_min, ground_z_max, ground_z_max_mid, ground_z_max_far,
+                               ground_z_r_near, ground_z_r_mid, ground_z_r_far};
+    }
 
     double correction_x{0}, correction_y{0}, correction_z{0},
     correction_roll_degree{0}, correction_pitch_degree{0}, correction_yaw_degree{0};
@@ -237,6 +253,7 @@ private:
 
     void printMapSummary(const BSplineMap& bspline_map) const;
     void saveGroundGridZ(const GroundGridMap& ground_grid) const;
+    void saveAllGndSurfacesToTxt(const GroundGridMap& ground_grid) const;
     void saveControlPointsToTxt(const BSplineMap& bspline_map,
                                 bool save_surface_samples,
                                 int step_begin = 0,

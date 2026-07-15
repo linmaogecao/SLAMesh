@@ -14,8 +14,9 @@
 //   4. 调用 refitDirty() 对所有 needs_refit 格重新拟合 BSpline
 //
 // 配准查询：
-//   给定世界系点 p，取 (ix,iy) 及其 ±radius 格内所有有效曲面作为候选。
-//   只查当前 step 附近的格（滑动窗口）。
+//   给定世界系点 p，优先按 XY 取本格曲面（querySurfaceAtXY）。
+//   queryNearestSurface / querySurfaces 保留邻格搜索，仅作兼容。
+// 只查当前 step 附近的格（滑动窗口）。
 //
 #pragma once
 
@@ -165,7 +166,15 @@ public:
         return n_fit;
     }
 
-    // 配准：在候选曲面中取 footprint 距离最近的一张
+    // 配准：按 XY 取本格曲面（无则 nullptr）；不做邻格 3D 最近竞优
+    const BSplineSurface* querySurfaceAtXY(const Eigen::Vector3d& p) const
+    {
+        auto it = cells_.find(toCellKey(p.x(), p.y()));
+        if (it == cells_.end() || !it->second.surf) return nullptr;
+        return it->second.surf.get();
+    }
+
+    // 配准：在候选曲面中取 footprint 距离最近的一张（邻格兜底，仅调试/兼容）
     const BSplineSurface* queryNearestSurface(const Eigen::Vector3d& p) const
     {
         const BSplineSurface* best = nullptr;

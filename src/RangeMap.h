@@ -9,6 +9,7 @@
 #include <fstream>
 #include <vector>
 #include <string>
+#include <cmath>
 #include <sys/stat.h>
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
@@ -28,6 +29,40 @@ struct RangePixel {
     std::pair<double, double> curvature;
     bool is_visted = false;
 };
+
+// 雷达系地面点：随水平距 r=hypot(x,y) 分段 z 上界
+struct GroundZSchedule {
+    double z_min{-3.0};
+    double z_max_near{-1.5};  // r < r_near
+    double z_max_mid{-1.0};   // r_near ≤ r < r_mid
+    double z_max_far{-0.5};   // r_mid ≤ r < r_far（及以外）
+    double r_near{10.0};
+    double r_mid{20.0};
+    double r_far{40.0};
+};
+
+inline double lidarGroundZMaxAtXY(double x, double y, const GroundZSchedule& s)
+{
+    const double r = std::hypot(x, y);
+    if (r < s.r_near) return s.z_max_near;
+    if (r < s.r_mid)  return s.z_max_mid;
+    if (r < s.r_far)  return s.z_max_far;
+    return s.z_max_far;
+}
+
+// 雷达系地面点：高度带（随距离放宽上界）+ 前后/左右 ROI
+// x_fwd_max: +x 上限；x_rear_max: -x 上限的绝对值（<0 时与 x_fwd_max 相同）
+inline bool isLidarGroundPoint(double x, double y, double z,
+                               const GroundZSchedule& s,
+                               double x_fwd_max, double y_abs_max,
+                               double x_rear_max = -1.0)
+{
+    const double rear = (x_rear_max >= 0.0) ? x_rear_max : x_fwd_max;
+    if (std::abs(y) > y_abs_max) return false;
+    if (x > x_fwd_max || x < -rear) return false;
+    const double z_max_eff = lidarGroundZMaxAtXY(x, y, s);
+    return z >= s.z_min && z <= z_max_eff;
+}
 
 struct SegmentationResult {
     std::vector<int> label_map;             // 全图标签
@@ -100,7 +135,8 @@ public:
     // -----------------------------------------------------------------
     // 2. 核心函数: PointCloud -> RangeImage
     // -----------------------------------------------------------------
-    // exclude_ground_band=true 时，z∈[ground_z_min,ground_z_max] 的点不投影进 range image
+    // exclude_ground_band=true 时，雷达系地面 ROI 点不投影进 range image
+    // （地面 ROI = z∈[z_min,z_max] 且 -roi_x_rear≤x≤roi_x、|y|≤roi_y，见 param；建图可对称）
     // layer_range_min/max：只投影 range∈[layer_range_min, layer_range_max) 的点（默认全范围）
     // z_floor：低于此值的点不进 range image（默认 MIN_Z=-2.5；传 -1e9 表示不做高度下限过滤）
     void generateRangeImage(const pcl::PointCloud<pcl::PointXYZ>& cloud,
@@ -128,7 +164,7 @@ public:
         return nv;
     }
 
-    // exclude_ground_band=true 时，z∈[ground_z_min,ground_z_max] 的像素不参与 BFS 聚类（仅障碍聚类）
+    // exclude_ground_band=true 时，地面 ROI 像素不参与 BFS 聚类（仅障碍聚类）
     SegmentationResult segmentRangeImage(double theta_deg, double max_dist, int min_cluster_size,
                                          double ground_z_min = -1e9, double ground_z_max = 1e9,
                                          bool exclude_ground_band = false);

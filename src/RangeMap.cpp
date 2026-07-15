@@ -40,7 +40,10 @@ void RangeImageProcessor::generateRangeImage(const pcl::PointCloud<pcl::PointXYZ
         const auto& pt = cloud.points[i];
         if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
             continue;
-        if (exclude_ground_band && pt.z >= ground_z_min && pt.z <= ground_z_max)
+        if (exclude_ground_band &&
+            isLidarGroundPoint(pt.x, pt.y, pt.z,
+                               param.groundZSchedule(),
+                               param.ground_roi_x, param.ground_roi_y))
             continue;
         double range = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
         if (range < eff_range_min || range > eff_range_max || pt.z < z_floor) {
@@ -122,7 +125,9 @@ SegmentationResult RangeImageProcessor::segmentRangeImage(double theta_deg, doub
     //const double normal_cos_thresh = std::cos(normal_angle_deg * M_PI / 180.0);
 
     auto isGroundPixel = [&](const RangePixel& px) {
-        return px.z >= ground_z_min && px.z <= ground_z_max;
+        return isLidarGroundPoint(px.x, px.y, px.z,
+                                  param.groundZSchedule(),
+                                  param.ground_roi_x, param.ground_roi_y);
     };
 
     // ---------- 1. 标记有效像素（可选排除地面高度带） ----------

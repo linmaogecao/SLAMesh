@@ -202,6 +202,58 @@ inline Transf makePoseFromZRP(double roll, double pitch, double z,
     return T;
 }
 
+// KITTI calib：雷达 pose → 左相机系（与 savePath2TxtKitti / 官方评估一致）
+inline Transf kittiVeloToCam(const std::string& seq)
+{
+    Transf T = Eigen::Matrix4d::Identity();
+    if (seq == "/00" || seq == "/01" || seq == "/02" || seq == "/13" || seq == "/14" ||
+        seq == "/15" || seq == "/16" || seq == "/17" || seq == "/18" || seq == "/19" ||
+        seq == "/20" || seq == "/21") {
+        T << 4.276802385584e-04, -9.999672484946e-01, -8.084491683471e-03, -1.198459927713e-02,
+            -7.210626507497e-03,  8.081198471645e-03, -9.999413164504e-01, -5.403984729748e-02,
+             9.999738645903e-01,  4.859485810390e-04, -7.206933692422e-03, -2.921968648686e-01,
+             0.0, 0.0, 0.0, 1.0;
+    } else if (seq == "/03") {
+        T << 2.347736981471e-04, -9.999441545438e-01, -1.056347781105e-02, -2.796816941295e-03,
+             1.044940741659e-02,  1.056535364138e-02, -9.998895741176e-01, -7.510879138296e-02,
+             9.999453885620e-01,  1.243653783865e-04,  1.045130299567e-02, -2.721327964059e-01,
+             0.0, 0.0, 0.0, 1.0;
+    } else {
+        // /04-/12 等
+        T << -1.857739385241e-03, -9.999659513510e-01, -8.039975204516e-03, -4.784029760483e-03,
+             -6.481465826011e-03,  8.051860151134e-03, -9.999466081774e-01, -7.337429464231e-02,
+              9.999773098287e-01, -1.805528627661e-03, -6.496203536139e-03, -3.339968064433e-01,
+              0.0, 0.0, 0.0, 1.0;
+    }
+    return T;
+}
+
+inline Transf poseVeloToCamera(const Transf& T_velo, const Transf& T_velo2cam)
+{
+    return T_velo2cam * T_velo * T_velo2cam.inverse();
+}
+
+// 与 KITTI_odometry_evaluation_tool evaluation.py plot_rpy 相同：euler_from_matrix(..., axes='szxy')
+// 返回 (roll, pitch, yaw)；高度取相机系 Y（下为正）
+inline void camPoseRpyHeight(const Transf& T_cam,
+                             double& roll, double& pitch, double& yaw, double& y_cam)
+{
+    const Eigen::Matrix3d& M = T_cam.block<3, 3>(0, 0);
+    // szxy: firstaxis=z=2, parity=0, repetition=0 → i=2,j=0,k=1
+    constexpr int i = 2, j = 0, k = 1;
+    const double cy = std::sqrt(M(i, i) * M(i, i) + M(j, i) * M(j, i));
+    if (cy > 1e-12) {
+        roll  = std::atan2( M(k, j),  M(k, k));
+        pitch = std::atan2(-M(k, i),  cy);
+        yaw   = std::atan2( M(j, i),  M(i, i));
+    } else {
+        roll  = std::atan2(-M(j, k), M(j, j));
+        pitch = std::atan2(-M(k, i), cy);
+        yaw   = 0.0;
+    }
+    y_cam = T_cam(1, 3);
+}
+
 // 地面阶段：只优化 [roll, pitch, z]；x/y/yaw 固定（地面不可观）
 struct GroundPointToPlaneZRP {
     GroundPointToPlaneZRP(const Eigen::Vector3d& p_local,
@@ -854,7 +906,7 @@ void Log::pose_print(ros::Publisher & cloud_pub) const{//ok
 void Log::savePath2TxtKitti(std::ofstream & file_out, nav_msgs::Path & path_msg){
     //write kitti format pose txt file, from path_msg, before write, transform to the camera frame using provided extrinsic
     if(file_out){
-        for(int i = 1; i<= step; i++){
+        for(int i = 1; i< step; i++){
             Transf T_rectified;
             Transf T_velo2cam = Eigen::Matrix4d::Identity();
             if(param.seq == "/00" || param.seq == "/01" || param.seq == "/02" || param.seq == "/13" || param.seq == "/14" ||
@@ -1151,6 +1203,16 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/ground_fit_max_pts",     ground_fit_max_pts,     150);
     nh.param("slamesher/ground_skip_points",  ground_skip_points,  40);
     nh.param("slamesher/ground_clear_dist",   ground_clear_dist,   150.0);
+    nh.param("slamesher/ground_z_min",        ground_z_min,        -3.0);
+    nh.param("slamesher/ground_z_max",        ground_z_max,        -1.5);
+    nh.param("slamesher/ground_z_max_mid",    ground_z_max_mid,    -1.0);
+    nh.param("slamesher/ground_z_max_far",    ground_z_max_far,    -0.5);
+    nh.param("slamesher/ground_z_r_near",     ground_z_r_near,     10.0);
+    nh.param("slamesher/ground_z_r_mid",      ground_z_r_mid,      20.0);
+    nh.param("slamesher/ground_z_r_far",      ground_z_r_far,      40.0);
+    nh.param("slamesher/ground_roi_x",        ground_roi_x,        40.0);
+    nh.param("slamesher/ground_roi_x_rear",   ground_roi_x_rear,   10.0);
+    nh.param("slamesher/ground_roi_y",        ground_roi_y,        20.0);
     nh.param("slamesher/bootstrap_step2_tx", bootstrap_step2_tx, 0.5);
     nh.param("slamesher/bootstrap_step2_ty", bootstrap_step2_ty, 0.0);
     nh.param("slamesher/bootstrap_step2_tz", bootstrap_step2_tz, 0.0);
@@ -1179,6 +1241,12 @@ void Parameter::initParameter(ros::NodeHandle & nh){
               << " fit_max=" << ground_fit_max_pts
               << " reg_skip=" << ground_skip_points
               << " clear_dist=" << ground_clear_dist << "m" << std::endl;
+    std::cout << "ground_roi (lidar): z_min=" << ground_z_min
+              << " z_max(r): r<" << ground_z_r_near << "->" << ground_z_max
+              << " r<" << ground_z_r_mid << "->" << ground_z_max_mid
+              << " r<" << ground_z_r_far << "->" << ground_z_max_far
+              << " +x<=" << ground_roi_x << " -x<=" << ground_roi_x_rear
+              << " |y|<=" << ground_roi_y << std::endl;
     std::cout << "bootstrap_step2 (velo m): [" << bootstrap_step2_tx << ", "
               << bootstrap_step2_ty << ", " << bootstrap_step2_tz << "]" << std::endl;
     nh.param("slamesher/cross_overlap", cross_overlap, false);
@@ -1571,7 +1639,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
     std::unordered_map<const BSplineSurface*, std::vector<int>> gnd_prev_indices;
     std::unordered_map<const BSplineSurface*, std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>>> gnd_prev_uv;
 
-    // 点进 Ceres 的距离门限：地面阶段用传入值；障碍阶段随 iter 收紧
+    // 点进 Ceres 的距离门限：地面/障碍均随迭代收紧（初值差→点-面距离可能偏大）
     double active_match_dist = match_dist_thr;
     auto obsMatchDistForIter = [&](int it) -> double {
         constexpr double kEnd = 0.2;
@@ -1583,6 +1651,12 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         }
         const double t = static_cast<double>(it) / static_cast<double>(max_iters - 1);
         return match_dist_thr + t * (kEnd - match_dist_thr);
+    };
+    // 地面：本格关联，门限先松后紧（运动估计初值差时 footprint 可 > match_dist_thr）
+    constexpr int kGndIters = 3;
+    auto gndMatchDistForIter = [&](int it) -> double {
+        static constexpr double kSched[3] = {2.0, 0.8, 0.4};
+        return kSched[std::min(std::max(it, 0), kGndIters - 1)];
     };
 
     // 配准前：range image 聚类（与建图同参；只做一次，迭代中复用）
@@ -1661,9 +1735,12 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
     };
 
     // 地面匹配 lambda：使用 GroundGridMap 查询，key 为 BSplineSurface 指针
+    // 可选diag：记录每个关联点结果 pass / fail_d / fail_normal，以及 footprint 距离
     auto buildGroundMatches = [&](
             const std::unordered_map<const BSplineSurface*, std::vector<int>>& surf_to_pts,
-            std::vector<RegMatch>& out) {
+            std::vector<RegMatch>& out,
+            std::unordered_map<int, int>* diag_status,
+            std::unordered_map<int, double>* diag_d) {
         for (auto& [surf_ptr, indices] : surf_to_pts) {
             if (!surf_ptr) continue;
             const auto& knU  = surf_ptr->getKnotsU();
@@ -1694,13 +1771,22 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             gnd_prev_uv[surf_ptr] = footprints;
 
             for (int k = 0; k < (int)indices.size(); k++) {
+                const int sid = indices[k];
                 double d = std::sqrt(std::abs(dists[k]));
-                if (d > active_match_dist || d < 1e-6) continue;
+                if (diag_d) (*diag_d)[sid] = d;
+                if (d > active_match_dist || d < 1e-6) {
+                    if (diag_status) (*diag_status)[sid] = 1;  // fail_d
+                    continue;
+                }
                 auto [paraU, paraV] = footprints[k];
                 SurfaceCurvature curv = const_cast<BSplineSurface*>(surf_ptr)
                     ->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
-                if (curv.normal.norm() < 1e-9) continue;
+                if (curv.normal.norm() < 1e-9) {
+                    if (diag_status) (*diag_status)[sid] = 2;  // fail_normal
+                    continue;
+                }
                 curv.normal.normalize();
+                if (diag_status) (*diag_status)[sid] = 0;  // pass
 
                 RegMatch m;
                 m.p_local   = Eigen::Vector3d(scan_local[indices[k]].x,
@@ -1715,6 +1801,113 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         }
     };
 
+    // 雷达系 +X 前方距离漏斗：z带宽 / 地面ROI / 匹配成败（按 0-5 / 5-10 / 10-20 / 20-40 m）
+    auto logGndLidarXFunnel = [&](
+            int giter,
+            double thr,
+            const std::unordered_map<const BSplineSurface*, std::vector<int>>& surf_to_pts,
+            const std::unordered_map<int, int>& diag_status,
+            const std::unordered_map<int, double>& /*diag_d*/,
+            const std::unordered_set<int>& no_surf_ids) {
+        constexpr int kNB = 4;
+        const double edges[kNB + 1] = {0.0, 5.0, 10.0, 20.0, 40.0};
+        struct Bin {
+            int xy_any_z = 0;   // |y|ok 且 x 在桶内（不加 z 条件）
+            int z_in = 0;       // z∈[zmin,zmax]
+            int z_hi = 0;       // z > zmax（出带偏高）
+            int z_lo = 0;       // z < zmin（出带偏低）
+            int samp_roi = 0;   // 配准采样且过地面ROI
+            int no_surf = 0;
+            int fail_d = 0;
+            int fail_n = 0;
+            int pass = 0;
+        };
+        Bin bins[kNB]{};
+        auto binOf = [&](double x) -> int {
+            if (x < edges[0] || x >= edges[kNB]) return -1;
+            for (int i = 0; i < kNB; ++i)
+                if (x < edges[i + 1]) return i;
+            return -1;
+        };
+
+        // 全点云：前方各桶内 z 是否在地面带（随距离放宽上界；无 skip）
+        for (int i = 0; i < (int)scan_local.size(); ++i) {
+            const double lx = scan_local[i].x, ly = scan_local[i].y, lz = scan_local[i].z;
+            if (std::abs(ly) > param.ground_roi_y) continue;
+            if (lx <= 0.0 || lx > param.ground_roi_x) continue;
+            const int bi = binOf(lx);
+            if (bi < 0) continue;
+            bins[bi].xy_any_z++;
+            const double z_hi_thr = lidarGroundZMaxAtXY(lx, ly, param.groundZSchedule());
+            if (lz > z_hi_thr) bins[bi].z_hi++;
+            else if (lz < ground_z_min) bins[bi].z_lo++;
+            else bins[bi].z_in++;
+        }
+
+        // 配准采样：ROI + 关联/距离结果
+        const int gnd_skip = param.ground_skip_points > 0 ? param.ground_skip_points : skip_points;
+        for (int i = 0; i < (int)scan_local.size(); i += gnd_skip) {
+            const double lx = scan_local[i].x, ly = scan_local[i].y, lz = scan_local[i].z;
+            if (!isLidarGroundPoint(lx, ly, lz, param.groundZSchedule(),
+                                    param.ground_roi_x, param.ground_roi_y,
+                                    param.ground_roi_x_rear))
+                continue;
+            if (lx <= 0.0) continue;  // 只统计前方
+            const int bi = binOf(lx);
+            if (bi < 0) continue;
+            bins[bi].samp_roi++;
+            if (no_surf_ids.count(i)) {
+                bins[bi].no_surf++;
+                continue;
+            }
+            auto it = diag_status.find(i);
+            if (it == diag_status.end()) continue;
+            if (it->second == 0) bins[bi].pass++;
+            else if (it->second == 1) bins[bi].fail_d++;
+            else bins[bi].fail_n++;
+        }
+        (void)surf_to_pts;
+
+        static std::ofstream fun;
+        if (!fun.is_open()) {
+            fun.open(std::string(kBsplineBuildDir) + "/gnd_lidar_x_funnel.txt",
+                     std::ios::out | std::ios::trunc);
+            fun << "# lidar +X forward funnel (ground ROI: |y|<=roi_y, 0<x<=roi_x)\n"
+                << "# z_min=" << param.ground_z_min
+                << " z_max(r): r<" << param.ground_z_r_near << "->" << param.ground_z_max
+                << " r<" << param.ground_z_r_mid << "->" << param.ground_z_max_mid
+                << " r<" << param.ground_z_r_far << "->" << param.ground_z_max_far
+                << " (hypot xy)\n"
+                << "# step giter thr  x0 x1  xy_any_z z_in z_hi z_lo"
+                << "  samp_roi no_surf fail_d fail_n pass\n";
+            fun << std::fixed << std::setprecision(3);
+        }
+        std::cout << "  [gnd-x] step=" << g_data.step << " giter=" << giter
+                  << " thr=" << thr
+                  << "  (radar +X forward; z_sched near/mid/far="
+                  << param.ground_z_max << "/" << param.ground_z_max_mid << "/"
+                  << param.ground_z_max_far << ")\n";
+        for (int i = 0; i < kNB; ++i) {
+            const auto& b = bins[i];
+            fun << g_data.step << " " << giter << " " << thr << " "
+                << edges[i] << " " << edges[i + 1] << " "
+                << b.xy_any_z << " " << b.z_in << " " << b.z_hi << " " << b.z_lo << " "
+                << b.samp_roi << " " << b.no_surf << " " << b.fail_d << " "
+                << b.fail_n << " " << b.pass << "\n";
+            std::cout << "    x=[" << edges[i] << "," << edges[i + 1] << ")m"
+                      << "  xy=" << b.xy_any_z
+                      << " z_in=" << b.z_in
+                      << " z_hi(>" << ground_z_max << ")=" << b.z_hi
+                      << " z_lo(<" << ground_z_min << ")=" << b.z_lo
+                      << " | samp_roi=" << b.samp_roi
+                      << " no_surf=" << b.no_surf
+                      << " fail_d=" << b.fail_d
+                      << " fail_n=" << b.fail_n
+                      << " pass=" << b.pass << "\n";
+        }
+        fun.flush();
+    };
+
     // ══════════════════════════════════════════════════════════════════════
     // 阶段 1：仅地面，只优化 z / roll / pitch；x,y,yaw 锁在 T_guess
     // ══════════════════════════════════════════════════════════════════════
@@ -1726,24 +1919,34 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         (void)roll0;
         (void)pitch0;
 
-        constexpr int kGndIters = 2;
         constexpr int kGndMinMatches = 10;
         for (int giter = 0; giter < kGndIters; ++giter) {
+            active_match_dist = gndMatchDistForIter(giter);
             std::unordered_map<const BSplineSurface*, std::vector<int>> gnd_surf_to_pts;
+            std::unordered_set<int> no_surf_ids;
             const int gnd_skip = param.ground_skip_points > 0 ? param.ground_skip_points : skip_points;
             for (int i = 0; i < (int)scan_local.size(); i += gnd_skip) {
                 const double lx = scan_local[i].x, ly = scan_local[i].y, lz = scan_local[i].z;
-                if (lz < ground_z_min || lz > ground_z_max) continue;
+                if (!isLidarGroundPoint(lx, ly, lz, param.groundZSchedule(),
+                                        param.ground_roi_x, param.ground_roi_y,
+                                        param.ground_roi_x_rear))
+                    continue;
                 Eigen::Vector3d p_w = T_curr.block<3, 3>(0, 0) *
                     Eigen::Vector3d(lx, ly, lz) + T_curr.block<3, 1>(0, 3);
-                const BSplineSurface* sp = ground_grid.queryNearestSurface(p_w);
+                const BSplineSurface* sp = ground_grid.querySurfaceAtXY(p_w);
                 if (sp) gnd_surf_to_pts[sp].push_back(i);
+                else no_surf_ids.insert(i);
             }
 
             std::vector<RegMatch> gnd_matches;
-            buildGroundMatches(gnd_surf_to_pts, gnd_matches);
+            std::unordered_map<int, int> diag_status;
+            std::unordered_map<int, double> diag_d;
+            buildGroundMatches(gnd_surf_to_pts, gnd_matches, &diag_status, &diag_d);
+            logGndLidarXFunnel(giter, active_match_dist, gnd_surf_to_pts,
+                               diag_status, diag_d, no_surf_ids);
             if ((int)gnd_matches.size() < kGndMinMatches) {
                 std::cout << "  [gnd] giter=" << giter
+                          << " thr=" << active_match_dist
                           << " skip, matches=" << gnd_matches.size() << std::endl;
                 break;
             }
@@ -1807,6 +2010,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             const double dz = std::abs(T_curr(2, 3) - T_before(2, 3));
             const double dR = (T_curr.block<3, 3>(0, 0) - T_before.block<3, 3>(0, 0)).norm();
             std::cout << "  [gnd] giter=" << giter
+                      << " thr=" << active_match_dist
                       << " matches=" << gnd_matches.size()
                       << " roll=" << rpy_z[0] << " pitch=" << rpy_z[1]
                       << " z=" << rpy_z[2]
@@ -1814,6 +2018,16 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                       << " dR=" << dR << " dz=" << dz << std::endl;
         }
     }
+
+    // 阶段快照（相机系，与 KITTI 评估 rpy 图同约定 szxy；高度=cam Y）
+    const Transf T_velo2cam = kittiVeloToCam(param.seq);
+    auto snapCam = [&](const Transf& T_velo, double& roll, double& pitch, double& y) {
+        double yaw = 0;
+        camPoseRpyHeight(poseVeloToCamera(T_velo, T_velo2cam), roll, pitch, yaw, y);
+        (void)yaw;
+    };
+    double roll_g = 0, pitch_g = 0, y_g = 0;
+    snapCam(T_curr, roll_g, pitch_g, y_g);
 
     // ══════════════════════════════════════════════════════════════════════
     // 阶段 2：仅障碍，完整 6-DOF（不再混入地面残差）
@@ -2154,6 +2368,20 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                   << " delta=" << delta_scale << std::endl;
     }
 
+    double roll_o = 0, pitch_o = 0, y_o = 0;
+    snapCam(T_curr, roll_o, pitch_o, y_o);
+    const double d_roll_obs = roll_o - roll_g;
+    const double d_pitch_obs = pitch_o - pitch_g;
+    const double d_y_obs = y_o - y_g;
+    std::cout << std::fixed << std::setprecision(6)
+              << "  [stage-delta cam] after_obs vs after_gnd:"
+              << " d_roll=" << d_roll_obs
+              << " d_pitch=" << d_pitch_obs
+              << " d_y=" << d_y_obs
+              << " | roll " << roll_g << "->" << roll_o
+              << " pitch " << pitch_g << "->" << pitch_o
+              << " y " << y_g << "->" << y_o << std::endl;
+
     // 阶段 3：障碍更新了 xy/yaw 后，再在固定 xy/yaw 下精修 z/roll/pitch
     // （禁止把旧 yaw 下的 roll/pitch 与新 yaw 欧拉硬拼）
     {
@@ -2162,19 +2390,40 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         double roll_i = 0, pitch_i = 0, yaw_fix = 0;
         matrixToRPY(T_curr.block<3, 3>(0, 0), roll_i, pitch_i, yaw_fix);
 
-        std::unordered_map<const BSplineSurface*, std::vector<int>> gnd_surf_to_pts;
+        constexpr int kGndRefineIters = 2;
+        auto gndRefineMatchDist = [](int it) -> double {
+            static constexpr double kSched[2] = {0.8, 0.4};
+            return kSched[std::min(std::max(it, 0), 1)];
+        };
         const int gnd_skip = param.ground_skip_points > 0 ? param.ground_skip_points : skip_points;
-        for (int i = 0; i < (int)scan_local.size(); i += gnd_skip) {
-            const double lx = scan_local[i].x, ly = scan_local[i].y, lz = scan_local[i].z;
-            if (lz < ground_z_min || lz > ground_z_max) continue;
-            Eigen::Vector3d p_w = T_curr.block<3, 3>(0, 0) *
-                Eigen::Vector3d(lx, ly, lz) + T_curr.block<3, 1>(0, 3);
-            const BSplineSurface* sp = ground_grid.queryNearestSurface(p_w);
-            if (sp) gnd_surf_to_pts[sp].push_back(i);
-        }
-        std::vector<RegMatch> gnd_matches;
-        buildGroundMatches(gnd_surf_to_pts, gnd_matches);
-        if ((int)gnd_matches.size() >= 10) {
+        for (int riter = 0; riter < kGndRefineIters; ++riter) {
+            active_match_dist = gndRefineMatchDist(riter);
+            std::unordered_map<const BSplineSurface*, std::vector<int>> gnd_surf_to_pts;
+            std::unordered_set<int> no_surf_ids;
+            for (int i = 0; i < (int)scan_local.size(); i += gnd_skip) {
+                const double lx = scan_local[i].x, ly = scan_local[i].y, lz = scan_local[i].z;
+                if (!isLidarGroundPoint(lx, ly, lz, param.groundZSchedule(),
+                                        param.ground_roi_x, param.ground_roi_y,
+                                        param.ground_roi_x_rear))
+                    continue;
+                Eigen::Vector3d p_w = T_curr.block<3, 3>(0, 0) *
+                    Eigen::Vector3d(lx, ly, lz) + T_curr.block<3, 1>(0, 3);
+                const BSplineSurface* sp = ground_grid.querySurfaceAtXY(p_w);
+                if (sp) gnd_surf_to_pts[sp].push_back(i);
+                else no_surf_ids.insert(i);
+            }
+            std::vector<RegMatch> gnd_matches;
+            std::unordered_map<int, int> diag_status;
+            std::unordered_map<int, double> diag_d;
+            buildGroundMatches(gnd_surf_to_pts, gnd_matches, &diag_status, &diag_d);
+            logGndLidarXFunnel(1000 + riter, active_match_dist, gnd_surf_to_pts,
+                               diag_status, diag_d, no_surf_ids);
+            if ((int)gnd_matches.size() < 10) {
+                std::cout << "  [gnd-refine] riter=" << riter
+                          << " thr=" << active_match_dist
+                          << " skip, matches=" << gnd_matches.size() << std::endl;
+                break;
+            }
             double rpy_z[3] = {roll_i, pitch_i, T_curr(2, 3)};
             ceres::Problem problem;
             ceres::LossFunction* loss = new ceres::HuberLoss(0.5);
@@ -2193,13 +2442,52 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             ceres::Solver::Summary summary;
             ceres::Solve(opts, &problem, &summary);
             T_curr = makePoseFromZRP(rpy_z[0], rpy_z[1], rpy_z[2], x_fix, y_fix, yaw_fix);
-            std::cout << "  [gnd-refine] matches=" << gnd_matches.size()
+            roll_i = rpy_z[0];
+            pitch_i = rpy_z[1];
+            std::cout << "  [gnd-refine] riter=" << riter
+                      << " thr=" << active_match_dist
+                      << " matches=" << gnd_matches.size()
                       << " roll=" << rpy_z[0] << " pitch=" << rpy_z[1]
                       << " z=" << rpy_z[2]
                       << " (xy/yaw from obs)" << std::endl;
-        } else {
-            std::cout << "  [gnd-refine] skip, matches=" << gnd_matches.size() << std::endl;
         }
+    }
+
+    {
+        double roll_f = 0, pitch_f = 0, y_f = 0;
+        snapCam(T_curr, roll_f, pitch_f, y_f);
+        const double d_roll_ref = roll_f - roll_o;
+        const double d_pitch_ref = pitch_f - pitch_o;
+        const double d_y_ref = y_f - y_o;
+
+        static std::ofstream stage_file;
+        if (!stage_file.is_open()) {
+            stage_file.open(std::string(kBsplineBuildDir) + "/pose_stage_delta.txt",
+                            std::ios::out | std::ios::trunc);
+            stage_file << std::fixed << std::setprecision(6);
+            stage_file << "# camera frame (T_vc*T*T_vc^{-1}); rpy = euler szxy same as KITTI eval plot_rpy; y = cam Y (down+)\n"
+                       << "# step"
+                       << "  roll_g pitch_g y_g"
+                       << "  roll_o pitch_o y_o"
+                       << "  d_roll_obs d_pitch_obs d_y_obs"
+                       << "  roll_f pitch_f y_f"
+                       << "  d_roll_ref d_pitch_ref d_y_ref\n";
+        }
+        if (stage_file.is_open()) {
+            stage_file << g_data.step
+                       << "  " << roll_g << " " << pitch_g << " " << y_g
+                       << "  " << roll_o << " " << pitch_o << " " << y_o
+                       << "  " << d_roll_obs << " " << d_pitch_obs << " " << d_y_obs
+                       << "  " << roll_f << " " << pitch_f << " " << y_f
+                       << "  " << d_roll_ref << " " << d_pitch_ref << " " << d_y_ref
+                       << "\n";
+            stage_file.flush();
+        }
+        std::cout << std::fixed << std::setprecision(6)
+                  << "  [stage-delta cam] after_refine vs after_obs:"
+                  << " d_roll=" << d_roll_ref
+                  << " d_pitch=" << d_pitch_ref
+                  << " d_y=" << d_y_ref << std::endl;
     }
 
     if (param.dump_frame > 0 && g_data.step == param.dump_frame) {
@@ -2214,12 +2502,22 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
             std::ofstream f_scan(base + "/scan_world.txt", std::ios::out | std::ios::trunc);
             f_scan << std::fixed << std::setprecision(6);
+            std::ofstream f_gnd(base + "/scan_gnd.txt", std::ios::out | std::ios::trunc);
+            f_gnd << std::fixed << std::setprecision(6);
+            int n_gnd_dump = 0;
             for (const auto& pt : scan_local.points) {
-                if (pt.z >= ground_z_min && pt.z <= ground_z_max) continue;
                 const Eigen::Vector3d p_w = R * Eigen::Vector3d(pt.x, pt.y, pt.z) + t;
-                f_scan << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+                if (isLidarGroundPoint(pt.x, pt.y, pt.z, param.groundZSchedule(),
+                                       param.ground_roi_x, param.ground_roi_y,
+                                       param.ground_roi_x_rear)) {
+                    f_gnd << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+                    ++n_gnd_dump;
+                } else {
+                    f_scan << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+                }
             }
             f_scan.close();
+            f_gnd.close();
 
             std::ofstream f_matched(base + "/matched.txt", std::ios::out | std::ios::trunc);
             f_matched << std::fixed << std::setprecision(6);
@@ -2234,12 +2532,14 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             std::ofstream f_unmatched(base + "/unmatched.txt", std::ios::out | std::ios::trunc);
             f_unmatched << std::fixed << std::setprecision(6);
             for (int i = 0; i < (int)scan_local.size(); i += skip_points) {
-                const double z = scan_local[i].z;
-                const bool is_gnd = (z >= ground_z_min && z <= ground_z_max);
-                const bool is_obs = (z >= match_min_z);
+                const auto& p = scan_local[i];
+                const bool is_gnd = isLidarGroundPoint(p.x, p.y, p.z, param.groundZSchedule(),
+                                                      param.ground_roi_x, param.ground_roi_y,
+                                                      param.ground_roi_x_rear);
+                const bool is_obs = (p.z >= match_min_z);
                 if (!is_gnd && !is_obs) continue;
                 if (matched_set.count(i)) continue;
-                const Eigen::Vector3d p_w = R * Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) + t;
+                const Eigen::Vector3d p_w = R * Eigen::Vector3d(p.x, p.y, p.z) + t;
                 f_unmatched << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
                 ++n_unmatched;
             }
@@ -2248,7 +2548,8 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             std::cout << "  [Dump] step=" << g_data.step
                       << " matched=" << last_matches.size()
                       << " unmatched=" << n_unmatched
-                      << " -> " << base << "/{matched,unmatched,scan_world}.txt" << std::endl;
+                      << " scan_gnd=" << n_gnd_dump
+                      << " -> " << base << "/{matched,unmatched,scan_world,scan_gnd}.txt" << std::endl;
         }
     }
     return T_curr;
@@ -2282,15 +2583,15 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
         saveClusterFilterStatsTxt(scan_local, g_data.step, ground_z_min, ground_z_max,
                                   split_dist, range_proc, range_proc_far);
     }
-    // range image 不再提前删地面带：地面链已由 z 带直接选点，障碍链需保留低矮障碍
-    // z_floor = ground_z_min：允许与地面带下沿齐平的低矮障碍进入 range image
-    range_proc.generateRangeImage(scan_local, ground_z_min, ground_z_max, false,
+    // range image 用「非地面 ROI」剩余点；地面 ROI 单独建图/配准
+    // z_floor = ground_z_min：去掉更低的噪声点
+    range_proc.generateRangeImage(scan_local, ground_z_min, ground_z_max, true,
                                   0.0, use_far_layer ? split_dist : 1e9, ground_z_min);
 
     // 远层：range ∈ [range_image_split, MAX_RANGE]，z_floor 低于近层
     const double far_z_floor = farLayerZFloor(ground_z_min);
     if (use_far_layer)
-        range_proc_far.generateRangeImage(scan_local, ground_z_min, ground_z_max, false,
+        range_proc_far.generateRangeImage(scan_local, ground_z_min, ground_z_max, true,
                                           split_dist, 1e9, far_z_floor);
 
     if (dump_occluded) {
@@ -2342,7 +2643,7 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
         }
     }
 
-    // exclude_ground_band=false：地面链已独立走 z 带选点，障碍链不再预删地面
+    // generate 已剔除地面 ROI；近层 segment 再兜底排除残余地面 ROI 像素
     SegmentationResult seg = range_proc.segmentRangeImage(
         5, 0.1, MIN_CLUSTER_PTS, ground_z_min, ground_z_max, true);
     range_proc.downsampleClusters(
@@ -2386,15 +2687,55 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                   << kBsplineBuildDir << "/frame1_apply_profile.txt" << std::endl;
     }
 
-    // ── 地面分支：雷达系按 z 高度带直接筛点，不经过 range image ──
+    // ── 地面分支：雷达系地面 ROI 直接筛点建图，不进 range image ──
     if (do_ground) {
         pcl::PointCloud<pcl::PointXYZ> cloud_gnd_world;
         std::vector<Eigen::Vector3d> gnd_lidar_pts;
         gnd_lidar_pts.reserve(scan_local.size() / 16);
         const int gnd_map_skip = std::max(1, param.ground_map_skip_points);
+
+        // 诊断：仅 dump_frame 指定帧导出雷达系 gnd_self / out_self
+        if (param.dump_frame > 0 && g_data.step == param.dump_frame) {
+            std::ofstream f_gnd(std::string(kBsplineBuildDir) + "/gnd_self.txt",
+                                std::ios::out | std::ios::trunc);
+            std::ofstream f_out(std::string(kBsplineBuildDir) + "/out_self.txt",
+                                std::ios::out | std::ios::trunc);
+            f_gnd << std::fixed << std::setprecision(6);
+            f_out << std::fixed << std::setprecision(6);
+            int n_gnd = 0, n_out = 0;
+            const GroundZSchedule z_sched = param.groundZSchedule();
+            for (const auto& pt : scan_local.points) {
+                if (std::abs(pt.x) > param.ground_roi_x ||
+                    std::abs(pt.y) > param.ground_roi_y)
+                    continue;
+                const double z_hi = lidarGroundZMaxAtXY(pt.x, pt.y, z_sched);
+                if (pt.z >= z_sched.z_min && pt.z <= z_hi) {
+                    f_gnd << pt.x << " " << pt.y << " " << pt.z << "\n";
+                    ++n_gnd;
+                } else {
+                    f_out << pt.x << " " << pt.y << " " << pt.z << "\n";
+                    ++n_out;
+                }
+            }
+            std::cout << "  [gnd-self] dump_frame=" << param.dump_frame
+                      << " step=" << g_data.step
+                      << " lidar |x|<=" << param.ground_roi_x
+                      << " |y|<=" << param.ground_roi_y
+                      << " z_min=" << z_sched.z_min
+                      << " z_max(r)<" << z_sched.r_near << ":" << z_sched.z_max_near
+                      << " <" << z_sched.r_mid << ":" << z_sched.z_max_mid
+                      << " <" << z_sched.r_far << ":" << z_sched.z_max_far
+                      << " gnd_self=" << n_gnd
+                      << " out_self=" << n_out
+                      << " -> " << kBsplineBuildDir
+                      << "/gnd_self.txt , out_self.txt" << std::endl;
+        }
+
         for (int i = 0; i < (int)scan_local.size(); i += gnd_map_skip) {
             const auto& pt = scan_local.points[i];
-            if (pt.z < ground_z_min || pt.z > ground_z_max) continue;
+            if (!isLidarGroundPoint(pt.x, pt.y, pt.z, param.groundZSchedule(),
+                                    param.ground_roi_x, param.ground_roi_y))
+                continue;
             gnd_lidar_pts.emplace_back(pt.x, pt.y, pt.z);
             Eigen::Vector3d pw = R_w * Eigen::Vector3d(pt.x, pt.y, pt.z) + t_w;
             cloud_gnd_world.push_back(pcl::PointXYZ(
@@ -2635,6 +2976,56 @@ void SLAMesher::saveGroundGridZ(const GroundGridMap& ground_grid) const
     }
 }
 
+void SLAMesher::saveAllGndSurfacesToTxt(const GroundGridMap& ground_grid) const
+{
+    const std::string out_path = std::string(kBsplineBuildDir) + "/all_gnd_surfaces.txt";
+    std::ofstream fout(out_path, std::ios::out | std::ios::trunc);
+    if (!fout.is_open()) {
+        std::cerr << "Failed to open: " << out_path << std::endl;
+        return;
+    }
+    fout << std::fixed << std::setprecision(6);
+
+    constexpr int kSampleGridU = 8;
+    constexpr int kSampleGridV = 8;
+    auto findSpan = [](double t, const std::vector<double>& knots, int num_cp) {
+        if (t >= 1.0 - 1e-9) return num_cp - 1;
+        for (int k = 3; k < num_cp; ++k)
+            if (knots[k] <= t && t < knots[k + 1]) return k;
+        return 3;
+    };
+
+    int n_surf = 0;
+    int n_pts = 0;
+    for (const auto& [key, cell] : ground_grid.cells()) {
+        (void)key;
+        if (!cell.surf) continue;
+        BSplineSurface& surf = *const_cast<BSplineSurface*>(cell.surf.get());
+        const auto& knU = surf.getKnotsU();
+        const auto& knV = surf.getKnotsV();
+        const auto& cps = surf.getControls();
+        const int num_cpv = surf.getNumCpV();
+        const int num_cpu = surf.getNumCpU();
+        if (cps.empty() || num_cpu < 4 || num_cpv < 4) continue;
+
+        ++n_surf;
+        for (int iu = 0; iu < kSampleGridU; ++iu) {
+            const double u = (kSampleGridU > 1) ? double(iu) / double(kSampleGridU - 1) : 0.0;
+            const BSplineSurface::Parameter paraU(findSpan(u, knU, num_cpu), u);
+            for (int iv = 0; iv < kSampleGridV; ++iv) {
+                const double v = (kSampleGridV > 1) ? double(iv) / double(kSampleGridV - 1) : 0.0;
+                const BSplineSurface::Parameter paraV(findSpan(v, knV, num_cpv), v);
+                const Eigen::Vector3d p = surf.getPos(paraU, paraV, knU, knV, cps, num_cpv);
+                fout << p.x() << " " << p.y() << " " << p.z() << "\n";
+                ++n_pts;
+            }
+        }
+    }
+    fout.close();
+    std::cout << "Ground surface samples: " << n_surf << " surfaces, "
+              << n_pts << " points -> " << out_path << std::endl;
+}
+
 void SLAMesher::saveControlPointsToTxt(const BSplineMap& bspline_map,
                                        bool save_surface_samples,
                                        int step_begin,
@@ -2812,9 +3203,9 @@ void SLAMesher::process(){
         traj_file << std::fixed << std::setprecision(6);
     }
 
-    // buildGroundMap 用：传感器系下地面点 z 范围
-    const double GROUND_Z_MIN    = -3.0;
-    const double GROUND_Z_MAX    = -1.5;
+    // buildGroundMap / 配准：雷达系地面 ROI（z 带 + xy 盒）
+    const double GROUND_Z_MIN = param.ground_z_min;
+    const double GROUND_Z_MAX = param.ground_z_max;
     while(nh.ok()){
         g_data.step++;
         if (param.max_frames > 0 && g_data.step > param.max_frames) {
@@ -2841,15 +3232,15 @@ void SLAMesher::process(){
         TicToc t_register;
         Transf T_guess = getOdom();
 
-        // 为配准生成 range image（近/远层），与 runMapBuild 同参数
+        // 为配准生成 range image（近/远层）：排除地面 ROI，其余点进障碍链
         {
             const double split = param.range_image_split;
             const bool use_far = (split > 0.0);
             const double far_z_floor = farLayerZFloor(GROUND_Z_MIN);
-            range_proc.generateRangeImage(scan_local, GROUND_Z_MIN, GROUND_Z_MAX, false,
+            range_proc.generateRangeImage(scan_local, GROUND_Z_MIN, GROUND_Z_MAX, true,
                                           0.0, use_far ? split : 1e9, GROUND_Z_MIN);
             if (use_far)
-                range_proc_far.generateRangeImage(scan_local, GROUND_Z_MIN, GROUND_Z_MAX, false,
+                range_proc_far.generateRangeImage(scan_local, GROUND_Z_MIN, GROUND_Z_MAX, true,
                                                   split, 1e9, far_z_floor);
         }
 
@@ -2881,7 +3272,7 @@ void SLAMesher::process(){
     std::cout << "Process finished. Total time: " << t_whole.toc() / 1000.0 << " s" << std::endl;
 
     printMapSummary(bspline_map);
-    saveGroundGridZ(ground_grid);
+    saveAllGndSurfacesToTxt(ground_grid);
     if (param.all_surfaces_max_step > 0) {
         saveControlPointsToTxt(bspline_map, true, 0, param.all_surfaces_max_step);
     } else if (param.map_save_step_begin > 0 || param.map_save_step_end > 0) {

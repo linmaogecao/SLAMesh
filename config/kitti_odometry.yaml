@@ -7,15 +7,15 @@ slamesher:
   read_offline_pcd: true 
   dataset: 1
   max_steps: 10000
-  max_frames: 0      # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
-  dump_frame: 0        # 0=不保存；>0 时导出 matched/unmatched/scan_world + 远距 cluster 漏斗统计
+  max_frames: 0     # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
+  dump_frame: 48        # 0=不保存；>0 指定帧导出 matched/unmatched/scan_world、远距 funnel、gnd_self/out_self
   dump_cluster_step: 0   # 0=不保存；>0 时导出 cluster 到 build/output_clusters/
   dump_occluded_step: 0 # 0=不保存；>0 时导出 range image 入图点 + 被遮挡点到 build/rangeimage_*,occluded_*.txt
   console_log_path: "/home/albus/catkin_ws/src/SLAMesh/debug.txt"   # 空=自动写到 file_loc_report/seq##_run_时间.log；也可填绝对路径如 debug.txt
-  save_surface_samples: false  # true 时在 global_map/ 下按序号保存曲面稀疏采样点（全序列）
-  all_surfaces_max_step: 0  # 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面（如 60）
-  map_save_step_begin: 0  # 与 end 配合的 step 闭区间过滤（all_surfaces_max_step>0 时优先）
-  map_save_step_end:   0  # 0=不限；例 begin=100 end=150 只导出该区间新建的曲面
+  save_surface_samples: true  # true 时在 global_map/ 下按序号保存曲面稀疏采样点（全序列）
+  all_surfaces_max_step: 48  # 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面（如 60）
+  map_save_step_begin: 10  # 与 end 配合的 step 闭区间过滤（all_surfaces_max_step>0 时优先）
+  map_save_step_end: 39  # 0=不限；例 begin=100 end=150 只导出该区间新建的曲面
   save_mesh_map: false
   #register param
   range_max: 100
@@ -26,7 +26,7 @@ slamesher:
   bootstrap_step2_ty: 0.0
   bootstrap_step2_tz: 0.0
   map_update_interval: 5      # 障碍 MapUpdate 间隔（帧）；step % N == 0 时建障碍曲面
-  ground_build_interval: 10    # 地面 buildGroundMap 间隔（帧）；第1帧 + step % N == 0
+  ground_build_interval: 5    # 地面 buildGroundMap 间隔（帧）；第1帧 + step % N == 0
   map_unmatched_ratio_min: 0.30 # 簇内未匹配比例 >= 此值才新建障碍曲面
   cluster_ds_min_pts:    80   # cluster 像素数 <= 此值不抽稀
   cluster_ds_target_max: 200   # 大 cluster 按 range-image (u,v) 2D 均匀稀疏到此规模（0=关闭）
@@ -43,11 +43,25 @@ slamesher:
   obs_cluster_match_max_pts: 80     # 每簇绑定后最多保留点数
   obs_cluster_skip_flat: true       # 跳过近似水平簇（|nz|>0.85）
   # XY 栅格地面地图
+  # 雷达系地面点：前方 x∈[0,roi_x]、后方 x∈[-roi_x_rear,0]、|y|≤roi_y；z 下界 ground_z_min，上界随水平距 r=hypot(x,y) 分段
+  #   r < ground_z_r_near → ground_z_max
+  #   r < ground_z_r_mid  → ground_z_max_mid
+  #   r < ground_z_r_far  → ground_z_max_far
+  ground_z_min: -3.0
+  ground_z_max: -1.5
+  ground_z_max_mid: -1.35
+  ground_z_max_far: -1
+  ground_z_r_near: 10.0
+  ground_z_r_mid: 20.0
+  ground_z_r_far: 40.0
+  ground_roi_x: 40.0       # 前方 +x 上限（米）
+  ground_roi_x_rear: 10.0  # 后方 -x 上限绝对值（米）；仅地面配准，建图仍用 ground_roi_x
+  ground_roi_y: 5.0       # 左右 |y| 上限（米）
   ground_cell_size: 6.0      # 每格 XY 边长（米）
-  ground_cell_min_pts: 80    # 格内点数达此值才拟合曲面
+  ground_cell_min_pts: 60    # 格内点数达此值才拟合曲面
   ground_cell_num_cp: 5      # BSpline 每维控制点数
   ground_query_radius: 1     # 配准查询格半径（格数）
-  ground_map_skip_points: 8  # 建图：z 带内每隔 N 点取 1 点投格（1=不跳）
+  ground_map_skip_points: 4  # 建图：地面 ROI 内每隔 N 点取 1 点投格（1=不跳）
   ground_cell_max_pts: 400   # 每格最多保留点数（超出均匀下采样）
   ground_fit_max_pts: 150    # 每格 BSpline 拟合最多用点数
   ground_skip_points: 80     # 地面配准采样间隔
