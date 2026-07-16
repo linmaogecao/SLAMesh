@@ -2014,10 +2014,12 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             const Eigen::Matrix3d R = T_curr.block<3, 3>(0, 0);
             const Eigen::Vector3d t = T_curr.block<3, 1>(0, 3);
 
+            std::ofstream f_origin(base + "/origin_scan.txt", std::ios::out | std::ios::trunc);
             std::ofstream f_scan(base + "/scan_world.txt", std::ios::out | std::ios::trunc);
             std::ofstream f_scan_gnd(base + "/scan_gnd.txt", std::ios::out | std::ios::trunc);
             std::ofstream f_self_gnd(base + "/self_gnd.txt", std::ios::out | std::ios::trunc);
             std::ofstream f_self_obs(base + "/self_obs.txt", std::ios::out | std::ios::trunc);
+            f_origin << std::fixed << std::setprecision(6);
             f_scan << std::fixed << std::setprecision(6);
             f_scan_gnd << std::fixed << std::setprecision(6);
             f_self_gnd << std::fixed << std::setprecision(6);
@@ -2025,16 +2027,17 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             for (const auto& pt : scan_local.points) {
                 const bool is_gnd = (pt.z >= ground_z_min && pt.z <= ground_z_max);
                 const Eigen::Vector3d p_l(pt.x, pt.y, pt.z);
+                const Eigen::Vector3d p_w = R * p_l + t;
+                f_origin << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
                 if (is_gnd) {
-                    const Eigen::Vector3d p_w = R * p_l + t;
                     f_scan_gnd << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
                     f_self_gnd << p_l.x() << " " << p_l.y() << " " << p_l.z() << "\n";
                 } else {
-                    const Eigen::Vector3d p_w = R * p_l + t;
                     f_scan << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
                     f_self_obs << p_l.x() << " " << p_l.y() << " " << p_l.z() << "\n";
                 }
             }
+            f_origin.close();
             f_scan.close();
             f_scan_gnd.close();
             f_self_gnd.close();
@@ -2074,7 +2077,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                       << " matched=" << last_matches.size()
                       << " unmatched=" << n_unmatched
                       << " -> " << base
-                      << "/{matched,matched_gnd,unmatched,scan_world,scan_gnd,self_gnd,self_obs}.txt"
+                      << "/{matched,matched_gnd,unmatched,origin_scan,scan_world,scan_gnd,self_gnd,self_obs}.txt"
                       << std::endl;
         }
     }
