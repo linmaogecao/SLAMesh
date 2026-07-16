@@ -34,6 +34,8 @@ public:
     int    obs_rimg_col_step{3};           // range image 列方向采样间隔（1=全取，3=每3列取1）
     int    obs_match_per_surf_max{50};     // 每个障碍曲面最多保留的匹配点数（0=不限）
     // XY 栅格地面地图
+    double ground_z_min{-3.0};        // 传感器系地面点 z 下界（建图/配准共用）
+    double ground_z_max{-1.5};        // 传感器系地面点 z 上界（建图/配准共用）
     double ground_cell_size{6.0};     // 每格 XY 边长（米）
     int    ground_cell_min_pts{80};   // 格内点数达此值才拟合曲面
     int    ground_cell_num_cp{5};     // BSpline 每维控制点数
@@ -41,8 +43,10 @@ public:
     int    ground_map_skip_points{8}; // 地面建图：雷达系 z 带内每隔 N 点取 1 点投格
     int    ground_cell_max_pts{400};  // 每格最多保留点数（超出均匀下采样）
     int    ground_fit_max_pts{150};   // 每格 BSpline 拟合最多用点数
-    int    ground_skip_points{40};    // 地面配准采样间隔
+    int    ground_skip_points{40};    // 地面配准采样间隔（已被 XY 格子采样替代，仅作初筛备用）
     double ground_clear_dist{150.0};  // 超过此距离（米）的旧格被清除
+    double ground_reg_cell_size{3.0}; // 地面配准 XY 格子采样边长（米）；0=退化回 skip 模式
+    int    ground_reg_cell_max_pts{30}; // 每个 XY 采样格最多保留点数
 
     double correction_x{0}, correction_y{0}, correction_z{0},
     correction_roll_degree{0}, correction_pitch_degree{0}, correction_yaw_degree{0};
