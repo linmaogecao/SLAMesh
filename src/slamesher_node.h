@@ -232,6 +232,7 @@ private:
 
     void printMapSummary(const BSplineMap& bspline_map) const;
     void saveGroundGridZ(const GroundGridMap& ground_grid) const;
+    void saveGndSurfacesToTxt(const GroundGridMap& ground_grid) const;
     void saveControlPointsToTxt(const BSplineMap& bspline_map,
                                 bool save_surface_samples,
                                 int step_begin = 0,

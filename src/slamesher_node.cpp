@@ -2455,6 +2455,53 @@ void SLAMesher::saveGroundGridZ(const GroundGridMap& ground_grid) const
     }
 }
 
+void SLAMesher::saveGndSurfacesToTxt(const GroundGridMap& ground_grid) const
+{
+    const std::string out_path = std::string(kBsplineBuildDir) + "/gnd_surfaces.txt";
+    std::ofstream fout(out_path, std::ios::out | std::ios::trunc);
+    if (!fout.is_open()) {
+        std::cerr << "Failed to open: " << out_path << std::endl;
+        return;
+    }
+    fout << std::fixed << std::setprecision(6);
+
+    constexpr int kSampleGridU = 8;
+    constexpr int kSampleGridV = 8;
+    auto findSpan = [](double t, const std::vector<double>& knots, int num_cp) {
+        if (t >= 1.0 - 1e-9) return num_cp - 1;
+        for (int k = 3; k < num_cp; ++k)
+            if (knots[k] <= t && t < knots[k + 1]) return k;
+        return 3;
+    };
+
+    int n_surf = 0, n_pts = 0;
+    for (const auto& [key, cell] : ground_grid.cells()) {
+        (void)key;
+        if (!cell.surf) continue;
+        const auto& surf = cell.surf;
+        const auto& knU = surf->getKnotsU();
+        const auto& knV = surf->getKnotsV();
+        const auto& cps = surf->getControls();
+        const int num_cpv = surf->getNumCpV();
+        const int num_cpu = surf->getNumCpU();
+        for (int iu = 0; iu < kSampleGridU; ++iu) {
+            const double u = (kSampleGridU > 1) ? double(iu) / double(kSampleGridU - 1) : 0.0;
+            const BSplineSurface::Parameter paraU(findSpan(u, knU, num_cpu), u);
+            for (int iv = 0; iv < kSampleGridV; ++iv) {
+                const double v = (kSampleGridV > 1) ? double(iv) / double(kSampleGridV - 1) : 0.0;
+                const BSplineSurface::Parameter paraV(findSpan(v, knV, num_cpv), v);
+                const Eigen::Vector3d p = surf->getPos(paraU, paraV, knU, knV, cps, num_cpv);
+                fout << p.x() << " " << p.y() << " " << p.z() << "\n";
+                ++n_pts;
+            }
+        }
+        ++n_surf;
+    }
+    fout.close();
+    std::cout << "Saved gnd_surfaces.txt: " << n_surf << " surfaces, "
+              << n_pts << " sample points -> " << out_path << std::endl;
+}
+
 void SLAMesher::saveControlPointsToTxt(const BSplineMap& bspline_map,
                                        bool save_surface_samples,
                                        int step_begin,
@@ -2702,6 +2749,10 @@ void SLAMesher::process(){
 
     printMapSummary(bspline_map);
     saveGroundGridZ(ground_grid);
+    if (param.save_surface_samples || param.all_surfaces_max_step > 0
+        || param.map_save_step_begin > 0 || param.map_save_step_end > 0) {
+        saveGndSurfacesToTxt(ground_grid);
+    }
     if (param.all_surfaces_max_step > 0) {
         saveControlPointsToTxt(bspline_map, true, 0, param.all_surfaces_max_step);
     } else if (param.map_save_step_begin > 0 || param.map_save_step_end > 0) {
