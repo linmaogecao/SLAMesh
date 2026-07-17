@@ -17,6 +17,7 @@ class Parameter{
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     int    max_steps{10000}, max_frames{0}, dump_frame{0}, dump_cluster_step{0}, dump_occluded_step{0}, register_times, num_test, min_points_num_to_gp, num_thread, cross_cell_overlap_length, dataset;
+    int    dump_gnd_scan_begin{0}, dump_gnd_scan_end{0};  // 闭区间每帧写 gnd_scan/；0=关；启动时先清空目录
     int    map_update_interval{20}, ground_build_interval{20};
     int    map_save_step_begin{0}, map_save_step_end{0};  // 0=不限；导出 created_step 在此闭区间内的曲面
     int    all_surfaces_max_step{0};  // 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面
@@ -47,6 +48,7 @@ public:
     double ground_clear_dist{150.0};  // 超过此距离（米）的旧格被清除
     double ground_reg_cell_size{3.0}; // 地面配准 XY 格子采样边长（米）；0=退化回 skip 模式
     int    ground_reg_cell_max_pts{30}; // 每个 XY 采样格最多保留点数
+    double ground_reg_y_max{5.0};     // 配准：雷达系 |y| 上限（米）；<=0 不限制
 
     double correction_x{0}, correction_y{0}, correction_z{0},
     correction_roll_degree{0}, correction_pitch_degree{0}, correction_yaw_degree{0};

@@ -1182,6 +1182,8 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/dump_frame", dump_frame, 0);
     nh.param("slamesher/dump_cluster_step", dump_cluster_step, 0);
     nh.param("slamesher/dump_occluded_step", dump_occluded_step, 0);
+    nh.param("slamesher/dump_gnd_scan_begin", dump_gnd_scan_begin, 0);
+    nh.param("slamesher/dump_gnd_scan_end", dump_gnd_scan_end, 0);
     nh.param("slamesher/all_surfaces_max_step", all_surfaces_max_step, 0);
     std::cout<<"max_steps: "<<max_steps<<std::endl;
     std::cout<<"max_frames: "<<max_frames<<(max_frames > 0 ? " (debug stop)" : " (run full sequence)")<<std::endl;
@@ -1194,6 +1196,33 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     std::cout<<"dump_occluded_step: "<<dump_occluded_step
              <<(dump_occluded_step > 0 ? " (save rangeimage+occluded -> " + std::string(kBsplineBuildDir) + "/rangeimage_*,occluded_*.txt)" : " (off)")
              <<std::endl;
+    {
+        const bool gnd_scan_on = (dump_gnd_scan_begin > 0 && dump_gnd_scan_end >= dump_gnd_scan_begin);
+        std::cout << "dump_gnd_scan: "
+                  << (gnd_scan_on
+                      ? (std::to_string(dump_gnd_scan_begin) + ".." + std::to_string(dump_gnd_scan_end)
+                         + " -> " + std::string(kBsplineBuildDir) + "/gnd_scan/")
+                      : "off")
+                  << std::endl;
+        if (gnd_scan_on) {
+            const std::filesystem::path gnd_dir =
+                std::filesystem::path(kBsplineBuildDir) / "gnd_scan";
+            std::error_code ec;
+            std::filesystem::remove_all(gnd_dir, ec);
+            if (ec) {
+                std::cerr << "  [DumpGndScan] clear failed: " << gnd_dir
+                          << " (" << ec.message() << ")\n";
+            }
+            ec.clear();
+            std::filesystem::create_directories(gnd_dir, ec);
+            if (ec) {
+                std::cerr << "  [DumpGndScan] mkdir failed: " << gnd_dir
+                          << " (" << ec.message() << ")\n";
+            } else {
+                std::cout << "  [DumpGndScan] cleared " << gnd_dir << std::endl;
+            }
+        }
+    }
     std::cout<<"all_surfaces_max_step: "<<all_surfaces_max_step
              <<(all_surfaces_max_step > 0 ? " (export surfaces with created_step <= N)" : " (off)")
              <<std::endl;
@@ -1239,6 +1268,7 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/ground_clear_dist",   ground_clear_dist,   150.0);
     nh.param("slamesher/ground_reg_cell_size",     ground_reg_cell_size,     3.0);
     nh.param("slamesher/ground_reg_cell_max_pts",  ground_reg_cell_max_pts,  30);
+    nh.param("slamesher/ground_reg_y_max",         ground_reg_y_max,         5.0);
     nh.param("slamesher/bootstrap_step2_tx", bootstrap_step2_tx, 0.5);
     nh.param("slamesher/bootstrap_step2_ty", bootstrap_step2_ty, 0.0);
     nh.param("slamesher/bootstrap_step2_tz", bootstrap_step2_tz, 0.0);
@@ -1261,6 +1291,7 @@ void Parameter::initParameter(ros::NodeHandle & nh){
               << " fit_max=" << ground_fit_max_pts
               << " reg_cell=" << ground_reg_cell_size << "m"
               << " reg_cell_max=" << ground_reg_cell_max_pts
+              << " reg_y_max=" << ground_reg_y_max << "m"
               << " clear_dist=" << ground_clear_dist << "m" << std::endl;
     std::cout << "bootstrap_step2 (velo m): [" << bootstrap_step2_tx << ", "
               << bootstrap_step2_ty << ", " << bootstrap_step2_tz << "]" << std::endl;
@@ -1864,6 +1895,8 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
     // ══════════════════════════════════════════════════════════════════════
     // 阶段 2：地面匹配 — 点到平面；只优化世界系 roll / pitch / z
     // ══════════════════════════════════════════════════════════════════════
+    std::vector<int> gnd_enter_indices;  // 最后一轮进入地面匹配（送入曲面查询）的点索引
+    std::vector<RegMatch> last_gnd_matches;  // 最后一轮过 thr、进 Ceres 的地面匹配
     {
         const std::vector<RegMatch> obs_saved = last_matches;
         const double x_fix = T_curr(0, 3);
@@ -1880,23 +1913,28 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         for (int giter = 0; giter < kGndIters; ++giter) {
             const double gnd_thr = gndMatchDistForIter(giter);
             std::unordered_map<const BSplineSurface*, std::vector<int>> gnd_surf_to_pts;
-            // XY 格子均匀采样：把满足 z 带的全部点先按世界系 XY 哈希到格子，
-            // 每格至多保留 ground_reg_cell_max_pts 个（按索引均匀抽取），
-            // 再把留下的点送入 surface 查询。
-            // 若 ground_reg_cell_size <= 0，退化为旧的 skip 模式。
+            // XY 格子均匀采样：把满足 z 带、且雷达系 |y|<=ground_reg_y_max 的点
+            // 先按世界系 XY 哈希到格子，每格至多保留 ground_reg_cell_max_pts 个，
+            // 再送入 surface 查询。ground_reg_cell_size<=0 时退化为 skip 模式。
             const double reg_cs   = param.ground_reg_cell_size;
             const int    reg_cmax = param.ground_reg_cell_max_pts > 0
                                     ? param.ground_reg_cell_max_pts : 30;
+            const double y_max    = param.ground_reg_y_max;
+            auto passGndLocal = [&](double ly, double lz) -> bool {
+                if (lz < ground_z_min || lz > ground_z_max) return false;
+                if (y_max > 0.0 && std::abs(ly) > y_max) return false;
+                return true;
+            };
             if (reg_cs > 0.0) {
-                // Step-1: 收集所有满足 z 带的点索引，归入 XY 格子
+                // Step-1: 收集候选点索引，归入 XY 格子
                 std::unordered_map<std::int64_t, std::vector<int>> xy_bucket;
                 const Eigen::Matrix3d R_curr = T_curr.block<3,3>(0,0);
                 const Eigen::Vector3d t_curr = T_curr.block<3,1>(0,3);
                 for (int i = 0; i < (int)scan_local.size(); ++i) {
-                    const double lz = scan_local[i].z;
-                    if (lz < ground_z_min || lz > ground_z_max) continue;
+                    const double ly = scan_local[i].y, lz = scan_local[i].z;
+                    if (!passGndLocal(ly, lz)) continue;
                     const Eigen::Vector3d p_w = R_curr *
-                        Eigen::Vector3d(scan_local[i].x, scan_local[i].y, lz) + t_curr;
+                        Eigen::Vector3d(scan_local[i].x, ly, lz) + t_curr;
                     const std::int64_t cx = static_cast<std::int64_t>(std::floor(p_w.x() / reg_cs));
                     const std::int64_t cy = static_cast<std::int64_t>(std::floor(p_w.y() / reg_cs));
                     const std::int64_t key = cx * 1000003LL + cy;
@@ -1919,12 +1957,19 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 const int gnd_skip = param.ground_skip_points > 0 ? param.ground_skip_points : skip_points;
                 for (int i = 0; i < (int)scan_local.size(); i += gnd_skip) {
                     const double lx = scan_local[i].x, ly = scan_local[i].y, lz = scan_local[i].z;
-                    if (lz < ground_z_min || lz > ground_z_max) continue;
+                    if (!passGndLocal(ly, lz)) continue;
                     Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
                         Eigen::Vector3d(lx, ly, lz) + T_curr.block<3,1>(0,3);
                     const BSplineSurface* sp = ground_grid.queryNearestSurface(p_w);
                     if (sp) gnd_surf_to_pts[sp].push_back(i);
                 }
+            }
+
+            // 记录本轮进入地面匹配（已找到最近曲面）的点
+            gnd_enter_indices.clear();
+            for (const auto& [sp, indices] : gnd_surf_to_pts) {
+                (void)sp;
+                gnd_enter_indices.insert(gnd_enter_indices.end(), indices.begin(), indices.end());
             }
 
             std::vector<RegMatch> gnd_matches;
@@ -1968,6 +2013,8 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 break;
             }
 
+            last_gnd_matches = gnd_matches;
+
             double rpy_z[3] = {roll_i, pitch_i, T_curr(2, 3)};
             ceres::Problem problem;
             ceres::LossFunction* loss = new ceres::HuberLoss(0.5);
@@ -2004,6 +2051,38 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         }
     }
 
+    const Eigen::Matrix3d R_dump = T_curr.block<3, 3>(0, 0);
+    const Eigen::Vector3d t_dump = T_curr.block<3, 1>(0, 3);
+
+    // 指定区间：每帧保存最后一轮 gnd_matches（过 thr、进 Ceres）世界系点
+    if (param.dump_gnd_scan_begin > 0
+        && param.dump_gnd_scan_end >= param.dump_gnd_scan_begin
+        && g_data.step >= param.dump_gnd_scan_begin
+        && g_data.step <= param.dump_gnd_scan_end) {
+        const std::filesystem::path gnd_dir =
+            std::filesystem::path(kBsplineBuildDir) / "gnd_scan";
+        std::error_code ec;
+        std::filesystem::create_directories(gnd_dir, ec);
+        if (ec) {
+            std::cerr << "  [DumpGndScan] mkdir failed: " << gnd_dir
+                      << " (" << ec.message() << ")\n";
+        } else {
+            const std::string out =
+                (gnd_dir / ("gnd_scan_" + std::to_string(g_data.step) + ".txt")).string();
+            std::ofstream f_gnd(out, std::ios::out | std::ios::trunc);
+            f_gnd << std::fixed << std::setprecision(6);
+            // 用匹配后 T_curr 重投影，与最终位姿一致
+            for (const auto& m : last_gnd_matches) {
+                const Eigen::Vector3d p_w = R_dump * m.p_local + t_dump;
+                f_gnd << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+            }
+            f_gnd.close();
+            std::cout << "  [DumpGndScan] step=" << g_data.step
+                      << " n_gnd_matches=" << last_gnd_matches.size()
+                      << " -> " << out << std::endl;
+        }
+    }
+
     if (param.dump_frame > 0 && g_data.step == param.dump_frame) {
         const std::string base = kBsplineBuildDir;
         std::error_code ec;
@@ -2011,8 +2090,8 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         if (ec) {
             std::cerr << "  [Dump] failed to create dir: " << base << " (" << ec.message() << ")\n";
         } else {
-            const Eigen::Matrix3d R = T_curr.block<3, 3>(0, 0);
-            const Eigen::Vector3d t = T_curr.block<3, 1>(0, 3);
+            const Eigen::Matrix3d& R = R_dump;
+            const Eigen::Vector3d& t = t_dump;
 
             std::ofstream f_origin(base + "/origin_scan.txt", std::ios::out | std::ios::trunc);
             std::ofstream f_scan(base + "/scan_world.txt", std::ios::out | std::ios::trunc);
@@ -2024,18 +2103,25 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             f_scan_gnd << std::fixed << std::setprecision(6);
             f_self_gnd << std::fixed << std::setprecision(6);
             f_self_obs << std::fixed << std::setprecision(6);
-            for (const auto& pt : scan_local.points) {
-                const bool is_gnd = (pt.z >= ground_z_min && pt.z <= ground_z_max);
+
+            // scan_gnd / self_gnd：最后一轮进入地面匹配（送入曲面查询）的点
+            std::unordered_set<int> gnd_enter_set(
+                gnd_enter_indices.begin(), gnd_enter_indices.end());
+            for (int idx : gnd_enter_indices) {
+                const auto& pt = scan_local.points[idx];
+                const Eigen::Vector3d p_l(pt.x, pt.y, pt.z);
+                const Eigen::Vector3d p_w = R * p_l + t;
+                f_scan_gnd << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+                f_self_gnd << p_l.x() << " " << p_l.y() << " " << p_l.z() << "\n";
+            }
+            for (int i = 0; i < (int)scan_local.size(); ++i) {
+                const auto& pt = scan_local.points[i];
                 const Eigen::Vector3d p_l(pt.x, pt.y, pt.z);
                 const Eigen::Vector3d p_w = R * p_l + t;
                 f_origin << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
-                if (is_gnd) {
-                    f_scan_gnd << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
-                    f_self_gnd << p_l.x() << " " << p_l.y() << " " << p_l.z() << "\n";
-                } else {
-                    f_scan << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
-                    f_self_obs << p_l.x() << " " << p_l.y() << " " << p_l.z() << "\n";
-                }
+                if (gnd_enter_set.count(i)) continue;
+                f_scan << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+                f_self_obs << p_l.x() << " " << p_l.y() << " " << p_l.z() << "\n";
             }
             f_origin.close();
             f_scan.close();
@@ -2074,6 +2160,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             f_unmatched.close();
 
             std::cout << "  [Dump] step=" << g_data.step
+                      << " gnd_enter=" << gnd_enter_indices.size()
                       << " matched=" << last_matches.size()
                       << " unmatched=" << n_unmatched
                       << " -> " << base

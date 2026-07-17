@@ -7,15 +7,17 @@ slamesher:
   read_offline_pcd: true 
   dataset: 1
   max_steps: 10000
-  max_frames: 120      # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
-  dump_frame: 120        # 0=不保存；>0 时导出 matched/unmatched/scan_world + 远距 cluster 漏斗统计
+  max_frames: 450      # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
+  dump_frame: 450        # 0=不保存；>0 时导出 matched/unmatched/scan_world + 远距 cluster 漏斗统计
   dump_cluster_step: 0   # 0=不保存；>0 时导出 cluster 到 build/output_clusters/
   dump_occluded_step: 0 # 0=不保存；>0 时导出 range image 入图点 + 被遮挡点到 build/rangeimage_*,occluded_*.txt
+  dump_gnd_scan_begin: 400  # 闭区间起点；每帧写最后一轮 gnd_matches（过 thr、进 Ceres）到 build/gnd_scan/；启动先清空
+  dump_gnd_scan_end: 450    # 闭区间终点；任一为 0 则关闭
   console_log_path: "/home/albus/catkin_ws/src/SLAMesh/debug.txt"   # 空=自动写到 file_loc_report/seq##_run_时间.log；也可填绝对路径如 debug.txt
   save_surface_samples: true  # true 时在 global_map/ 下按序号保存曲面稀疏采样点（全序列）
-  all_surfaces_max_step: 120  # 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面（如 60）
-  map_save_step_begin: 1  # 与 end 配合的 step 闭区间过滤（all_surfaces_max_step>0 时优先）
-  map_save_step_end:   120  # 0=不限；例 begin=100 end=150 只导出该区间新建的曲面
+  all_surfaces_max_step: 450  # 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面（如 60）
+  map_save_step_begin: 350  # 与 end 配合的 step 闭区间过滤（all_surfaces_max_step>0 时优先）
+  map_save_step_end:   450  # 0=不限；例 begin=100 end=150 只导出该区间新建的曲面
   save_mesh_map: false
   #register param
   range_max: 100
@@ -37,7 +39,7 @@ slamesher:
   obs_match_per_surf_max: 50   # 每个障碍曲面最多保留的匹配点数（0=不限；防止长物体垄断）
   # XY 栅格地面地图
   ground_z_min: -3.0         # 传感器系地面点 z 下界（建图/配准共用）
-  ground_z_max: -1.9        # 传感器系地面点 z 上界（建图/配准共用）
+  ground_z_max: -1.5       # 传感器系地面点 z 上界（建图/配准共用）
   ground_cell_size: 6.0      # 每格 XY 边长（米）
   ground_cell_min_pts: 60    # 格内点数达此值才拟合曲面
   ground_cell_num_cp: 5      # BSpline 每维控制点数
@@ -49,6 +51,7 @@ slamesher:
   ground_clear_dist: 150.0   # 超过此距离（米）的旧格被清除
   ground_reg_cell_size: 5.0  # 配准时 XY 均匀采样格边长（米）；0=退化为 skip 模式
   ground_reg_cell_max_pts: 20 # 每个采样格最多取点数
+  ground_reg_y_max: 5.0      # 配准：雷达系 |y|<=此值（米）；<=0 不限制（减少两侧障碍脏点）
   cross_overlap: true
   cross_cell_overlap_length: 1
   num_margin_old_cell: 500
