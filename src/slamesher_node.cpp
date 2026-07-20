@@ -1201,25 +1201,28 @@ void Parameter::initParameter(ros::NodeHandle & nh){
         std::cout << "dump_gnd_scan: "
                   << (gnd_scan_on
                       ? (std::to_string(dump_gnd_scan_begin) + ".." + std::to_string(dump_gnd_scan_end)
-                         + " -> " + std::string(kBsplineBuildDir) + "/gnd_scan/")
+                         + " -> " + std::string(kBsplineBuildDir)
+                         + "/gnd_scan/ + whole_gnd/ + scan_world/")
                       : "off")
                   << std::endl;
         if (gnd_scan_on) {
-            const std::filesystem::path gnd_dir =
-                std::filesystem::path(kBsplineBuildDir) / "gnd_scan";
-            std::error_code ec;
-            std::filesystem::remove_all(gnd_dir, ec);
-            if (ec) {
-                std::cerr << "  [DumpGndScan] clear failed: " << gnd_dir
-                          << " (" << ec.message() << ")\n";
-            }
-            ec.clear();
-            std::filesystem::create_directories(gnd_dir, ec);
-            if (ec) {
-                std::cerr << "  [DumpGndScan] mkdir failed: " << gnd_dir
-                          << " (" << ec.message() << ")\n";
-            } else {
-                std::cout << "  [DumpGndScan] cleared " << gnd_dir << std::endl;
+            for (const char* sub : {"gnd_scan", "whole_gnd", "scan_world"}) {
+                const std::filesystem::path gnd_dir =
+                    std::filesystem::path(kBsplineBuildDir) / sub;
+                std::error_code ec;
+                std::filesystem::remove_all(gnd_dir, ec);
+                if (ec) {
+                    std::cerr << "  [DumpGndScan] clear failed: " << gnd_dir
+                              << " (" << ec.message() << ")\n";
+                }
+                ec.clear();
+                std::filesystem::create_directories(gnd_dir, ec);
+                if (ec) {
+                    std::cerr << "  [DumpGndScan] mkdir failed: " << gnd_dir
+                              << " (" << ec.message() << ")\n";
+                } else {
+                    std::cout << "  [DumpGndScan] cleared " << gnd_dir << std::endl;
+                }
             }
         }
     }
@@ -1264,6 +1267,8 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/ground_map_skip_points", ground_map_skip_points, 8);
     nh.param("slamesher/ground_cell_max_pts",    ground_cell_max_pts,    400);
     nh.param("slamesher/ground_fit_max_pts",     ground_fit_max_pts,     150);
+    nh.param("slamesher/ground_cell_z_pct",      ground_cell_z_pct,      0.0);
+    nh.param("slamesher/ground_cell_z_tol",      ground_cell_z_tol,      0.2);
     nh.param("slamesher/ground_skip_points",  ground_skip_points,  40);
     nh.param("slamesher/ground_clear_dist",   ground_clear_dist,   150.0);
     nh.param("slamesher/ground_reg_cell_size",     ground_reg_cell_size,     3.0);
@@ -1289,6 +1294,8 @@ void Parameter::initParameter(ros::NodeHandle & nh){
               << " map_skip=" << ground_map_skip_points
               << " cell_max=" << ground_cell_max_pts
               << " fit_max=" << ground_fit_max_pts
+              << " z_pct=" << ground_cell_z_pct
+              << " z_tol=" << ground_cell_z_tol << "m"
               << " reg_cell=" << ground_reg_cell_size << "m"
               << " reg_cell_max=" << ground_reg_cell_max_pts
               << " reg_y_max=" << ground_reg_y_max << "m"
@@ -1906,7 +1913,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
         constexpr int kGndIters = 3;
         auto gndMatchDistForIter = [](int it) -> double {
-            static constexpr double kSched[3] = {2.0, 0.8, 0.4};
+            static constexpr double kSched[3] = {1.5, 0.4, 0.1};
             return kSched[std::min(std::max(it, 0), kGndIters - 1)];
         };
 
@@ -2054,33 +2061,76 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
     const Eigen::Matrix3d R_dump = T_curr.block<3, 3>(0, 0);
     const Eigen::Vector3d t_dump = T_curr.block<3, 1>(0, 3);
 
-    // 指定区间：每帧保存最后一轮 gnd_matches（过 thr、进 Ceres）世界系点
+    // 指定区间：每帧写 gnd_scan/（过 thr 匹配）+ whole_gnd/（z 带初分类地面点）+ scan_world/（全量世界系点）
     if (param.dump_gnd_scan_begin > 0
         && param.dump_gnd_scan_end >= param.dump_gnd_scan_begin
         && g_data.step >= param.dump_gnd_scan_begin
         && g_data.step <= param.dump_gnd_scan_end) {
-        const std::filesystem::path gnd_dir =
-            std::filesystem::path(kBsplineBuildDir) / "gnd_scan";
-        std::error_code ec;
-        std::filesystem::create_directories(gnd_dir, ec);
-        if (ec) {
-            std::cerr << "  [DumpGndScan] mkdir failed: " << gnd_dir
-                      << " (" << ec.message() << ")\n";
-        } else {
-            const std::string out =
-                (gnd_dir / ("gnd_scan_" + std::to_string(g_data.step) + ".txt")).string();
-            std::ofstream f_gnd(out, std::ios::out | std::ios::trunc);
-            f_gnd << std::fixed << std::setprecision(6);
-            // 用匹配后 T_curr 重投影，与最终位姿一致
-            for (const auto& m : last_gnd_matches) {
-                const Eigen::Vector3d p_w = R_dump * m.p_local + t_dump;
-                f_gnd << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+        const double y_max_dump = param.ground_reg_y_max;
+        auto dumpWorldPts = [&](const std::filesystem::path& dir,
+                                const std::string& prefix,
+                                const auto& write_pts,
+                                const char* tag) {
+            std::error_code ec;
+            std::filesystem::create_directories(dir, ec);
+            if (ec) {
+                std::cerr << "  [" << tag << "] mkdir failed: " << dir
+                          << " (" << ec.message() << ")\n";
+                return;
             }
-            f_gnd.close();
-            std::cout << "  [DumpGndScan] step=" << g_data.step
-                      << " n_gnd_matches=" << last_gnd_matches.size()
-                      << " -> " << out << std::endl;
-        }
+            const std::string out =
+                (dir / (prefix + std::to_string(g_data.step) + ".txt")).string();
+            std::ofstream f(out, std::ios::out | std::ios::trunc);
+            f << std::fixed << std::setprecision(6);
+            const int n = write_pts(f);
+            f.close();
+            std::cout << "  [" << tag << "] step=" << g_data.step
+                      << " n=" << n << " -> " << out << std::endl;
+        };
+
+        dumpWorldPts(
+            std::filesystem::path(kBsplineBuildDir) / "gnd_scan",
+            "gnd_scan_",
+            [&](std::ofstream& f) {
+                for (const auto& m : last_gnd_matches) {
+                    const Eigen::Vector3d p_w = R_dump * m.p_local + t_dump;
+                    f << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+                }
+                return (int)last_gnd_matches.size();
+            },
+            "DumpGndScan");
+
+        // whole_gnd：一开始按雷达系 z 带（+ |y|<=ground_reg_y_max）分类出的全部地面点
+        dumpWorldPts(
+            std::filesystem::path(kBsplineBuildDir) / "whole_gnd",
+            "whole_gnd_",
+            [&](std::ofstream& f) {
+                int n = 0;
+                for (int i = 0; i < (int)scan_local.size(); ++i) {
+                    const double ly = scan_local[i].y, lz = scan_local[i].z;
+                    if (lz < ground_z_min || lz > ground_z_max) continue;
+                    if (y_max_dump > 0.0 && std::abs(ly) > y_max_dump) continue;
+                    const Eigen::Vector3d p_w = R_dump *
+                        Eigen::Vector3d(scan_local[i].x, ly, lz) + t_dump;
+                    f << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+                    ++n;
+                }
+                return n;
+            },
+            "DumpWholeGnd");
+
+        dumpWorldPts(
+            std::filesystem::path(kBsplineBuildDir) / "scan_world",
+            "scan_world_",
+            [&](std::ofstream& f) {
+                for (int i = 0; i < (int)scan_local.size(); ++i) {
+                    const Eigen::Vector3d p_w = R_dump *
+                        Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z) + t_dump;
+                    f << p_w.x() << " " << p_w.y() << " " << p_w.z() << "\n";
+                }
+                return (int)scan_local.size();
+            },
+            "DumpScanWorld");
     }
 
     if (param.dump_frame > 0 && g_data.step == param.dump_frame) {
@@ -2750,7 +2800,9 @@ void SLAMesher::process(){
                               param.ground_cell_num_cp,
                               param.ground_query_radius,
                               param.ground_cell_max_pts,
-                              param.ground_fit_max_pts);
+                              param.ground_fit_max_pts,
+                              param.ground_cell_z_pct,
+                              param.ground_cell_z_tol);
     RangeImageProcessor range_proc;
     RangeImageProcessor range_proc_far;  // 远层（range >= range_image_split）
 

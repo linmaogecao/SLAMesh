@@ -17,7 +17,7 @@ class Parameter{
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     int    max_steps{10000}, max_frames{0}, dump_frame{0}, dump_cluster_step{0}, dump_occluded_step{0}, register_times, num_test, min_points_num_to_gp, num_thread, cross_cell_overlap_length, dataset;
-    int    dump_gnd_scan_begin{0}, dump_gnd_scan_end{0};  // 闭区间每帧写 gnd_scan/；0=关；启动时先清空目录
+    int    dump_gnd_scan_begin{0}, dump_gnd_scan_end{0};  // 闭区间每帧写 gnd_scan/ + whole_gnd/ + scan_world/；0=关；启动时先清空目录
     int    map_update_interval{20}, ground_build_interval{20};
     int    map_save_step_begin{0}, map_save_step_end{0};  // 0=不限；导出 created_step 在此闭区间内的曲面
     int    all_surfaces_max_step{0};  // 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面
@@ -44,6 +44,8 @@ public:
     int    ground_map_skip_points{8}; // 地面建图：雷达系 z 带内每隔 N 点取 1 点投格
     int    ground_cell_max_pts{400};  // 每格最多保留点数（超出均匀下采样）
     int    ground_fit_max_pts{150};   // 每格 BSpline 拟合最多用点数
+    double ground_cell_z_pct{0.0};    // 建图：格内 z 参考；(0,1]=分位，<=0 用均值
+    double ground_cell_z_tol{0.2};    // 建图：相对参考高度上容差（米）；<=0 关闭
     int    ground_skip_points{40};    // 地面配准采样间隔（已被 XY 格子采样替代，仅作初筛备用）
     double ground_clear_dist{150.0};  // 超过此距离（米）的旧格被清除
     double ground_reg_cell_size{3.0}; // 地面配准 XY 格子采样边长（米）；0=退化回 skip 模式

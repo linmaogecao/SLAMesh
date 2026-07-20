@@ -10,8 +10,8 @@
 // 地面点分 cluster（格）流程：
 //   1. 当前帧地面点（雷达系）→ 变换到世界系
 //   2. 按 (floor(x/cell_size), floor(y/cell_size)) 投格
-//   3. 每格积累点，达到 min_pts 后标记 needs_refit
-//   4. 调用 refitDirty() 对所有 needs_refit 格重新拟合 BSpline
+//   3. 格内相对高度过滤（均值/分位 + 上容差），再封顶下采样
+//   4. 达到 min_pts 后标记 needs_refit，refitCells 拟合 BSpline
 //
 // 配准查询：
 //   给定世界系点 p，取 (ix,iy) 及其 ±radius 格内所有有效曲面作为候选。
@@ -19,6 +19,7 @@
 //
 #pragma once
 
+#include <algorithm>
 #include <cmath>
 #include <unordered_map>
 #include <unordered_set>
@@ -66,22 +67,29 @@ public:
     // active_radius : 配准查询时格坐标半径（格数）
     // cell_max_pts: 每格最多保留点数（超出均匀下采样）
     // fit_max_pts : 拟合 BSpline 时最多使用的点数
+    // cell_z_pct  : (0,1] 时用格内 z 分位作参考；<=0 用均值
+    // cell_z_tol  : 相对参考高度上容差（米）；<=0 关闭过滤
     explicit GroundGridMap(double cell_size   = 6.0,
                            int    min_pts     = 80,
                            int    num_cp      = 5,
                            int    active_radius = 6,
                            int    cell_max_pts = 400,
-                           int    fit_max_pts  = 150)
+                           int    fit_max_pts  = 150,
+                           double cell_z_pct  = 0.0,
+                           double cell_z_tol  = 0.0)
         : cell_size_(cell_size),
           min_pts_(min_pts),
           num_cp_(num_cp),
           active_radius_(active_radius),
           cell_max_pts_(std::max(1, cell_max_pts)),
-          fit_max_pts_(std::max(1, fit_max_pts))
+          fit_max_pts_(std::max(1, fit_max_pts)),
+          cell_z_pct_(cell_z_pct),
+          cell_z_tol_(cell_z_tol)
     {}
 
     // -----------------------------------------------------------------------
     // 把一帧地面点（世界系）投格，按 XY 分组写入对应 GroundCell
+    // 投格后可按格内平均/分位高度砍掉偏高点，再封顶下采样
     // 返回新增/更新的格 key 列表
     // -----------------------------------------------------------------------
     std::vector<GroundCellKey> addPoints(
@@ -99,8 +107,9 @@ public:
         }
         for (const auto& k : touched) {
             auto it = cells_.find(k);
-            if (it != cells_.end())
-                capPointsInPlace(it->second.pts, cell_max_pts_);
+            if (it == cells_.end()) continue;
+            filterCellByRelativeZ(it->second.pts, cell_z_pct_, cell_z_tol_);
+            capPointsInPlace(it->second.pts, cell_max_pts_);
         }
         return {touched.begin(), touched.end()};
     }
@@ -334,6 +343,45 @@ public:
     }
 
 private:
+    // 格内相对高度过滤：砍掉明显高于参考高度的点（障碍抬高地面）
+    // pct in (0,1] → 用该分位作 z_ref；否则用均值
+    // 保留 z <= z_ref + tol；过滤后过少则回退，避免空格
+    static void filterCellByRelativeZ(pcl::PointCloud<pcl::PointXYZ>& pts,
+                                      double pct,
+                                      double tol)
+    {
+        if (tol <= 0.0) return;
+        const int n = static_cast<int>(pts.size());
+        if (n < 3) return;
+
+        std::vector<float> zs;
+        zs.reserve(static_cast<size_t>(n));
+        for (const auto& p : pts) zs.push_back(p.z);
+
+        double z_ref = 0.0;
+        if (pct > 0.0 && pct <= 1.0) {
+            const size_t k = static_cast<size_t>(
+                std::min(n - 1, std::max(0, static_cast<int>(std::floor(pct * (n - 1))))));
+            std::nth_element(zs.begin(), zs.begin() + static_cast<std::ptrdiff_t>(k), zs.end());
+            z_ref = zs[k];
+        } else {
+            double sum = 0.0;
+            for (float z : zs) sum += z;
+            z_ref = sum / static_cast<double>(n);
+        }
+
+        const float z_cut = static_cast<float>(z_ref + tol);
+        pcl::PointCloud<pcl::PointXYZ> kept;
+        kept.reserve(static_cast<size_t>(n));
+        for (const auto& p : pts) {
+            if (p.z <= z_cut) kept.push_back(p);
+        }
+        // 过滤后太少则回退，避免格被掏空无法拟合
+        const int min_keep = std::max(3, n / 5);
+        if (static_cast<int>(kept.size()) >= min_keep)
+            pts.swap(kept);
+    }
+
     static void capPointsInPlace(pcl::PointCloud<pcl::PointXYZ>& pts, int max_pts)
     {
         const int n = static_cast<int>(pts.size());
@@ -389,5 +437,7 @@ private:
     int    active_radius_;
     int    cell_max_pts_;
     int    fit_max_pts_;
+    double cell_z_pct_;   // (0,1]=分位参考；<=0 用均值
+    double cell_z_tol_;   // 上容差（米）；<=0 关闭
     std::unordered_map<GroundCellKey, GroundCell, GroundCellKeyHash> cells_;
 };
