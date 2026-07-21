@@ -6,6 +6,7 @@
 #define SPLINE_FITTING_RANGEMAP_H
 
 #include <iostream>
+#include <array>
 #include <fstream>
 #include <vector>
 #include <string>
@@ -32,6 +33,18 @@ struct RangePixel {
 struct SegmentationResult {
     std::vector<int> label_map;             // 全图标签
     std::vector<std::vector<int>> clusters; // 每个面的索引集合
+};
+
+struct GroundExtractDebugStats {
+    int input_valid_points = 0;
+    int seed_cols = 0;
+    int accepted_col_points = 0;
+    int cut_by_zmax = 0;
+    int cut_by_step = 0;
+    int cell_count = 0;
+    int after_cell_filter = 0;
+    std::array<int, 7> col_bin_counts{{0, 0, 0, 0, 0, 0, 0}};
+    std::array<int, 7> final_bin_counts{{0, 0, 0, 0, 0, 0, 0}};
 };
 
 // ---------- 体素化分割结果存储 ----------
@@ -88,6 +101,9 @@ public:
     std::vector<int> pixel_to_cloud_idx_;
     // 本次 generateRangeImage 中：已通过筛选但因同像素存在更近点而未写入 range image 的点（雷达系）
     std::vector<Eigen::Vector3d> occluded_points_;
+    // ground_cloud_mask_[i] = true 表示点云第 i 个点被 extractGroundByCellFilter 判为地面
+    std::vector<bool> ground_cloud_mask_;
+    GroundExtractDebugStats ground_debug_stats_;
     pcl::PointCloud<pcl::PointXYZ> ouyt;
     RangeImageProcessor() {
         range_image_.resize(H_SCANS * W_COLS);
@@ -103,12 +119,14 @@ public:
     // exclude_ground_band=true 时，z∈[ground_z_min,ground_z_max] 的点不投影进 range image
     // layer_range_min/max：只投影 range∈[layer_range_min, layer_range_max) 的点（默认全范围）
     // z_floor：低于此值的点不进 range image（默认 MIN_Z=-2.5；传 -1e9 表示不做高度下限过滤）
+    // exclude_mask：若非 null，则跳过 cloud[i] 中 (*exclude_mask)[i]==true 的点（优先级高于 z 带排除）
     void generateRangeImage(const pcl::PointCloud<pcl::PointXYZ>& cloud,
                             double ground_z_min = -1e9, double ground_z_max = 1e9,
                             bool exclude_ground_band = false,
                             double layer_range_min = 0.0,
                             double layer_range_max = 1e9,
-                            double z_floor = -2.5);
+                            double z_floor = -2.5,
+                            const std::vector<bool>* exclude_mask = nullptr);
 
     const std::vector<Eigen::Vector3d>& getOccludedPoints() const { return occluded_points_; }
     bool getPoint(int u, int v, Eigen::Vector3d& out_point) const {
@@ -127,6 +145,18 @@ public:
         int nv = (v + W_COLS) % W_COLS;
         return nv;
     }
+
+    // 地面点提取：全图 range image → 按列从底环向上传播（每步 z 差 ≤ col_max_step）
+    //             → XY 格子内严格 z 分位过滤
+    // 结果写入 ground_cloud_mask_（按点云下标），并返回地面点下标列表
+    // z_max：雷达系硬性高度上限（如 -0.5）；z_min：硬性下限（如 -3.8）
+    // col_max_step：同列相邻环 z 允许变化最大值（m），超出则截止
+    // cell_size：XY 格子边长；cell_z_pct：格内低分位；cell_z_tol：容差（m，应偏严）
+    std::vector<int> extractGroundByCellFilter(
+        const pcl::PointCloud<pcl::PointXYZ>& cloud,
+        double z_min, double z_max,
+        double col_max_step,
+        double cell_size, double cell_z_pct, double cell_z_tol);
 
     // exclude_ground_band=true 时，z∈[ground_z_min,ground_z_max] 的像素不参与 BFS 聚类（仅障碍聚类）
     SegmentationResult segmentRangeImage(double theta_deg, double max_dist, int min_cluster_size,

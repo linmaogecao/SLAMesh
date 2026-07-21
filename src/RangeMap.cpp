@@ -8,6 +8,7 @@
 #include <cmath>
 #include <omp.h>
 #include <sstream>
+#include <unordered_map>
 #include <unordered_set>
 extern Parameter param;//in SLAMesh node
 extern Log g_data;//in SLAMesh node
@@ -21,7 +22,8 @@ void RangeImageProcessor::generateRangeImage(const pcl::PointCloud<pcl::PointXYZ
                                              double ground_z_min, double ground_z_max,
                                              bool exclude_ground_band,
                                              double layer_range_min, double layer_range_max,
-                                             double z_floor)
+                                             double z_floor,
+                                             const std::vector<bool>* exclude_mask)
 {
     std::fill(range_image_.begin(), range_image_.end(), RangePixel());
     std::fill(pixel_to_cloud_idx_.begin(), pixel_to_cloud_idx_.end(), -1);
@@ -40,8 +42,12 @@ void RangeImageProcessor::generateRangeImage(const pcl::PointCloud<pcl::PointXYZ
         const auto& pt = cloud.points[i];
         if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z))
             continue;
-        if (exclude_ground_band && pt.z >= ground_z_min && pt.z <= ground_z_max)
+        // 优先使用 mask 排除（地面点）；没有 mask 时退回 z 带排除
+        if (exclude_mask) {
+            if (i < exclude_mask->size() && (*exclude_mask)[i]) continue;
+        } else if (exclude_ground_band && pt.z >= ground_z_min && pt.z <= ground_z_max) {
             continue;
+        }
         double range = std::sqrt(pt.x * pt.x + pt.y * pt.y + pt.z * pt.z);
         if (range < eff_range_min || range > eff_range_max || pt.z < z_floor) {
             continue;
@@ -859,6 +865,156 @@ std::vector<Eigen::Vector3d> out;
     for (int i = (int)valid_rings.size() - 1; i >= 0; --i)
         out.push_back(getPoint3D(valid_rings[i], col_hi[valid_rings[i]]));
     return out;   // 首尾相连即为闭合多边形
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// extractGroundByCellFilter — 列向传播 + XY 格子严格过滤
+//   Step-1  全点云建内部 range image（不做 z 预过滤，障碍物也投影进来）
+//   Step-2  逐列从底环向上传播：z >= z_max 或相邻环 |Δz| > col_max_step 时截止
+//   Step-3  列传播候选点分配到 XY 格子，每格内严格 z 分位过滤
+//   结果存入 ground_cloud_mask_（按点云下标），并返回地面点下标列表
+// ─────────────────────────────────────────────────────────────────────────────
+std::vector<int> RangeImageProcessor::extractGroundByCellFilter(
+    const pcl::PointCloud<pcl::PointXYZ>& cloud,
+    double z_min, double z_max,
+    double col_max_step,
+    double cell_size, double cell_z_pct, double cell_z_tol)
+{
+    ground_cloud_mask_.assign(cloud.size(), false);
+    ground_debug_stats_ = GroundExtractDebugStats{};
+
+    auto distanceBin = [](float x) -> int {
+        if (x >= -30.0f && x < -20.0f) return 0;
+        if (x >= -20.0f && x < -10.0f) return 1;
+        if (x >= -10.0f && x < 0.0f) return 2;
+        if (x >= 0.0f && x < 5.0f) return 3;
+        if (x >= 5.0f && x < 10.0f) return 4;
+        if (x >= 10.0f && x < 20.0f) return 5;
+        if (x >= 20.0f && x <= 40.0f) return 6;
+        return -1;
+    };
+
+    // ---------- Step-1 : 全图内部 range image（障碍物也投影，用于列向截止判断）----------
+    struct GndPix { float z = 0.f; int cidx = -1; float range = 1e9f; };
+    std::vector<GndPix> gnd_ri(H_SCANS * W_COLS);
+
+    const float fov_up_rad   =  FOV_UP   * (float)M_PI / 180.f;
+    const float fov_down_rad =  FOV_DOWN * (float)M_PI / 180.f;
+    const float fov_total    =  fov_up_rad - fov_down_rad;   // 正值
+
+    for (int i = 0; i < (int)cloud.size(); ++i) {
+        const auto& pt = cloud.points[i];
+        if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+
+        const float r2 = pt.x*pt.x + pt.y*pt.y + pt.z*pt.z;
+        if (r2 < (float)(MIN_RANGE * MIN_RANGE)) continue;
+        if (r2 > (float)(MAX_RANGE * MAX_RANGE)) continue;
+        ++ground_debug_stats_.input_valid_points;
+        const float r = std::sqrt(r2);
+
+        const float ang_v = std::asin(pt.z / r);
+        const float row_f = (ang_v - fov_down_rad) / fov_total * (float)(H_SCANS - 1);
+        const int   row   = (int)std::round(row_f);
+        if (row < 0 || row >= H_SCANS) continue;
+
+        const float ang_h = std::atan2(pt.y, pt.x);
+        int col = (int)std::round((ang_h + (float)M_PI) / (2.f*(float)M_PI) * (float)W_COLS);
+        if (col >= W_COLS) col -= W_COLS;
+        if (col < 0)       col += W_COLS;
+
+        const int idx = row * W_COLS + col;
+        if (r < gnd_ri[idx].range) {
+            gnd_ri[idx] = {pt.z, i, r};
+        }
+    }
+
+    // ---------- Step-2 : 列向传播（底环 → 顶环）----------
+    // row 0 对应最低仰角（FOV_DOWN = -24.8°），row H_SCANS-1 对应最高仰角（FOV_UP = +2°）
+    // 从 row=0（底环，指向地面）往上走（u 递增）；遇到 z >= z_max（硬上限）或 |Δz| > col_max_step 则截止
+    const float z_max_f   = (float)z_max;
+    const float step_max  = (float)col_max_step;
+
+    std::vector<int> col_gnd_cidx;
+    col_gnd_cidx.reserve(W_COLS * H_SCANS / 8);
+
+    for (int v = 0; v < W_COLS; ++v) {
+        float last_z = std::numeric_limits<float>::quiet_NaN();
+        bool seeded = false;
+        for (int u = 0; u < H_SCANS; ++u) {  // 从底环(u=0)向顶环(u=H_SCANS-1)传播
+            const auto& gp = gnd_ri[u * W_COLS + v];
+            if (gp.cidx < 0) continue;          // 该环无点，跳过继续向上
+            const float z = gp.z;
+            if (z >= z_max_f) {
+                ++ground_debug_stats_.cut_by_zmax;
+                break;             // 触碰硬上限，截止
+            }
+            if (std::isnan(last_z)) {
+                // 种子：第一个有效且低于硬上限的环
+                if (!seeded) {
+                    seeded = true;
+                    ++ground_debug_stats_.seed_cols;
+                }
+                last_z = z;
+                col_gnd_cidx.push_back(gp.cidx);
+                ++ground_debug_stats_.accepted_col_points;
+                const int bin = distanceBin(cloud.points[gp.cidx].x);
+                if (bin >= 0) ++ground_debug_stats_.col_bin_counts[bin];
+            } else {
+                if (std::abs(z - last_z) > step_max) {
+                    ++ground_debug_stats_.cut_by_step;
+                    break;  // 高度跳变，截止
+                }
+                last_z = z;
+                col_gnd_cidx.push_back(gp.cidx);
+                ++ground_debug_stats_.accepted_col_points;
+                const int bin = distanceBin(cloud.points[gp.cidx].x);
+                if (bin >= 0) ++ground_debug_stats_.col_bin_counts[bin];
+            }
+        }
+    }
+
+    // ---------- Step-3 : XY 格子严格过滤 ----------
+    using CellKey = std::pair<int32_t, int32_t>;
+    struct CellHash {
+        size_t operator()(const CellKey& k) const noexcept {
+            return std::hash<int64_t>()((int64_t(k.first) << 32) | (uint32_t)k.second);
+        }
+    };
+    std::unordered_map<CellKey, std::vector<int>, CellHash> cells;
+    const float cs = (float)cell_size;
+
+    for (int ci : col_gnd_cidx) {
+        const auto& pt = cloud.points[ci];
+        const int32_t cx = (int32_t)std::floor(pt.x / cs);
+        const int32_t cy = (int32_t)std::floor(pt.y / cs);
+        cells[{cx, cy}].push_back(ci);
+    }
+    ground_debug_stats_.cell_count = (int)cells.size();
+
+    std::vector<int> result;
+    result.reserve(col_gnd_cidx.size());
+
+    for (auto& [key, indices] : cells) {
+        if (indices.empty()) continue;
+        std::vector<float> zs;
+        zs.reserve(indices.size());
+        for (int ci : indices) zs.push_back(cloud.points[ci].z);
+        std::sort(zs.begin(), zs.end());
+        // 取低分位作参考，严格容差（偏紧，避免低矮障碍物混入）
+        const int k = std::max(0, std::min((int)zs.size() - 1,
+                               (int)std::floor(cell_z_pct * (double)(zs.size() - 1))));
+        const float z_cut = zs[k] + (float)cell_z_tol;
+        for (int ci : indices) {
+            if (cloud.points[ci].z <= z_cut) {
+                ground_cloud_mask_[ci] = true;
+                result.push_back(ci);
+                const int bin = distanceBin(cloud.points[ci].x);
+                if (bin >= 0) ++ground_debug_stats_.final_bin_counts[bin];
+            }
+        }
+    }
+    ground_debug_stats_.after_cell_filter = (int)result.size();
+    return result;
 }
 
 bool RangeImageProcessor::getPointCloud(pcl::PointCloud<pcl::PointXYZ> & pcl_got, double voxel_filter_size)

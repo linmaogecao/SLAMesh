@@ -46,11 +46,30 @@ public:
     int    ground_fit_max_pts{150};   // 每格 BSpline 拟合最多用点数
     double ground_cell_z_pct{0.0};    // 建图：格内 z 参考；(0,1]=分位，<=0 用均值
     double ground_cell_z_tol{0.2};    // 建图：相对参考高度上容差（米）；<=0 关闭
-    int    ground_skip_points{40};    // 地面配准采样间隔（已被 XY 格子采样替代，仅作初筛备用）
+    int    ground_skip_points{40};    // 地面配准采样间隔（已被分层采样替代，仅作退化备用）
     double ground_clear_dist{150.0};  // 超过此距离（米）的旧格被清除
     double ground_reg_cell_size{3.0}; // 地面配准 XY 格子采样边长（米）；0=退化回 skip 模式
-    int    ground_reg_cell_max_pts{30}; // 每个 XY 采样格最多保留点数
+    int    ground_reg_cell_max_pts{30}; // 每个 XY 采样格最多保留点数（分层采样启用时不再生效）
     double ground_reg_y_max{5.0};     // 配准：雷达系 |y| 上限（米）；<=0 不限制
+
+    // ── 地面配准分层采样（按雷达系 x 前向距离分 bin，保证远近均衡）──
+    // 每个 bin 对应 GroundMatchPolicy::distanceBin 的 7 档：
+    // [-30,-20) / [-20,-10) / [-10,0) / [0,5) / [5,10) / [10,20) / [20,40]
+    bool gnd_stratified_enabled{true}; // true=分层采样；false=退化回 world XY 格采样
+    int  gnd_bin_cap_0{200};  // bin-0: x∈[-30,-20) 后远
+    int  gnd_bin_cap_1{250};  // bin-1: x∈[-20,-10) 后中
+    int  gnd_bin_cap_2{250};  // bin-2: x∈[-10,0)   后近
+    int  gnd_bin_cap_3{250};  // bin-3: x∈[0,5)     前近
+    int  gnd_bin_cap_4{300};  // bin-4: x∈[5,10)
+    int  gnd_bin_cap_5{350};  // bin-5: x∈[10,20)   中距
+    int  gnd_bin_cap_6{350};  // bin-6: x∈[20,40]   远处，pitch 主力
+
+    // ── 地面点列向传播 + XY 格子分类（extractGroundByCellFilter）──
+    bool   gnd_cell_enabled{false};   // 总开关：true=启用；false=退化回旧 z 带分类
+    double gnd_col_max_step{0.05};    // 列向传播：相邻环 z 允许变化上限（m）；超出截止
+    double gnd_cell_size{5.0};        // XY 格子边长（米）
+    double gnd_cell_z_pct{0.10};      // 格内 z 低分位（0.10 = 10%）
+    double gnd_cell_z_tol{0.15};      // 高于低分位的上容差（m）；偏严以排除低矮障碍物
 
     double correction_x{0}, correction_y{0}, correction_z{0},
     correction_roll_degree{0}, correction_pitch_degree{0}, correction_yaw_degree{0};
