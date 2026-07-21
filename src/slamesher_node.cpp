@@ -1186,6 +1186,8 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/dump_occluded_step", dump_occluded_step, 0);
     nh.param("slamesher/dump_gnd_scan_begin", dump_gnd_scan_begin, 0);
     nh.param("slamesher/dump_gnd_scan_end", dump_gnd_scan_end, 0);
+    nh.param("slamesher/gnd_diag_begin", gnd_diag_begin, 0);
+    nh.param("slamesher/gnd_diag_end", gnd_diag_end, 0);
     nh.param("slamesher/all_surfaces_max_step", all_surfaces_max_step, 0);
     std::cout<<"max_steps: "<<max_steps<<std::endl;
     std::cout<<"max_frames: "<<max_frames<<(max_frames > 0 ? " (debug stop)" : " (run full sequence)")<<std::endl;
@@ -1205,6 +1207,13 @@ void Parameter::initParameter(ros::NodeHandle & nh){
                       ? (std::to_string(dump_gnd_scan_begin) + ".." + std::to_string(dump_gnd_scan_end)
                          + " -> " + std::string(kBsplineBuildDir)
                          + "/gnd_scan/ + whole_gnd/ + scan_world/")
+                      : "off")
+                  << std::endl;
+        const bool gnd_diag_on = (gnd_diag_begin > 0 && gnd_diag_end >= gnd_diag_begin);
+        std::cout << "gnd_diag: "
+                  << (gnd_diag_on
+                      ? (std::to_string(gnd_diag_begin) + ".." + std::to_string(gnd_diag_end)
+                         + " (classify cut / map clip / residual-by-bin)")
                       : "off")
                   << std::endl;
         if (gnd_scan_on) {
@@ -1267,6 +1276,7 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/ground_cell_num_cp",  ground_cell_num_cp,  5);
     nh.param("slamesher/ground_query_radius", ground_query_radius, 1);
     nh.param("slamesher/ground_map_skip_points", ground_map_skip_points, 8);
+    nh.param("slamesher/ground_map_skip_above",  ground_map_skip_above,  0);
     nh.param("slamesher/ground_cell_max_pts",    ground_cell_max_pts,    400);
     nh.param("slamesher/ground_fit_max_pts",     ground_fit_max_pts,     150);
     nh.param("slamesher/ground_cell_z_pct",      ground_cell_z_pct,      0.0);
@@ -1287,17 +1297,20 @@ void Parameter::initParameter(ros::NodeHandle & nh){
               << " z_pct=" << gnd_cell_z_pct
               << " z_tol=" << gnd_cell_z_tol << "m" << std::endl;
     nh.param("slamesher/gnd_stratified_enabled", gnd_stratified_enabled, true);
-    nh.param("slamesher/gnd_bin_cap_0", gnd_bin_cap_0, 200);
-    nh.param("slamesher/gnd_bin_cap_1", gnd_bin_cap_1, 250);
-    nh.param("slamesher/gnd_bin_cap_2", gnd_bin_cap_2, 250);
-    nh.param("slamesher/gnd_bin_cap_3", gnd_bin_cap_3, 250);
-    nh.param("slamesher/gnd_bin_cap_4", gnd_bin_cap_4, 300);
-    nh.param("slamesher/gnd_bin_cap_5", gnd_bin_cap_5, 350);
-    nh.param("slamesher/gnd_bin_cap_6", gnd_bin_cap_6, 350);
+    nh.param("slamesher/gnd_bin_cap_0", gnd_bin_cap_0, 240);
+    nh.param("slamesher/gnd_bin_cap_1", gnd_bin_cap_1, 260);
+    nh.param("slamesher/gnd_bin_cap_2", gnd_bin_cap_2, 260);
+    nh.param("slamesher/gnd_bin_cap_3", gnd_bin_cap_3, 200);
+    nh.param("slamesher/gnd_bin_cap_4", gnd_bin_cap_4, 200);
+    nh.param("slamesher/gnd_bin_cap_5", gnd_bin_cap_5, 240);
+    nh.param("slamesher/gnd_bin_cap_6", gnd_bin_cap_6, 240);
+    nh.param("slamesher/gnd_bin_cap_7", gnd_bin_cap_7, 0);
     std::cout << "gnd_stratified: " << (gnd_stratified_enabled ? "ON" : "OFF")
               << " caps=[" << gnd_bin_cap_0 << "," << gnd_bin_cap_1 << ","
               << gnd_bin_cap_2 << "," << gnd_bin_cap_3 << "," << gnd_bin_cap_4 << ","
-              << gnd_bin_cap_5 << "," << gnd_bin_cap_6 << "]" << std::endl;
+              << gnd_bin_cap_5 << "," << gnd_bin_cap_6 << "," << gnd_bin_cap_7 << "]"
+              << "  bins=[-50,-30)/[-30,-20)/[-20,-10)/[-10,0)/[0,5)/[5,10)/[10,20)/[20,40]"
+              << std::endl;
     nh.param("slamesher/bootstrap_step2_tx", bootstrap_step2_tx, 0.5);
     nh.param("slamesher/bootstrap_step2_ty", bootstrap_step2_ty, 0.0);
     nh.param("slamesher/bootstrap_step2_tz", bootstrap_step2_tz, 0.0);
@@ -1316,6 +1329,7 @@ void Parameter::initParameter(ros::NodeHandle & nh){
               << " num_cp=" << ground_cell_num_cp
               << " query_r=" << ground_query_radius
               << " map_skip=" << ground_map_skip_points
+              << " skip_above=" << ground_map_skip_above
               << " cell_max=" << ground_cell_max_pts
               << " fit_max=" << ground_fit_max_pts
               << " z_pct=" << ground_cell_z_pct
@@ -1956,17 +1970,37 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
              param.dump_gnd_scan_end >= param.dump_gnd_scan_begin &&
              g_data.step >= param.dump_gnd_scan_begin &&
              g_data.step <= param.dump_gnd_scan_end);
+        const bool gnd_diag_log =
+            (param.gnd_diag_begin > 0 &&
+             param.gnd_diag_end >= param.gnd_diag_begin &&
+             g_data.step >= param.gnd_diag_begin &&
+             g_data.step <= param.gnd_diag_end);
+        const bool gnd_detail_log = gnd_funnel_log || gnd_diag_log;
         auto gndMatchDistForIter = [](int it) -> double {
             static constexpr double kSched[3] = {1.5, 0.4, 0.1};
             return kSched[std::min(std::max(it, 0), kGndIters - 1)];
         };
         auto fmtBinCounts = [](const auto& bins) -> std::string {
             std::ostringstream oss;
-            oss << "[" << bins[0] << "," << bins[1] << "," << bins[2]
-                << "," << bins[3] << "," << bins[4] << "]";
+            oss << "[";
+            for (int _i = 0; _i < (int)bins.size(); ++_i) {
+                if (_i) oss << ",";
+                oss << bins[_i];
+            }
+            oss << "]";
             return oss.str();
         };
-        if (gnd_funnel_log && param.gnd_cell_enabled) {
+        auto fmtBinDoubles = [](const auto& bins, int prec = 4) -> std::string {
+            std::ostringstream oss;
+            oss << std::fixed << std::setprecision(prec) << "[";
+            for (int _i = 0; _i < (int)bins.size(); ++_i) {
+                if (_i) oss << ",";
+                oss << bins[_i];
+            }
+            oss << "]";
+            return oss.str();
+        };
+        if (gnd_detail_log && param.gnd_cell_enabled) {
             const auto& s = rp_near.ground_debug_stats_;
             std::cout << "  [GndColStat] step=" << g_data.step
                       << " input_valid=" << s.input_valid_points
@@ -1979,6 +2013,33 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                       << " after_cell=" << s.after_cell_filter
                       << " final_bins=" << fmtBinCounts(s.final_bin_counts)
                       << std::endl;
+            if (gnd_diag_log) {
+                std::cout << "  [GndDiag/Classify] step=" << g_data.step
+                          << " cell_cut=" << s.cell_cut_total
+                          << " cell_cut_bins=" << fmtBinCounts(s.cell_cut_bin_counts)
+                          << " cut_zmax_bins=" << fmtBinCounts(s.cut_zmax_bins)
+                          << " cut_step_bins=" << fmtBinCounts(s.cut_step_bins)
+                          << std::endl;
+                // z 带占用：全点按距离 bin 统计落在/低于/高于 z 带的点数
+                std::array<int, ground_match_policy::kDistanceBinCount> z_in{}, z_lo{}, z_hi{};
+                for (int i = 0; i < (int)scan_local.size(); ++i) {
+                    const auto& pt = scan_local.points[i];
+                    if (!std::isfinite(pt.x) || !std::isfinite(pt.y) || !std::isfinite(pt.z)) continue;
+                    const double rs = (pt.x < 0.0f ? -1.0 : 1.0) *
+                                      std::hypot(static_cast<double>(pt.x), static_cast<double>(pt.y));
+                    const int b = ground_match_policy::distanceBin(rs);
+                    if (b < 0) continue;
+                    if (pt.z < ground_z_min) ++z_lo[b];
+                    else if (pt.z > ground_z_max) ++z_hi[b];
+                    else ++z_in[b];
+                }
+                std::cout << "  [GndDiag/ZBand] step=" << g_data.step
+                          << " z_in_bins=" << fmtBinCounts(z_in)
+                          << " z_below_bins=" << fmtBinCounts(z_lo)
+                          << " z_above_bins=" << fmtBinCounts(z_hi)
+                          << " band=[" << ground_z_min << "," << ground_z_max << "]"
+                          << std::endl;
+            }
         }
 
         for (int giter = 0; giter < kGndIters; ++giter) {
@@ -2016,19 +2077,23 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 const std::array<int, kDistanceBinCount> caps{
                     param.gnd_bin_cap_0, param.gnd_bin_cap_1, param.gnd_bin_cap_2,
                     param.gnd_bin_cap_3, param.gnd_bin_cap_4, param.gnd_bin_cap_5,
-                    param.gnd_bin_cap_6};
+                    param.gnd_bin_cap_6, param.gnd_bin_cap_7};
 
                 // Step-1: 收集所有通过高度/分类过滤的候选
+                // 使用 r_signed = sign(x)·hypot(x,y) 作为距离度量：
+                // 弯道时后方点 x 很小但 y 大，用 r_signed 才能正确按实际距离分 bin
                 std::vector<Candidate> candidates;
                 candidates.reserve(scan_local.size() / 8);
                 for (int i = 0; i < (int)scan_local.size(); ++i) {
                     if (!passGndLocal(i)) continue;
                     ++pass_local_cnt;
                     const auto& pt = scan_local.points[i];
-                    const Candidate cand{i, static_cast<double>(pt.x), static_cast<double>(pt.y)};
+                    const double r_signed = (pt.x < 0.0f ? -1.0 : 1.0) *
+                                            std::hypot(static_cast<double>(pt.x),
+                                                       static_cast<double>(pt.y));
+                    const Candidate cand{i, r_signed, static_cast<double>(pt.y)};
                     const int bin = distanceBin(cand.x);
                     if (bin >= 0) ++pass_bins[bin];
-                    // 只把落在 5 个距离 bin 内的点送入分层采样
                     if (bin < 0) continue;
                     candidates.push_back(cand);
                 }
@@ -2056,7 +2121,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                         if (bin >= 0) ++query_fail_bins[bin];
                     }
                 }
-                if (gnd_funnel_log) {
+                if (gnd_detail_log) {
                     std::cout << "  [GndReg] step=" << g_data.step
                               << " giter=" << giter
                               << " pass_local=" << pass_local_cnt
@@ -2119,7 +2184,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             int dbg_fp_total = 0, dbg_rej_thr = 0, dbg_rej_tiny = 0, dbg_rej_bad_normal = 0;
             buildGroundMatches(gnd_surf_to_pts, gnd_thr, gnd_matches,
                                &dbg_fp_total, &dbg_rej_thr, &dbg_rej_tiny, &dbg_rej_bad_normal);
-            if (gnd_funnel_log) {
+            if (gnd_detail_log) {
                 std::cout << "  [GndMatch] step=" << g_data.step
                           << " giter=" << giter
                           << " thr=" << gnd_thr
@@ -2130,6 +2195,40 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                           << " rej_tiny=" << dbg_rej_tiny
                           << " rej_bad_normal=" << dbg_rej_bad_normal
                           << " accept=" << gnd_matches.size()
+                          << std::endl;
+            }
+            if (gnd_diag_log) {
+                // 有符号点到面残差按距离 bin：mean(n·(p-q))，坡度偏平时前方/后方常系统性同号
+                using namespace ground_match_policy;
+                std::array<int, kDistanceBinCount> n_bin{};
+                std::array<double, kDistanceBinCount> sum_n{}, sum_abs{}, sum_dz{}, sum_x{};
+                for (const auto& m : gnd_matches) {
+                    const double rs = (m.p_local.x() < 0.0 ? -1.0 : 1.0) *
+                                      std::hypot(m.p_local.x(), m.p_local.y());
+                    const int b = distanceBin(rs);
+                    if (b < 0) continue;
+                    const double d_n = (m.p_world - m.curvature.point).dot(m.curvature.normal);
+                    ++n_bin[b];
+                    sum_n[b] += d_n;
+                    sum_abs[b] += std::abs(d_n);
+                    sum_dz[b] += (m.p_world.z() - m.curvature.point.z());
+                    sum_x[b] += m.p_local.x();
+                }
+                std::array<double, kDistanceBinCount> mean_n{}, mean_abs{}, mean_dz{}, mean_x{};
+                for (int b = 0; b < kDistanceBinCount; ++b) {
+                    if (n_bin[b] <= 0) continue;
+                    mean_n[b] = sum_n[b] / n_bin[b];
+                    mean_abs[b] = sum_abs[b] / n_bin[b];
+                    mean_dz[b] = sum_dz[b] / n_bin[b];
+                    mean_x[b] = sum_x[b] / n_bin[b];
+                }
+                std::cout << "  [GndDiag/ResBin] step=" << g_data.step
+                          << " giter=" << giter
+                          << " n=" << fmtBinCounts(n_bin)
+                          << " mean_n=" << fmtBinDoubles(mean_n)
+                          << " mean|n|=" << fmtBinDoubles(mean_abs)
+                          << " mean_dz=" << fmtBinDoubles(mean_dz)
+                          << " mean_x=" << fmtBinDoubles(mean_x, 2)
                           << std::endl;
             }
 
@@ -2173,14 +2272,30 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
             last_gnd_matches = gnd_matches;
 
+            // 按实际距离 r_signed 统计每 bin 匹配数，用于动态调权
+            // 当近点密集而远点稀少时，normalizedPointWeight 自动放大远点权重
+            using namespace ground_match_policy;
+            std::array<int, kDistanceBinCount> gnd_match_bin_counts{};
+            for (const auto& m : gnd_matches) {
+                const double rs = (m.p_local.x() < 0.0 ? -1.0 : 1.0) *
+                                  std::hypot(m.p_local.x(), m.p_local.y());
+                const int b = distanceBin(rs);
+                if (b >= 0) ++gnd_match_bin_counts[b];
+            }
+
             double rpy_z[3] = {roll_i, pitch_i, T_curr(2, 3)};
             ceres::Problem problem;
             ceres::LossFunction* loss = new ceres::HuberLoss(0.5);
             for (const auto& m : gnd_matches) {
+                const double rs = (m.p_local.x() < 0.0 ? -1.0 : 1.0) *
+                                  std::hypot(m.p_local.x(), m.p_local.y());
+                const int b = distanceBin(rs);
+                const double scale = normalizedPointWeight(b, gnd_match_bin_counts);
+                if (scale <= 0.0) continue;  // 前远 prior=0，不进优化
                 problem.AddResidualBlock(
                     GroundPointToPlaneZRP::Create(
                         m.p_local, m.curvature.point, m.curvature.normal,
-                        x_fix, y_fix, yaw_fix, 1.0),
+                        x_fix, y_fix, yaw_fix, scale),
                     loss, rpy_z);
             }
             ceres::Solver::Options opts;
@@ -2435,9 +2550,22 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
         pcl::PointCloud<pcl::PointXYZ> cloud_gnd_world;
         std::vector<Eigen::Vector3d> gnd_lidar_pts;
         gnd_lidar_pts.reserve(scan_local.size() / 16);
-        const int gnd_map_skip = std::max(1, param.ground_map_skip_points);
+        // 投格前抽稀：
+        // - skip_above > 0：候选 <= above 全保留；超过则均匀抽到约 above 个
+        // - skip_above <= 0：不 skip（stride=1），过密由格内 cell_max_pts 处理
+        auto mapSkipStride = [&](int cand_count) -> int {
+            if (cand_count <= 0) return 1;
+            if (param.ground_map_skip_above > 0) {
+                if (cand_count <= param.ground_map_skip_above) return 1;
+                return std::max(1, (cand_count + param.ground_map_skip_above - 1) /
+                                       param.ground_map_skip_above);
+            }
+            return 1;
+        };
 
         if (param.gnd_cell_enabled) {
+            const int cand = static_cast<int>(gnd_indices.size());
+            const int gnd_map_skip = mapSkipStride(cand);
             int cnt = 0;
             for (int i : gnd_indices) {
                 if (cnt++ % gnd_map_skip != 0) continue;
@@ -2447,9 +2575,16 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                 cloud_gnd_world.push_back(pcl::PointXYZ(
                     static_cast<float>(pw.x()), static_cast<float>(pw.y()), static_cast<float>(pw.z())));
             }
-            std::cout << "  [GndCol] map_pts=" << cloud_gnd_world.size() << "\n";
+            std::cout << "  [GndCol] map_pts=" << cloud_gnd_world.size()
+                      << " cand=" << cand << " skip=" << gnd_map_skip << "\n";
         } else {
             // 旧方案：纯 z 带
+            int cand = 0;
+            for (int i = 0; i < (int)scan_local.size(); ++i) {
+                const auto& pt = scan_local.points[i];
+                if (pt.z >= ground_z_min && pt.z <= ground_z_max) ++cand;
+            }
+            const int gnd_map_skip = mapSkipStride(cand);
             for (int i = 0; i < (int)scan_local.size(); i += gnd_map_skip) {
                 const auto& pt = scan_local.points[i];
                 if (pt.z < ground_z_min || pt.z > ground_z_max) continue;
@@ -2464,7 +2599,32 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
             saveFrame1GroundPoints(gnd_lidar_pts);
 
         if (!cloud_gnd_world.empty()) {
-            auto touched = ground_grid.addPoints(cloud_gnd_world, g_data.step);
+            GroundCellAddStats add_stats;
+            const bool gnd_diag_map =
+                (param.gnd_diag_begin > 0 &&
+                 param.gnd_diag_end >= param.gnd_diag_begin &&
+                 g_data.step >= param.gnd_diag_begin &&
+                 g_data.step <= param.gnd_diag_end);
+            auto touched = ground_grid.addPoints(
+                cloud_gnd_world, g_data.step, gnd_diag_map ? &add_stats : nullptr);
+            if (gnd_diag_map) {
+                const double approx_slope_deg =
+                    (add_stats.max_span_xy > 1e-3)
+                        ? (std::atan2(add_stats.max_z_span, add_stats.max_span_xy) * 180.0 / M_PI)
+                        : 0.0;
+                std::cout << "  [GndDiag/MapClip] step=" << g_data.step
+                          << " cells=" << add_stats.cells_touched
+                          << " pts_before=" << add_stats.pts_before_filter
+                          << " clipped=" << add_stats.pts_clipped
+                          << " capped=" << add_stats.pts_capped
+                          << " after=" << add_stats.pts_after_filter
+                          << " cells_clipped=" << add_stats.cells_clipped
+                          << " cells_reverted=" << add_stats.cells_reverted
+                          << " max_xy_span=" << add_stats.max_span_xy
+                          << " max_z_span=" << add_stats.max_z_span
+                          << " approx_slope_deg=" << approx_slope_deg
+                          << std::endl;
+            }
             if (profile_frame1_apply)
                 BSplineSurface::setApplyProfileLabel("gnd");
             n_added_gnd = ground_grid.refitCells(touched, param.num_thread);

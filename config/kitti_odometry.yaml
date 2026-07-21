@@ -7,17 +7,19 @@ slamesher:
   read_offline_pcd: true 
   dataset: 1
   max_steps: 10000
-  max_frames: 200      # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
-  dump_frame: 200        # 0=不保存；>0 时导出 matched/unmatched/scan_world + 远距 cluster 漏斗统计
+  max_frames: 150      # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
+  dump_frame: 150        # 0=不保存；>0 时导出 matched/unmatched/scan_world + 远距 cluster 漏斗统计
   dump_cluster_step: 0   # 0=不保存；>0 时导出 cluster 到 build/output_clusters/
   dump_occluded_step: 0 # 0=不保存；>0 时导出 range image 入图点 + 被遮挡点到 build/rangeimage_*,occluded_*.txt
-  dump_gnd_scan_begin: 70  # 闭区间起点；写 gnd_scan/（过 thr 匹配点）+ whole_gnd/（z带初分类地面点）+ scan_world/（全量世界系点）；启动先清空
-  dump_gnd_scan_end: 200    # 闭区间终点；任一为 0 则关闭
+  dump_gnd_scan_begin: 95  # 闭区间起点；写 gnd_scan/（过 thr 匹配点）+ whole_gnd/（z带初分类地面点）+ scan_world/（全量世界系点）；启动先清空
+  dump_gnd_scan_end: 150    # 闭区间终点；任一为 0 则关闭
+  gnd_diag_begin: 90      # 闭区间：打印地面诊断（分类砍点/建图clip/匹配残差分bin）；看 pitch 跟丢时设 58..61
+  gnd_diag_end: 150        # 任一为 0 则关闭；改区间即可，无需改代码
   console_log_path: "/home/albus/catkin_ws/src/SLAMesh/debug.txt"   # 空=自动写到 file_loc_report/seq##_run_时间.log；也可填绝对路径如 debug.txt
   save_surface_samples: true  # true 时在 global_map/ 下按序号保存曲面稀疏采样点（全序列）
-  all_surfaces_max_step: 200 # 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面（如 60）
+  all_surfaces_max_step: 0 # 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面（如 60）
   map_save_step_begin: 70 # 与 end 配合的 step 闭区间过滤（all_surfaces_max_step>0 时优先）
-  map_save_step_end:   200  # 0=不限；例 begin=100 end=150 只导出该区间新建的曲面
+  map_save_step_end:   150  # 0=不限；例 begin=100 end=150 只导出该区间新建的曲面
   save_mesh_map: false
   #register param
   range_max: 100
@@ -44,7 +46,8 @@ slamesher:
   ground_cell_min_pts: 60    # 格内点数达此值才拟合曲面
   ground_cell_num_cp: 5      # BSpline 每维控制点数
   ground_query_radius: 1     # 配准查询格半径（格数）
-  ground_map_skip_points: 8  # 建图：z 带内每隔 N 点取 1 点投格（1=不跳）
+  ground_map_skip_points: 8  # 保留字段（当前投格前逻辑不再用固定 stride）
+  ground_map_skip_above: 0    # <=0：投格前不 skip（推荐）；>0：候选超过此数才均匀抽到该数量
   ground_cell_max_pts: 400   # 每格最多保留点数（超出均匀下采样）
   ground_fit_max_pts: 150    # 每格 BSpline 拟合最多用点数
   ground_cell_z_pct: 0.0     # 建图格内 z 参考：(0,1]=分位；<=0 用均值（默认）
@@ -53,23 +56,25 @@ slamesher:
   ground_clear_dist: 150.0   # 超过此距离（米）的旧格被清除
   ground_reg_cell_size: 5.0  # 配准时 XY 均匀采样格边长（米）；0=退化为 skip 模式
   ground_reg_cell_max_pts: 30 # 每个采样格最多取点数
-  ground_reg_y_max: 15.0      # 配准：雷达系 |y|<=此值（米）；<=0 不限制（减少两侧障碍脏点）
+  ground_reg_y_max: 0         # 配准：<=0 不限制（弯道侧后方点不被截断）
   # ── 地面点 XY 格子分类 ──
   gnd_cell_enabled:  true    # true=列向传播+格子过滤；false=退化为纯 z 带
-  gnd_col_max_step:  0.1    # 列向传播：同列相邻环 z 允许变化上限（m）
+  gnd_col_max_step:  0.1    # 列向传播：同列相邻环 |Δz| 上限（m）；超出只断链开新段，不整列停止（整列仅 z>=ground_z_max 停）
   gnd_cell_size:     5.0     # XY 格子边长（米）
   gnd_cell_z_pct:    0.10    # 格内 z 低分位（10%）作参考高度
   gnd_cell_z_tol:    0.15    # 高于参考的上容差（m）；偏严以排除低矮障碍物
-  # ── 地面配准分层采样（按雷达系 x 前向距离 bin，保证远近均衡）──
-  # caps 合计 1950；车后拆 3 段，前方保持 4 段
+  # ── 地面配准分层采样（r_signed 距离 bin，后方到 -50m）──
+  # [-50,-30)/[-30,-20)/[-20,-10)/[-10,0)/[0,5)/[5,10)/[10,20)/[20,40]
+  # 总配额约 1640；加重后极远/后远杠杆；前远 bin7 无图 cap=0
   gnd_stratified_enabled: true
-  gnd_bin_cap_0:  200   # bin-0: x∈[-30,-20) 后远
-  gnd_bin_cap_1:  250   # bin-1: x∈[-20,-10) 后中
-  gnd_bin_cap_2:  250   # bin-2: x∈[-10,0)   后近
-  gnd_bin_cap_3:  250   # bin-3: x∈[0,5)     前近
-  gnd_bin_cap_4:  300   # bin-4: x∈[5,10)
-  gnd_bin_cap_5:  350   # bin-5: x∈[10,20)   中距
-  gnd_bin_cap_6:  350   # bin-6: x∈[20,40]   远处，pitch 主力
+  gnd_bin_cap_0:  240   # bin-0: 后极远 [-50,-30)
+  gnd_bin_cap_1:  260   # bin-1: 后远   [-30,-20)
+  gnd_bin_cap_2:  260   # bin-2: 后中   [-20,-10)
+  gnd_bin_cap_3:  200   # bin-3: 后近   [-10,0)
+  gnd_bin_cap_4:  200   # bin-4: 前近   [0,5)
+  gnd_bin_cap_5:  240   # bin-5: 前中近 [5,10)
+  gnd_bin_cap_6:  240   # bin-6: 前中   [10,20)
+  gnd_bin_cap_7:  0     # bin-7: 前远   [20,40]，未建图，不采样
   cross_overlap: true
   cross_cell_overlap_length: 1
   num_margin_old_cell: 500

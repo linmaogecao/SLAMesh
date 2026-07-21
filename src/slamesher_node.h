@@ -18,6 +18,7 @@ public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     int    max_steps{10000}, max_frames{0}, dump_frame{0}, dump_cluster_step{0}, dump_occluded_step{0}, register_times, num_test, min_points_num_to_gp, num_thread, cross_cell_overlap_length, dataset;
     int    dump_gnd_scan_begin{0}, dump_gnd_scan_end{0};  // 闭区间每帧写 gnd_scan/ + whole_gnd/ + scan_world/；0=关；启动时先清空目录
+    int    gnd_diag_begin{0}, gnd_diag_end{0};            // 闭区间打印地面诊断（分类砍点/建图clip/匹配残差分bin）；任一为0则关
     int    map_update_interval{20}, ground_build_interval{20};
     int    map_save_step_begin{0}, map_save_step_end{0};  // 0=不限；导出 created_step 在此闭区间内的曲面
     int    all_surfaces_max_step{0};  // 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面
@@ -41,7 +42,8 @@ public:
     int    ground_cell_min_pts{80};   // 格内点数达此值才拟合曲面
     int    ground_cell_num_cp{5};     // BSpline 每维控制点数
     int    ground_query_radius{1};    // 配准查询格半径（格数）
-    int    ground_map_skip_points{8}; // 地面建图：雷达系 z 带内每隔 N 点取 1 点投格
+    int    ground_map_skip_points{8}; // 保留；投格前现以 skip_above 为准（<=0 不 skip）
+    int    ground_map_skip_above{0};  // <=0 投格前不 skip；>0 时候选超过此数才均匀抽到该数量
     int    ground_cell_max_pts{400};  // 每格最多保留点数（超出均匀下采样）
     int    ground_fit_max_pts{150};   // 每格 BSpline 拟合最多用点数
     double ground_cell_z_pct{0.0};    // 建图：格内 z 参考；(0,1]=分位，<=0 用均值
@@ -52,21 +54,22 @@ public:
     int    ground_reg_cell_max_pts{30}; // 每个 XY 采样格最多保留点数（分层采样启用时不再生效）
     double ground_reg_y_max{5.0};     // 配准：雷达系 |y| 上限（米）；<=0 不限制
 
-    // ── 地面配准分层采样（按雷达系 x 前向距离分 bin，保证远近均衡）──
-    // 每个 bin 对应 GroundMatchPolicy::distanceBin 的 7 档：
-    // [-30,-20) / [-20,-10) / [-10,0) / [0,5) / [5,10) / [10,20) / [20,40]
+    // ── 地面配准分层采样（按雷达系 r_signed 分 bin，保证远近均衡）──
+    // 每个 bin 对应 GroundMatchPolicy::distanceBin 的 8 档：
+    // [-50,-30) / [-30,-20) / [-20,-10) / [-10,0) / [0,5) / [5,10) / [10,20) / [20,40]
     bool gnd_stratified_enabled{true}; // true=分层采样；false=退化回 world XY 格采样
-    int  gnd_bin_cap_0{200};  // bin-0: x∈[-30,-20) 后远
-    int  gnd_bin_cap_1{250};  // bin-1: x∈[-20,-10) 后中
-    int  gnd_bin_cap_2{250};  // bin-2: x∈[-10,0)   后近
-    int  gnd_bin_cap_3{250};  // bin-3: x∈[0,5)     前近
-    int  gnd_bin_cap_4{300};  // bin-4: x∈[5,10)
-    int  gnd_bin_cap_5{350};  // bin-5: x∈[10,20)   中距
-    int  gnd_bin_cap_6{350};  // bin-6: x∈[20,40]   远处，pitch 主力
+    int  gnd_bin_cap_0{240};  // bin-0: 后极远 [-50,-30)
+    int  gnd_bin_cap_1{260};  // bin-1: 后远   [-30,-20)
+    int  gnd_bin_cap_2{260};  // bin-2: 后中   [-20,-10)
+    int  gnd_bin_cap_3{200};  // bin-3: 后近   [-10,0)
+    int  gnd_bin_cap_4{200};  // bin-4: 前近   [0,5)
+    int  gnd_bin_cap_5{240};  // bin-5: 前中近 [5,10)
+    int  gnd_bin_cap_6{240};  // bin-6: 前中   [10,20)
+    int  gnd_bin_cap_7{0};    // bin-7: 前远   [20,40] 无图，不采样
 
     // ── 地面点列向传播 + XY 格子分类（extractGroundByCellFilter）──
     bool   gnd_cell_enabled{false};   // 总开关：true=启用；false=退化回旧 z 带分类
-    double gnd_col_max_step{0.05};    // 列向传播：相邻环 z 允许变化上限（m）；超出截止
+    double gnd_col_max_step{0.05};    // 列向：相邻环 |Δz| 上限；超出断链开新段，不整列停（整列仅 z>=z_max）
     double gnd_cell_size{5.0};        // XY 格子边长（米）
     double gnd_cell_z_pct{0.10};      // 格内 z 低分位（0.10 = 10%）
     double gnd_cell_z_tol{0.15};      // 高于低分位的上容差（m）；偏严以排除低矮障碍物

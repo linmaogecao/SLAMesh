@@ -59,6 +59,18 @@ struct GroundCell {
 // -----------------------------------------------------------------------
 // XY 2D 栅格地面地图
 // -----------------------------------------------------------------------
+struct GroundCellAddStats {
+    int cells_touched = 0;
+    int pts_before_filter = 0;
+    int pts_after_filter = 0;
+    int pts_clipped = 0;       // 相对 z 过滤砍掉
+    int pts_capped = 0;        // cell_max 均匀抽稀丢掉
+    int cells_clipped = 0;     // 发生过 z 过滤的格数
+    int cells_reverted = 0;    // 过滤后过少回退的格数
+    double max_span_xy = 0.0;  // 触及格中 XY 跨度最大（近似坡长）
+    double max_z_span = 0.0;   // 触及格中过滤前 z 跨度最大
+};
+
 class GroundGridMap {
 public:
     // cell_size   : XY 栅格边长（米），建议 4–8 m
@@ -90,11 +102,12 @@ public:
     // -----------------------------------------------------------------------
     // 把一帧地面点（世界系）投格，按 XY 分组写入对应 GroundCell
     // 投格后可按格内平均/分位高度砍掉偏高点，再封顶下采样
-    // 返回新增/更新的格 key 列表
+    // 返回新增/更新的格 key 列表；stats 非空时填过滤/封顶诊断
     // -----------------------------------------------------------------------
     std::vector<GroundCellKey> addPoints(
         const pcl::PointCloud<pcl::PointXYZ>& pts_world,
-        int current_step)
+        int current_step,
+        GroundCellAddStats* stats = nullptr)
     {
         std::unordered_set<GroundCellKey, GroundCellKeyHash> touched;
         for (const auto& pt : pts_world) {
@@ -105,11 +118,51 @@ public:
             cell.needs_refit = true;
             touched.insert(k);
         }
+        if (stats) {
+            stats->cells_touched = static_cast<int>(touched.size());
+            for (const auto& k : touched) {
+                auto it = cells_.find(k);
+                if (it == cells_.end()) continue;
+                stats->pts_before_filter += static_cast<int>(it->second.pts.size());
+            }
+        }
         for (const auto& k : touched) {
             auto it = cells_.find(k);
             if (it == cells_.end()) continue;
-            filterCellByRelativeZ(it->second.pts, cell_z_pct_, cell_z_tol_);
-            capPointsInPlace(it->second.pts, cell_max_pts_);
+            auto& pts = it->second.pts;
+            if (stats && !pts.empty()) {
+                float xmin = pts[0].x, xmax = pts[0].x;
+                float ymin = pts[0].y, ymax = pts[0].y;
+                float zmin = pts[0].z, zmax = pts[0].z;
+                for (const auto& p : pts) {
+                    xmin = std::min(xmin, p.x); xmax = std::max(xmax, p.x);
+                    ymin = std::min(ymin, p.y); ymax = std::max(ymax, p.y);
+                    zmin = std::min(zmin, p.z); zmax = std::max(zmax, p.z);
+                }
+                const double span_xy = std::hypot(static_cast<double>(xmax - xmin),
+                                                   static_cast<double>(ymax - ymin));
+                const double z_span = static_cast<double>(zmax - zmin);
+                stats->max_span_xy = std::max(stats->max_span_xy, span_xy);
+                stats->max_z_span = std::max(stats->max_z_span, z_span);
+            }
+            const int n0 = static_cast<int>(pts.size());
+            int reverted = 0;
+            filterCellByRelativeZ(pts, cell_z_pct_, cell_z_tol_, &reverted);
+            const int n1 = static_cast<int>(pts.size());
+            if (stats) {
+                if (n1 < n0) {
+                    stats->pts_clipped += (n0 - n1);
+                    ++stats->cells_clipped;
+                }
+                if (reverted) ++stats->cells_reverted;
+            }
+            const int n2 = n1;
+            capPointsInPlace(pts, cell_max_pts_);
+            if (stats) {
+                const int n3 = static_cast<int>(pts.size());
+                if (n3 < n2) stats->pts_capped += (n2 - n3);
+                stats->pts_after_filter += n3;
+            }
         }
         return {touched.begin(), touched.end()};
     }
@@ -346,10 +399,13 @@ private:
     // 格内相对高度过滤：砍掉明显高于参考高度的点（障碍抬高地面）
     // pct in (0,1] → 用该分位作 z_ref；否则用均值
     // 保留 z <= z_ref + tol；过滤后过少则回退，避免空格
+    // reverted_out：若因过少回退则写 1
     static void filterCellByRelativeZ(pcl::PointCloud<pcl::PointXYZ>& pts,
                                       double pct,
-                                      double tol)
+                                      double tol,
+                                      int* reverted_out = nullptr)
     {
+        if (reverted_out) *reverted_out = 0;
         if (tol <= 0.0) return;
         const int n = static_cast<int>(pts.size());
         if (n < 3) return;
@@ -380,6 +436,8 @@ private:
         const int min_keep = std::max(3, n / 5);
         if (static_cast<int>(kept.size()) >= min_keep)
             pts.swap(kept);
+        else if (reverted_out)
+            *reverted_out = 1;
     }
 
     static void capPointsInPlace(pcl::PointCloud<pcl::PointXYZ>& pts, int max_pts)

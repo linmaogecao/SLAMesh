@@ -17,8 +17,7 @@
 #include <opencv4/opencv2/opencv.hpp>
 #include <Eigen/Eigenvalues>
 #include <opencv2/opencv.hpp>
-
-
+#include "GroundMatchPolicy.h"
 
 struct RangePixel {
     double x = 0.0;
@@ -43,8 +42,12 @@ struct GroundExtractDebugStats {
     int cut_by_step = 0;
     int cell_count = 0;
     int after_cell_filter = 0;
-    std::array<int, 7> col_bin_counts{{0, 0, 0, 0, 0, 0, 0}};
-    std::array<int, 7> final_bin_counts{{0, 0, 0, 0, 0, 0, 0}};
+    int cell_cut_total = 0;  // Step-3 被格内 z 容差砍掉的点数
+    std::array<int, ground_match_policy::kDistanceBinCount> col_bin_counts{};
+    std::array<int, ground_match_policy::kDistanceBinCount> final_bin_counts{};
+    std::array<int, ground_match_policy::kDistanceBinCount> cell_cut_bin_counts{}; // 格过滤砍点按距离 bin
+    std::array<int, ground_match_policy::kDistanceBinCount> cut_zmax_bins{};       // 触发 z_max 整列停止的点所在 bin
+    std::array<int, ground_match_policy::kDistanceBinCount> cut_step_bins{};       // 触发 |Δz| 断链（开新段）的点所在 bin
 };
 
 // ---------- 体素化分割结果存储 ----------
@@ -146,11 +149,12 @@ public:
         return nv;
     }
 
-    // 地面点提取：全图 range image → 按列从底环向上传播（每步 z 差 ≤ col_max_step）
+    // 地面点提取：全图 range image → 按列从底环向上传播
     //             → XY 格子内严格 z 分位过滤
     // 结果写入 ground_cloud_mask_（按点云下标），并返回地面点下标列表
-    // z_max：雷达系硬性高度上限（如 -0.5）；z_min：硬性下限（如 -3.8）
-    // col_max_step：同列相邻环 z 允许变化最大值（m），超出则截止
+    // z_max：雷达系硬性高度上限（如 -0.5）；仅 z>=z_max 时整列停止
+    // z_min：硬性下限（如 -3.8）；低于则跳过该环，不停止
+    // col_max_step：同列相邻环 z 变化上限（m）；超出只断连续性并开新段，不截断整列
     // cell_size：XY 格子边长；cell_z_pct：格内低分位；cell_z_tol：容差（m，应偏严）
     std::vector<int> extractGroundByCellFilter(
         const pcl::PointCloud<pcl::PointXYZ>& cloud,

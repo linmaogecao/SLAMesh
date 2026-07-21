@@ -870,7 +870,9 @@ std::vector<Eigen::Vector3d> out;
 // ─────────────────────────────────────────────────────────────────────────────
 // extractGroundByCellFilter — 列向传播 + XY 格子严格过滤
 //   Step-1  全点云建内部 range image（不做 z 预过滤，障碍物也投影进来）
-//   Step-2  逐列从底环向上传播：z >= z_max 或相邻环 |Δz| > col_max_step 时截止
+//   Step-2  逐列从底环向上：仅雷达系 z >= z_max 时整列停止；
+//           |Δz| > col_max_step 只断连续性并以当前点（仍在带内）开新段，继续向上
+//           z < z_min 跳过该环，不停止
 //   Step-3  列传播候选点分配到 XY 格子，每格内严格 z 分位过滤
 //   结果存入 ground_cloud_mask_（按点云下标），并返回地面点下标列表
 // ─────────────────────────────────────────────────────────────────────────────
@@ -883,15 +885,11 @@ std::vector<int> RangeImageProcessor::extractGroundByCellFilter(
     ground_cloud_mask_.assign(cloud.size(), false);
     ground_debug_stats_ = GroundExtractDebugStats{};
 
-    auto distanceBin = [](float x) -> int {
-        if (x >= -30.0f && x < -20.0f) return 0;
-        if (x >= -20.0f && x < -10.0f) return 1;
-        if (x >= -10.0f && x < 0.0f) return 2;
-        if (x >= 0.0f && x < 5.0f) return 3;
-        if (x >= 5.0f && x < 10.0f) return 4;
-        if (x >= 10.0f && x < 20.0f) return 5;
-        if (x >= 20.0f && x <= 40.0f) return 6;
-        return -1;
+    // 诊断用：与 GroundMatchPolicy::distanceBin 同一套 r_signed bin
+    auto distanceBinRS = [](float x, float y) -> int {
+        const double r = (x < 0.0f ? -1.0 : 1.0) *
+                         std::hypot(static_cast<double>(x), static_cast<double>(y));
+        return ground_match_policy::distanceBin(r);
     };
 
     // ---------- Step-1 : 全图内部 range image（障碍物也投影，用于列向截止判断）----------
@@ -930,12 +928,26 @@ std::vector<int> RangeImageProcessor::extractGroundByCellFilter(
 
     // ---------- Step-2 : 列向传播（底环 → 顶环）----------
     // row 0 对应最低仰角（FOV_DOWN = -24.8°），row H_SCANS-1 对应最高仰角（FOV_UP = +2°）
-    // 从 row=0（底环，指向地面）往上走（u 递增）；遇到 z >= z_max（硬上限）或 |Δz| > col_max_step 则截止
+    // 仅 z >= z_max（雷达系硬上限）整列停止；|Δz| 过大只断链并以当前带内点开新段
+    const float z_min_f   = (float)z_min;
     const float z_max_f   = (float)z_max;
     const float step_max  = (float)col_max_step;
 
     std::vector<int> col_gnd_cidx;
     col_gnd_cidx.reserve(W_COLS * H_SCANS / 8);
+
+    auto acceptColPoint = [&](int cidx, float z, float& last_z, bool& seeded) {
+        if (!seeded) {
+            seeded = true;
+            ++ground_debug_stats_.seed_cols;
+        }
+        last_z = z;
+        col_gnd_cidx.push_back(cidx);
+        ++ground_debug_stats_.accepted_col_points;
+        const auto& _p = cloud.points[cidx];
+        const int bin = distanceBinRS(_p.x, _p.y);
+        if (bin >= 0) ++ground_debug_stats_.col_bin_counts[bin];
+    };
 
     for (int v = 0; v < W_COLS; ++v) {
         float last_z = std::numeric_limits<float>::quiet_NaN();
@@ -944,31 +956,31 @@ std::vector<int> RangeImageProcessor::extractGroundByCellFilter(
             const auto& gp = gnd_ri[u * W_COLS + v];
             if (gp.cidx < 0) continue;          // 该环无点，跳过继续向上
             const float z = gp.z;
+
+            // 整列唯一停止条件：雷达系 z 超出硬上限
             if (z >= z_max_f) {
                 ++ground_debug_stats_.cut_by_zmax;
-                break;             // 触碰硬上限，截止
+                { const auto& _p = cloud.points[gp.cidx];
+                  const int bin = distanceBinRS(_p.x, _p.y);
+                  if (bin >= 0) ++ground_debug_stats_.cut_zmax_bins[bin]; }
+                break;
             }
+            // 低于硬下限：跳过该环，不停止
+            if (z < z_min_f) {
+                continue;
+            }
+
             if (std::isnan(last_z)) {
-                // 种子：第一个有效且低于硬上限的环
-                if (!seeded) {
-                    seeded = true;
-                    ++ground_debug_stats_.seed_cols;
-                }
-                last_z = z;
-                col_gnd_cidx.push_back(gp.cidx);
-                ++ground_debug_stats_.accepted_col_points;
-                const int bin = distanceBin(cloud.points[gp.cidx].x);
-                if (bin >= 0) ++ground_debug_stats_.col_bin_counts[bin];
+                acceptColPoint(gp.cidx, z, last_z, seeded);
+            } else if (std::abs(z - last_z) > step_max) {
+                // 台阶过大：断连续性，但继续向上；当前点仍在带内则开新段
+                ++ground_debug_stats_.cut_by_step;
+                { const auto& _p = cloud.points[gp.cidx];
+                  const int bin = distanceBinRS(_p.x, _p.y);
+                  if (bin >= 0) ++ground_debug_stats_.cut_step_bins[bin]; }
+                acceptColPoint(gp.cidx, z, last_z, seeded);
             } else {
-                if (std::abs(z - last_z) > step_max) {
-                    ++ground_debug_stats_.cut_by_step;
-                    break;  // 高度跳变，截止
-                }
-                last_z = z;
-                col_gnd_cidx.push_back(gp.cidx);
-                ++ground_debug_stats_.accepted_col_points;
-                const int bin = distanceBin(cloud.points[gp.cidx].x);
-                if (bin >= 0) ++ground_debug_stats_.col_bin_counts[bin];
+                acceptColPoint(gp.cidx, z, last_z, seeded);
             }
         }
     }
@@ -1008,8 +1020,14 @@ std::vector<int> RangeImageProcessor::extractGroundByCellFilter(
             if (cloud.points[ci].z <= z_cut) {
                 ground_cloud_mask_[ci] = true;
                 result.push_back(ci);
-                const int bin = distanceBin(cloud.points[ci].x);
-                if (bin >= 0) ++ground_debug_stats_.final_bin_counts[bin];
+                { const auto& _p = cloud.points[ci];
+                  const int bin = distanceBinRS(_p.x, _p.y);
+                  if (bin >= 0) ++ground_debug_stats_.final_bin_counts[bin]; }
+            } else {
+                ++ground_debug_stats_.cell_cut_total;
+                { const auto& _p = cloud.points[ci];
+                  const int bin = distanceBinRS(_p.x, _p.y);
+                  if (bin >= 0) ++ground_debug_stats_.cell_cut_bin_counts[bin]; }
             }
         }
     }
