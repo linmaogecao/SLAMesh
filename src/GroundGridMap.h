@@ -8,9 +8,9 @@
 //     - 最后更新的 step，用于滑动窗口清理
 //
 // 地面点分 cluster（格）流程：
-//   1. 当前帧地面点（雷达系）→ 变换到世界系
-//   2. 按 (floor(x/cell_size), floor(y/cell_size)) 投格
-//   3. 格内相对高度过滤（均值/分位 + 上容差），再封顶下采样
+//   1. 当前帧地面点（雷达系 z 带）→ 变换到世界系（全量，不做全局 skip）
+//   2. 按 (floor(x/cell_size), floor(y/cell_size)) 先投格
+//   3. 格内相对高度过滤；仅当点数 > cell_max_pts 时才均匀降采样（稀疏格全留）
 //   4. 达到 min_pts 后标记 needs_refit，refitCells 拟合 BSpline
 //
 // 配准查询：
@@ -61,14 +61,16 @@ struct GroundCell {
 // -----------------------------------------------------------------------
 class GroundGridMap {
 public:
-    // cell_size   : XY 栅格边长（米），建议 4–8 m
-    // min_pts     : 格内点数达到此值才触发拟合
-    // num_cp      : BSpline 每维控制点数
+    // cell_size     : XY 栅格边长（米），建议 4–8 m
+    // min_pts       : 格内点数达到此值才触发拟合
+    // num_cp        : BSpline 每维控制点数
     // active_radius : 配准查询时格坐标半径（格数）
-    // cell_max_pts: 每格最多保留点数（超出均匀下采样）
-    // fit_max_pts : 拟合 BSpline 时最多使用的点数
-    // cell_z_pct  : (0,1] 时用格内 z 分位作参考；<=0 用均值
-    // cell_z_tol  : 相对参考高度上容差（米）；<=0 关闭过滤
+    // cell_max_pts  : 每格最多保留点数（超出均匀下采样）
+    // fit_max_pts   : 拟合 BSpline 时最多使用的点数
+    // cell_z_pct    : (0,1] 时用格内 z 分位作参考；<=0 用均值
+    // cell_z_tol    : 相对参考高度上容差（米）；<=0 关闭过滤
+    // normal_z_min  : 拟合曲面法向 |z| 分量最小值（0=关闭）；
+    //                 地面法向应大致朝上，若 |normal.z| < 此值则视为墙面丢弃
     explicit GroundGridMap(double cell_size   = 6.0,
                            int    min_pts     = 80,
                            int    num_cp      = 5,
@@ -76,7 +78,8 @@ public:
                            int    cell_max_pts = 400,
                            int    fit_max_pts  = 150,
                            double cell_z_pct  = 0.0,
-                           double cell_z_tol  = 0.0)
+                           double cell_z_tol  = 0.0,
+                           double normal_z_min = 0.0)
         : cell_size_(cell_size),
           min_pts_(min_pts),
           num_cp_(num_cp),
@@ -84,12 +87,13 @@ public:
           cell_max_pts_(std::max(1, cell_max_pts)),
           fit_max_pts_(std::max(1, fit_max_pts)),
           cell_z_pct_(cell_z_pct),
-          cell_z_tol_(cell_z_tol)
+          cell_z_tol_(cell_z_tol),
+          normal_z_min_(normal_z_min)
     {}
 
     // -----------------------------------------------------------------------
     // 把一帧地面点（世界系）投格，按 XY 分组写入对应 GroundCell
-    // 投格后可按格内平均/分位高度砍掉偏高点，再封顶下采样
+    // 先投格，再格内高度过滤；仅密集格（> cell_max_pts）均匀降采样
     // 返回新增/更新的格 key 列表
     // -----------------------------------------------------------------------
     std::vector<GroundCellKey> addPoints(
@@ -168,6 +172,7 @@ public:
             if (it == cells_.end()) continue;
             it->second.needs_refit = false;
             if (!t.ok) continue;
+            if (!checkNormalUpward(*t.surf, normal_z_min_)) continue;  // 法向检验
             it->second.surf = std::move(t.surf);
             ++n_fit;
         }
@@ -410,6 +415,29 @@ private:
             dst.push_back(src[static_cast<size_t>(i)]);
     }
 
+    // 检查曲面中心法向是否大致朝上（|normal.z| >= normal_z_min_）
+    // 法向由曲面中心 (u=v=0.5) 处的偏导叉积得到
+    static bool checkNormalUpward(const BSplineSurface& surf, double normal_z_min)
+    {
+        if (normal_z_min <= 0.0) return true;
+        const auto& knU = surf.getKnotsU();
+        const auto& knV = surf.getKnotsV();
+        const auto& cps = surf.getControls();
+        const int nU = surf.getNumCpU();
+        const int nV = surf.getNumCpV();
+        auto findSpanLocal = [](double t, const std::vector<double>& kn, int ncp) {
+            if (t >= 1.0 - 1e-9) return ncp - 1;
+            for (int k = 3; k < ncp; ++k)
+                if (kn[k] <= t && t < kn[k + 1]) return k;
+            return 3;
+        };
+        BSplineSurface::Parameter pU(findSpanLocal(0.5, knU, nU), 0.5);
+        BSplineSurface::Parameter pV(findSpanLocal(0.5, knV, nV), 0.5);
+        const SurfaceCurvature curv =
+            const_cast<BSplineSurface&>(surf).getCurvature(pU, pV, knU, knV, cps, nV);
+        return std::abs(curv.normal.z()) >= normal_z_min;
+    }
+
     bool refitCell(const GroundCellKey& k, GroundCell& cell)
     {
         cell.needs_refit = false;
@@ -421,7 +449,9 @@ private:
 
         auto new_surf = std::make_shared<BSplineSurface>(3, 3, num_cp_, num_cp_, 0.25);
         if (!new_surf->apply(cloud, 30, 1, 1, 0.05))
-            return false;  // 跑满迭代未收敛，保留旧曲面（如有）
+            return false;
+        if (!checkNormalUpward(*new_surf, normal_z_min_))
+            return false;  // 法向偏离竖直过多（墙面/斜坡过陡），丢弃
         cell.surf = std::move(new_surf);
         return true;
     }
@@ -437,7 +467,8 @@ private:
     int    active_radius_;
     int    cell_max_pts_;
     int    fit_max_pts_;
-    double cell_z_pct_;   // (0,1]=分位参考；<=0 用均值
-    double cell_z_tol_;   // 上容差（米）；<=0 关闭
+    double cell_z_pct_;    // (0,1]=分位参考；<=0 用均值
+    double cell_z_tol_;    // 上容差（米）；<=0 关闭
+    double normal_z_min_;  // 拟合曲面法向 |z| 最小值；<=0 关闭
     std::unordered_map<GroundCellKey, GroundCell, GroundCellKeyHash> cells_;
 };
