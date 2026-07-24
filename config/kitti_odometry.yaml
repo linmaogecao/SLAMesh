@@ -7,12 +7,12 @@ slamesher:
   read_offline_pcd: true 
   dataset: 1
   max_steps: 10000
-  max_frames: 800      # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
-  dump_frame: 0        # 0=不保存；>0 时导出 matched/unmatched/scan_world + 远距 cluster 漏斗统计
+  max_frames: 0      # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
+  dump_frame: 240        # 0=不保存；>0 时导出 matched/unmatched/scan_world + 远距 cluster 漏斗统计
   dump_cluster_step: 0   # 0=不保存；>0 时导出 cluster 到 build/output_clusters/
   dump_occluded_step: 0 # 0=不保存；>0 时导出 range image 入图点 + 被遮挡点到 build/rangeimage_*,occluded_*.txt
-  dump_gnd_scan_begin: 150  # 闭区间起点；写 gnd_scan/（过 thr 匹配点）+ whole_gnd/（z带初分类地面点）+ scan_world/（全量世界系点）；启动先清空
-  dump_gnd_scan_end: 800    # 闭区间终点；任一为 0 则关闭
+  dump_gnd_scan_begin: 130  # 闭区间起点；写 gnd_scan/（过 thr 匹配点）+ whole_gnd/（z带初分类地面点）+ scan_world/（全量世界系点）；启动先清空
+  dump_gnd_scan_end: 240    # 闭区间终点；任一为 0 则关闭
   console_log_path: "/home/albus/catkin_ws/src/SLAMesh/debug.txt"   # 空=自动写到 file_loc_report/seq##_run_时间.log；也可填绝对路径如 debug.txt
   save_surface_samples: true  # true 时在 global_map/ 下按序号保存曲面稀疏采样点（全序列）
   all_surfaces_max_step: 0 # 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面（如 60）
@@ -51,10 +51,16 @@ slamesher:
   ground_cell_z_tol: 0.2     # 建图：砍掉 z > z_ref+tol 的点（米）；<=0 关闭
   ground_skip_points: 40     # 地面配准采样间隔（ground_reg_cell_size>0 时不生效）
   ground_reg_cell_size: 5.0  # 配准时 XY 均匀采样格边长（米）；0=退化为 skip 模式
-  ground_reg_cell_max_pts: 30 # 每格均匀初抽种子数
+  ground_reg_cell_max_pts: 30 # 后/中区每格均匀初抽种子数
+  ground_reg_cell_max_pts_front: 90 # 前区（lx>=fb_x0）每格初抽上限；更密，缓解前向点少
   ground_reg_cell_target_pts: 50 # 过 thr 后每格目标匹配数；不够用种子邻居填充；<=0 关闭
   ground_reg_nbr_per_seed: 40 # 每个种子挂的同格邻居上限（未抽中点里均匀取）；<=0 不截断
-  ground_reg_y_max: 15.0      # 配准：雷达系 |y|<=此值（米）；<=0 不限制（减少两侧障碍脏点）
+  ground_reg_y_max: 5.0      # 配准：雷达系 |y|<=此值（米）；<=0 不限制（减少两侧障碍脏点）
+  # 前/后/中配额：不足用成功种子邻居补，超额再裁；<=0 关闭
+  ground_reg_fb_x0: 5.0      # |x|<x0 为中桶；x>=x0 前桶；x<=-x0 后桶（米）
+  ground_reg_fb_front: 0.40  # 前桶比例
+  ground_reg_fb_mid:   0.25  # 中桶比例
+  ground_reg_fb_back:  0.35  # 后桶比例（=1-front-mid）
   # 粗层（多分辨率第二层）—— 远处/稀疏区 fallback，细层命中时不参与配准
   ground_coarse_cell_size: 20.0   # 粗格 XY 边长（米）
   ground_coarse_min_pts: 30       # 粗层拟合门槛（点数，比细层低）

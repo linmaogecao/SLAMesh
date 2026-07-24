@@ -1269,10 +1269,15 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/ground_cell_z_tol",      ground_cell_z_tol,      0.2);
     nh.param("slamesher/ground_skip_points",  ground_skip_points,  40);
     nh.param("slamesher/ground_reg_cell_size",        ground_reg_cell_size,        3.0);
-    nh.param("slamesher/ground_reg_cell_max_pts",     ground_reg_cell_max_pts,     30);
-    nh.param("slamesher/ground_reg_cell_target_pts",  ground_reg_cell_target_pts,  50);
-    nh.param("slamesher/ground_reg_nbr_per_seed",     ground_reg_nbr_per_seed,     40);
-    nh.param("slamesher/ground_reg_y_max",            ground_reg_y_max,            5.0);
+    nh.param("slamesher/ground_reg_cell_max_pts",       ground_reg_cell_max_pts,       30);
+    nh.param("slamesher/ground_reg_cell_max_pts_front", ground_reg_cell_max_pts_front, 90);
+    nh.param("slamesher/ground_reg_cell_target_pts",    ground_reg_cell_target_pts,    50);
+    nh.param("slamesher/ground_reg_nbr_per_seed",       ground_reg_nbr_per_seed,       40);
+    nh.param("slamesher/ground_reg_y_max",              ground_reg_y_max,              5.0);
+    nh.param("slamesher/ground_reg_fb_x0",              ground_reg_fb_x0,              5.0);
+    nh.param("slamesher/ground_reg_fb_front",           ground_reg_fb_front,           0.34);
+    nh.param("slamesher/ground_reg_fb_mid",             ground_reg_fb_mid,             0.33);
+    nh.param("slamesher/ground_reg_fb_back",            ground_reg_fb_back,            0.33);
     nh.param("slamesher/ground_coarse_cell_size",     ground_coarse_cell_size,     20.0);
     nh.param("slamesher/ground_coarse_min_pts",       ground_coarse_min_pts,       30);
     nh.param("slamesher/ground_coarse_num_cp",        ground_coarse_num_cp,        7);
@@ -1311,9 +1316,13 @@ void Parameter::initParameter(ros::NodeHandle & nh){
               << " z_tol=" << ground_cell_z_tol << "m"
               << " reg_cell=" << ground_reg_cell_size << "m"
               << " reg_cell_max=" << ground_reg_cell_max_pts
+              << " front_max=" << ground_reg_cell_max_pts_front
               << " reg_target=" << ground_reg_cell_target_pts
               << " reg_nbr/seed=" << ground_reg_nbr_per_seed
-              << " reg_y_max=" << ground_reg_y_max << "m" << std::endl;
+              << " reg_y_max=" << ground_reg_y_max << "m"
+              << " fb_x0=" << ground_reg_fb_x0 << "m"
+              << " fb(F/M/B)=" << ground_reg_fb_front << "/" << ground_reg_fb_mid << "/" << ground_reg_fb_back
+              << std::endl;
     std::cout << "ground_grid(coarse): cell=" << ground_coarse_cell_size
               << "m min_pts=" << ground_coarse_min_pts
               << " num_cp=" << ground_coarse_num_cp
@@ -1939,18 +1948,20 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
         constexpr int kGndIters = 3;
         auto gndMatchDistForIter = [](int it) -> double {
-            static constexpr double kSched[3] = {1.5, 0.4, 0.1};
+            static constexpr double kSched[3] = {1, 0.3, 0.03};
             return kSched[std::min(std::max(it, 0), kGndIters - 1)];
         };
 
         for (int giter = 0; giter < kGndIters; ++giter) {
             const double gnd_thr = gndMatchDistForIter(giter);
             std::unordered_map<const BSplineSurface*, std::vector<int>> gnd_surf_to_pts;
-            // XY 格子均匀采样：满足分层 z 带（近区同建图 gnd_near_*）且 |y|<=ground_reg_y_max，
-            // 每格均匀抽种子并挂邻居；过 thr 后不足 target 再用成功种子邻居填充。
+            // XY 格子采样：分层 z + |y|；格内按 lx 分前/中/后，前向更密初抽并挂邻居；
+            // 过 thr 后格扩容，再 FB 邻居补短板并裁超额。
             const double reg_cs   = param.ground_reg_cell_size;
             const int    reg_cmax = param.ground_reg_cell_max_pts > 0
                                     ? param.ground_reg_cell_max_pts : 30;
+            const int    reg_cmax_f = (param.ground_reg_cell_max_pts_front > 0)
+                                    ? param.ground_reg_cell_max_pts_front : reg_cmax;
             const int    reg_tgt  = param.ground_reg_cell_target_pts;
             const int    nbr_cap  = param.ground_reg_nbr_per_seed;
             const double y_max    = param.ground_reg_y_max;
@@ -1958,6 +1969,9 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             const double near_y   = param.gnd_near_y_max;
             const double near_z   = param.gnd_near_z_max;
             const bool   use_near = (near_x > 0.0 && near_y > 0.0);
+            const double fb_x0    = param.ground_reg_fb_x0;
+            const double fb_front = param.ground_reg_fb_front;
+            const double fb_mid   = param.ground_reg_fb_mid;
             auto zCeilAt = [&](double lx, double ly) -> double {
                 if (use_near && std::abs(lx) <= near_x && std::abs(ly) <= near_y)
                     return std::min(near_z, ground_z_max);  // 近区只许更严
@@ -1988,10 +2002,11 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                     xy_bucket[key].push_back(i);
                     pt_cell_key[i] = key;
                 }
-                // 每格均匀抽种子，并把 (seed, next_seed) 之间的点挂为邻居
-                for (auto& [key, indices] : xy_bucket) {
-                    const int n    = (int)indices.size();
-                    const int step = std::max(1, n / reg_cmax);
+                // 每格内按雷达系 lx 分前/中/后，前向用更密 max_pts，再挂邻居
+                auto sample_group = [&](const std::vector<int>& indices, int cmax) {
+                    const int n = (int)indices.size();
+                    if (n <= 0 || cmax <= 0) return;
+                    const int step = std::max(1, n / cmax);
                     for (int k = 0; k < n; k += step) {
                         const int seed = indices[k];
                         const Eigen::Vector3d p_w = R_curr *
@@ -2017,6 +2032,22 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                         if (!nbrs.empty())
                             seed_neighbors[seed] = std::move(nbrs);
                     }
+                };
+                for (auto& [key, indices] : xy_bucket) {
+                    (void)key;
+                    std::vector<int> idx_f, idx_m, idx_b;
+                    idx_f.reserve(indices.size());
+                    idx_m.reserve(indices.size());
+                    idx_b.reserve(indices.size());
+                    for (int i : indices) {
+                        const double lx = scan_local[i].x;
+                        if (lx >= fb_x0)       idx_f.push_back(i);
+                        else if (lx <= -fb_x0) idx_b.push_back(i);
+                        else                   idx_m.push_back(i);
+                    }
+                    sample_group(idx_f, reg_cmax_f);
+                    sample_group(idx_m, reg_cmax);
+                    sample_group(idx_b, reg_cmax);
                 }
             } else {
                 // 退化：旧 skip 模式（无邻居扩容）
@@ -2116,6 +2147,111 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                                   << " (target/cell=" << reg_tgt << ")" << std::endl;
                     }
                 }
+            }
+
+            // 前/后/中配额：不足用该桶成功种子的邻居补（不限格子 target），再裁超额
+            if (fb_front > 0.0 && !gnd_matches.empty()) {
+                auto bucket_of_lx = [&](double lx) -> int {
+                    if (lx >= fb_x0) return 0;       // front
+                    if (lx <= -fb_x0) return 2;      // back
+                    return 1;                        // mid
+                };
+
+                const int total0 = (int)gnd_matches.size();
+                int tgt[3] = {
+                    (int)std::round(total0 * fb_front),
+                    (int)std::round(total0 * fb_mid),
+                    0
+                };
+                tgt[2] = total0 - tgt[0] - tgt[1];
+
+                std::unordered_set<int> matched_idx;
+                matched_idx.reserve(gnd_matches.size() * 2);
+                std::vector<int> ok_seeds[3];
+                int have[3] = {0, 0, 0};
+                for (const auto& m : gnd_matches) {
+                    matched_idx.insert(m.scan_idx);
+                    const int b = bucket_of_lx(m.p_local.x());
+                    ++have[b];
+                    if (seed_neighbors.count(m.scan_idx))
+                        ok_seeds[b].push_back(m.scan_idx);
+                }
+
+                // 短板桶：从成功种子邻居补点（邻居 lx 仍须落在同桶）
+                std::unordered_map<const BSplineSurface*, std::vector<int>> fb_expand;
+                int n_fb_try = 0;
+                for (int b = 0; b < 3; ++b) {
+                    if (have[b] >= tgt[b] || ok_seeds[b].empty()) continue;
+                    const int need = tgt[b] - have[b];
+                    std::vector<int> pool;
+                    for (int s : ok_seeds[b]) {
+                        auto nit = seed_neighbors.find(s);
+                        if (nit == seed_neighbors.end()) continue;
+                        for (int ni : nit->second) {
+                            if (matched_idx.count(ni)) continue;
+                            if (bucket_of_lx(scan_local[ni].x) != b) continue;
+                            pool.push_back(ni);
+                        }
+                    }
+                    if (pool.empty()) continue;
+                    const int take = std::min(need, (int)pool.size());
+                    const int step = std::max(1, (int)pool.size() / take);
+                    int added = 0;
+                    for (int j = 0; j < (int)pool.size() && added < take; j += step) {
+                        const int ni = pool[j];
+                        if (matched_idx.count(ni)) continue;
+                        const Eigen::Vector3d p_w = R_curr *
+                            Eigen::Vector3d(scan_local[ni].x, scan_local[ni].y,
+                                           scan_local[ni].z) + t_curr;
+                        const BSplineSurface* sp = mr_ground.queryNearest(p_w);
+                        if (!sp) continue;
+                        fb_expand[sp].push_back(ni);
+                        matched_idx.insert(ni);
+                        ++added;
+                        ++n_fb_try;
+                    }
+                }
+                if (!fb_expand.empty())
+                    buildGroundMatches(fb_expand, gnd_thr, gnd_matches);
+
+                // 重新分桶并裁到 tgt（超额裁，不足全留）
+                const int total = (int)gnd_matches.size();
+                std::vector<int> idx_bkt[3];
+                for (int i = 0; i < total; ++i)
+                    idx_bkt[bucket_of_lx(gnd_matches[i].p_local.x())].push_back(i);
+
+                auto trim_bucket = [](std::vector<int>& idx, int t) {
+                    if (t <= 0 || (int)idx.size() <= t) return;
+                    const int n = (int)idx.size();
+                    const int step = std::max(1, n / t);
+                    std::vector<int> kept;
+                    kept.reserve(t);
+                    for (int j = 0; j < n && (int)kept.size() < t; j += step)
+                        kept.push_back(idx[j]);
+                    idx.swap(kept);
+                };
+                for (int b = 0; b < 3; ++b)
+                    trim_bucket(idx_bkt[b], std::max(0, tgt[b]));
+
+                if (giter == 0) {
+                    std::cout << "  [gnd fb] total0=" << total0
+                              << " +try=" << n_fb_try
+                              << " ->" << total
+                              << " F=" << idx_bkt[0].size() << "/" << tgt[0]
+                              << " M=" << idx_bkt[1].size() << "/" << tgt[1]
+                              << " B=" << idx_bkt[2].size() << "/" << std::max(0, tgt[2])
+                              << std::endl;
+                }
+                std::unordered_set<int> keep_idx;
+                keep_idx.reserve(idx_bkt[0].size() + idx_bkt[1].size() + idx_bkt[2].size());
+                for (int b = 0; b < 3; ++b)
+                    for (int i : idx_bkt[b]) keep_idx.insert(i);
+
+                std::vector<RegMatch> balanced;
+                balanced.reserve(keep_idx.size());
+                for (int i = 0; i < total; ++i)
+                    if (keep_idx.count(i)) balanced.push_back(gnd_matches[i]);
+                gnd_matches.swap(balanced);
             }
 
             {

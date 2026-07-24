@@ -48,10 +48,16 @@ public:
     double ground_cell_z_tol{0.2};    // 建图：相对参考高度上容差（米）；<=0 关闭
     int    ground_skip_points{40};    // 地面配准采样间隔（已被 XY 格子采样替代，仅作初筛备用）
     double ground_reg_cell_size{3.0}; // 地面配准 XY 格子采样边长（米）；0=退化回 skip 模式
-    int    ground_reg_cell_max_pts{30}; // 每个 XY 采样格均匀初抽种子数
+    int    ground_reg_cell_max_pts{30}; // 后/中区：每 XY 格均匀初抽种子数
+    int    ground_reg_cell_max_pts_front{90}; // 前区（lx>=fb_x0）：更密初抽；<=0 同 max_pts
     int    ground_reg_cell_target_pts{50}; // 过 thr 后每格目标匹配数；不足则用种子邻居填充；<=0 关闭扩容
     int    ground_reg_nbr_per_seed{40}; // 每个种子最多挂的同格邻居数（均匀取自未抽中点）；<=0 不截断
     double ground_reg_y_max{5.0};     // 配准：雷达系 |y| 上限（米）；<=0 不限制
+    // 前后配额：thr 后按雷达系 x 分前/中/后；不足用成功种子邻居补，超额再裁；<=0 关闭
+    double ground_reg_fb_x0{5.0};    // |x|<x0 为中桶；x>=x0 前，x<=-x0 后
+    double ground_reg_fb_front{0.34}; // 前桶目标比例；<=0 关闭前后配额
+    double ground_reg_fb_mid{0.33};  // 中桶目标比例
+    double ground_reg_fb_back{0.33}; // 后桶目标比例
     // 粗层（多分辨率第二层）
     double ground_coarse_cell_size{20.0};  // 粗格 XY 边长（米）
     int    ground_coarse_min_pts{30};      // 粗层拟合门槛
