@@ -8,7 +8,7 @@
 #include "RangeMap.h"
 #include "BSplineMap.h"
 #include "BSplineSDMErr.h"
-#include "GroundGridMap.h"
+#include "MultiResGroundMap.h"
 #include <sensor_msgs/point_cloud_conversion.h>
 #include <pcl/registration/icp.h>
 #include <unordered_set>
@@ -18,7 +18,6 @@ public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     int    max_steps{10000}, max_frames{0}, dump_frame{0}, dump_cluster_step{0}, dump_occluded_step{0}, register_times, num_test, min_points_num_to_gp, num_thread, cross_cell_overlap_length, dataset;
     int    dump_gnd_scan_begin{0}, dump_gnd_scan_end{0};  // 闭区间每帧写 gnd_scan/ + whole_gnd/ + scan_world/；0=关；启动时先清空目录
-    int    gnd_diag_begin{0}, gnd_diag_end{0};            // 闭区间打印地面诊断（分类砍点/建图clip/匹配残差分bin）；任一为0则关
     int    map_update_interval{20}, ground_build_interval{20};
     int    map_save_step_begin{0}, map_save_step_end{0};  // 0=不限；导出 created_step 在此闭区间内的曲面
     int    all_surfaces_max_step{0};  // 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面
@@ -42,37 +41,40 @@ public:
     int    ground_cell_min_pts{80};   // 格内点数达此值才拟合曲面
     int    ground_cell_num_cp{5};     // BSpline 每维控制点数
     int    ground_query_radius{1};    // 配准查询格半径（格数）
-    int    ground_map_skip_points{8}; // 保留；投格前现以 skip_above 为准（<=0 不 skip）
-    int    ground_map_skip_above{0};  // <=0 投格前不 skip；>0 时候选超过此数才均匀抽到该数量
+    int    ground_map_skip_points{1}; // 已废弃：建图改为先投 XY 格再按格密度降采样，此参数不再使用
     int    ground_cell_max_pts{400};  // 每格最多保留点数（超出均匀下采样）
     int    ground_fit_max_pts{150};   // 每格 BSpline 拟合最多用点数
     double ground_cell_z_pct{0.0};    // 建图：格内 z 参考；(0,1]=分位，<=0 用均值
     double ground_cell_z_tol{0.2};    // 建图：相对参考高度上容差（米）；<=0 关闭
-    int    ground_skip_points{40};    // 地面配准采样间隔（已被分层采样替代，仅作退化备用）
-    double ground_clear_dist{150.0};  // 超过此距离（米）的旧格被清除
+    int    ground_skip_points{40};    // 地面配准采样间隔（已被 XY 格子采样替代，仅作初筛备用）
     double ground_reg_cell_size{3.0}; // 地面配准 XY 格子采样边长（米）；0=退化回 skip 模式
-    int    ground_reg_cell_max_pts{30}; // 每个 XY 采样格最多保留点数（分层采样启用时不再生效）
+    int    ground_reg_cell_max_pts{30}; // 后/中区：每 XY 格均匀初抽种子数
+    int    ground_reg_cell_max_pts_front{90}; // 前区（lx>=fb_x0）：更密初抽；<=0 同 max_pts
+    int    ground_reg_cell_target_pts{50}; // 过 thr 后每格目标匹配数；不足则用种子邻居填充；<=0 关闭扩容
+    int    ground_reg_nbr_per_seed{40}; // 每个种子最多挂的同格邻居数（均匀取自未抽中点）；<=0 不截断
     double ground_reg_y_max{5.0};     // 配准：雷达系 |y| 上限（米）；<=0 不限制
-
-    // ── 地面配准分层采样（按雷达系 r_signed 分 bin，保证远近均衡）──
-    // 每个 bin 对应 GroundMatchPolicy::distanceBin 的 8 档：
-    // [-50,-30) / [-30,-20) / [-20,-10) / [-10,0) / [0,5) / [5,10) / [10,20) / [20,40]
-    bool gnd_stratified_enabled{true}; // true=分层采样；false=退化回 world XY 格采样
-    int  gnd_bin_cap_0{240};  // bin-0: 后极远 [-50,-30)
-    int  gnd_bin_cap_1{260};  // bin-1: 后远   [-30,-20)
-    int  gnd_bin_cap_2{260};  // bin-2: 后中   [-20,-10)
-    int  gnd_bin_cap_3{200};  // bin-3: 后近   [-10,0)
-    int  gnd_bin_cap_4{200};  // bin-4: 前近   [0,5)
-    int  gnd_bin_cap_5{240};  // bin-5: 前中近 [5,10)
-    int  gnd_bin_cap_6{240};  // bin-6: 前中   [10,20)
-    int  gnd_bin_cap_7{0};    // bin-7: 前远   [20,40] 无图，不采样
-
-    // ── 地面点列向传播 + XY 格子分类（extractGroundByCellFilter）──
-    bool   gnd_cell_enabled{false};   // 总开关：true=启用；false=退化回旧 z 带分类
-    double gnd_col_max_step{0.05};    // 列向：相邻环 |Δz| 上限；超出断链开新段，不整列停（整列仅 z>=z_max）
-    double gnd_cell_size{5.0};        // XY 格子边长（米）
-    double gnd_cell_z_pct{0.10};      // 格内 z 低分位（0.10 = 10%）
-    double gnd_cell_z_tol{0.15};      // 高于低分位的上容差（m）；偏严以排除低矮障碍物
+    // 前后配额：thr 后按雷达系 x 分前/中/后；不足用成功种子邻居补，超额再裁；<=0 关闭
+    double ground_reg_fb_x0{5.0};    // |x|<x0 为中桶；x>=x0 前，x<=-x0 后
+    double ground_reg_fb_front{0.34}; // 前桶目标比例；<=0 关闭前后配额
+    double ground_reg_fb_mid{0.33};  // 中桶目标比例
+    double ground_reg_fb_back{0.33}; // 后桶目标比例
+    // 粗层（多分辨率第二层）
+    double ground_coarse_cell_size{20.0};  // 粗格 XY 边长（米）
+    int    ground_coarse_min_pts{30};      // 粗层拟合门槛
+    int    ground_coarse_num_cp{7};        // 粗层 BSpline 每维控制点数（7x7）
+    int    ground_coarse_query_radius{1};  // 粗层查询格半径
+    int    ground_coarse_cell_max_pts{600}; // 粗格最多保留点数
+    int    ground_coarse_fit_max_pts{250}; // 粗层拟合最多用点数
+    // 地面 range image 列向提取
+    double gnd_ri_z_min{-3.0};      // 地面 RI / 建图 z 下界（传感器系）
+    double gnd_ri_z_max{0.0};       // 远区 / 近区外 z 上界
+    // 近区（雷达系 |x|<=near_x 且 |y|<=near_y）：更严 z 上界，挡车身抬高假地面
+    double gnd_near_x_max{20.0};    // 近区前后半长（米）；<=0 关闭近区分层
+    double gnd_near_y_max{10.0};    // 近区左右半宽（米）
+    double gnd_near_z_max{-1.5};    // 近区 z 上界（比 gnd_ri_z_max 更严）
+    double gnd_col_max_step{0.3};   // 列向传播最大 Δz（米）；超过则断链不断列
+    double gnd_col_seed_h_up{0.4};  // 相对本列 seed_z 最大上抬（米）；挡住车身抬高假地面
+    double gnd_normal_z_min{0.5};   // 拟合曲面法向 |z| 最小值；更小则视为墙面丢弃
 
     double correction_x{0}, correction_y{0}, correction_z{0},
     correction_roll_degree{0}, correction_pitch_degree{0}, correction_yaw_degree{0};
@@ -233,7 +235,7 @@ private:
     Transf registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                              Transf T_guess,
                              BSplineMap& bspline_map,
-                             GroundGridMap& ground_grid,
+                             MultiResGroundMap& mr_ground,
                              int max_iters,
                              double converge_thr,
                              double match_dist_thr,
@@ -250,15 +252,16 @@ private:
                      const Transf& T_world,
                      RangeImageProcessor& range_proc,
                      RangeImageProcessor& range_proc_far,
+                     RangeImageProcessor& range_proc_gnd,
                      BSplineMap& bspline_map,
-                     GroundGridMap& ground_grid,
+                     MultiResGroundMap& mr_ground,
                      double match_dist_thr,
                      double ground_z_min,
                      double ground_z_max);
 
     void printMapSummary(const BSplineMap& bspline_map) const;
-    void saveGroundGridZ(const GroundGridMap& ground_grid) const;
-    void saveGndSurfacesToTxt(const GroundGridMap& ground_grid) const;
+    void saveGroundGridZ(const MultiResGroundMap& mr_ground) const;
+    void saveGndSurfacesToTxt(const MultiResGroundMap& mr_ground) const;
     void saveControlPointsToTxt(const BSplineMap& bspline_map,
                                 bool save_surface_samples,
                                 int step_begin = 0,
