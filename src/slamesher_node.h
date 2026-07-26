@@ -17,7 +17,7 @@ class Parameter{
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     int    max_steps{10000}, max_frames{0}, dump_frame{0}, dump_cluster_step{0}, dump_occluded_step{0}, register_times, num_test, min_points_num_to_gp, num_thread, cross_cell_overlap_length, dataset;
-    int    dump_gnd_scan_begin{0}, dump_gnd_scan_end{0};  // 闭区间每帧写 gnd_scan/ + whole_gnd/ + scan_world/；0=关；启动时先清空目录
+    int    dump_gnd_scan_begin{0}, dump_gnd_scan_end{0};  // 闭区间：gnd_scan/+whole_gnd/+scan_world/；建地面时再写 all_surfaces/all_surfaces_<step>.txt（累计）；0=关
     int    map_update_interval{20}, ground_build_interval{20};
     int    map_save_step_begin{0}, map_save_step_end{0};  // 0=不限；导出 created_step 在此闭区间内的曲面
     int    all_surfaces_max_step{0};  // 0=不限；>0 时 all_surfaces.txt 只含 created_step<=此值的曲面
@@ -261,7 +261,11 @@ private:
 
     void printMapSummary(const BSplineMap& bspline_map) const;
     void saveGroundGridZ(const MultiResGroundMap& mr_ground) const;
-    void saveGndSurfacesToTxt(const MultiResGroundMap& mr_ground) const;
+    // out_path 空：写 build/gnd_surfaces.txt；否则写指定路径（地面采样点 xyz）
+    void saveGndSurfacesToTxt(const MultiResGroundMap& mr_ground,
+                              const std::string& out_path = "") const;
+    // dump_gnd_scan 区间内：每次建完地面，累计快照到 all_surfaces/all_surfaces_<step>.txt
+    void dumpGndAllSurfacesAtBuild(const MultiResGroundMap& mr_ground) const;
     void saveControlPointsToTxt(const BSplineMap& bspline_map,
                                 bool save_surface_samples,
                                 int step_begin = 0,

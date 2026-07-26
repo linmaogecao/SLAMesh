@@ -1202,11 +1202,11 @@ void Parameter::initParameter(ros::NodeHandle & nh){
                   << (gnd_scan_on
                       ? (std::to_string(dump_gnd_scan_begin) + ".." + std::to_string(dump_gnd_scan_end)
                          + " -> " + std::string(kBsplineBuildDir)
-                         + "/gnd_scan/ + whole_gnd/ + scan_world/")
+                         + "/gnd_scan/ + whole_gnd/ + scan_world/ + all_surfaces/")
                       : "off")
                   << std::endl;
         if (gnd_scan_on) {
-            for (const char* sub : {"gnd_scan", "whole_gnd", "scan_world"}) {
+            for (const char* sub : {"gnd_scan", "whole_gnd", "scan_world", "all_surfaces"}) {
                 const std::filesystem::path gnd_dir =
                     std::filesystem::path(kBsplineBuildDir) / sub;
                 std::error_code ec;
@@ -2635,6 +2635,8 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                 BSplineSurface::setApplyProfileLabel("gnd");
             n_added_gnd = mr_ground.refitAll(param.num_thread);
         }
+        // dump 区间内：每次建完地面，写累计 all_surfaces_<step>.txt（含此前建图）
+        dumpGndAllSurfacesAtBuild(mr_ground);
     }
 
     if (dump_clusters) {
@@ -2960,9 +2962,24 @@ void SLAMesher::saveGroundGridZ(const MultiResGroundMap& mr_ground) const
     }
 }
 
-void SLAMesher::saveGndSurfacesToTxt(const MultiResGroundMap& mr_ground) const
+void SLAMesher::saveGndSurfacesToTxt(const MultiResGroundMap& mr_ground,
+                                     const std::string& out_path_in) const
 {
-    const std::string out_path = std::string(kBsplineBuildDir) + "/gnd_surfaces.txt";
+    const std::string out_path = out_path_in.empty()
+        ? (std::string(kBsplineBuildDir) + "/gnd_surfaces.txt")
+        : out_path_in;
+    {
+        std::error_code ec;
+        const auto parent = std::filesystem::path(out_path).parent_path();
+        if (!parent.empty()) {
+            std::filesystem::create_directories(parent, ec);
+            if (ec) {
+                std::cerr << "Failed to create directory: " << parent
+                          << " (" << ec.message() << ")\n";
+                return;
+            }
+        }
+    }
     std::ofstream fout(out_path, std::ios::out | std::ios::trunc);
     if (!fout.is_open()) {
         std::cerr << "Failed to open: " << out_path << std::endl;
@@ -3005,9 +3022,32 @@ void SLAMesher::saveGndSurfacesToTxt(const MultiResGroundMap& mr_ground) const
         }
     }
     fout.close();
-    std::cout << "Saved gnd_surfaces.txt: " << n_surf << " surfaces ("
+    std::cout << "Saved gnd surfaces: " << n_surf << " surfaces ("
               << mr_ground.numLayers() << " layers), "
               << n_pts << " sample points -> " << out_path << std::endl;
+}
+
+void SLAMesher::dumpGndAllSurfacesAtBuild(const MultiResGroundMap& mr_ground) const
+{
+    if (param.dump_gnd_scan_begin <= 0
+        || param.dump_gnd_scan_end < param.dump_gnd_scan_begin
+        || g_data.step < param.dump_gnd_scan_begin
+        || g_data.step > param.dump_gnd_scan_end) {
+        return;
+    }
+    const std::filesystem::path dir =
+        std::filesystem::path(kBsplineBuildDir) / "all_surfaces";
+    std::error_code ec;
+    std::filesystem::create_directories(dir, ec);
+    if (ec) {
+        std::cerr << "  [DumpGndAllSurfaces] mkdir failed: " << dir
+                  << " (" << ec.message() << ")\n";
+        return;
+    }
+    // 累计快照：当前地面地图全量采样（含此前各次建图结果）
+    const std::string out =
+        (dir / ("all_surfaces_" + std::to_string(g_data.step) + ".txt")).string();
+    saveGndSurfacesToTxt(mr_ground, out);
 }
 
 void SLAMesher::saveControlPointsToTxt(const BSplineMap& bspline_map,
