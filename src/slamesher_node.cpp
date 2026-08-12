@@ -1256,6 +1256,36 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/range_image_far_min_cluster", range_image_far_min_cluster, 20);
     nh.param("slamesher/obs_rimg_col_step",           obs_rimg_col_step,           3);
     nh.param("slamesher/obs_match_per_surf_max",      obs_match_per_surf_max,      50);
+    nh.param("slamesher/obs_cand_target",             obs_cand_target,             1500);
+    nh.param("slamesher/use_patchwork_ground", use_patchwork_ground, true);
+    {
+        const PatchworkppConfig d;
+        nh.param("slamesher/pw_sensor_height",   patchwork.sensor_height,   d.sensor_height);
+        nh.param("slamesher/pw_num_iter",        patchwork.num_iter,        d.num_iter);
+        nh.param("slamesher/pw_num_lpr",         patchwork.num_lpr,         d.num_lpr);
+        nh.param("slamesher/pw_num_min_pts",     patchwork.num_min_pts,     d.num_min_pts);
+        nh.param("slamesher/pw_th_seeds",        patchwork.th_seeds,        d.th_seeds);
+        nh.param("slamesher/pw_th_dist",         patchwork.th_dist,         d.th_dist);
+        nh.param("slamesher/pw_th_seeds_v",      patchwork.th_seeds_v,      d.th_seeds_v);
+        nh.param("slamesher/pw_th_dist_v",       patchwork.th_dist_v,       d.th_dist_v);
+        nh.param("slamesher/pw_max_r",           patchwork.max_range,       d.max_range);
+        nh.param("slamesher/pw_min_r",           patchwork.min_range,       d.min_range);
+        nh.param("slamesher/pw_uprightness_thr", patchwork.uprightness_thr, d.uprightness_thr);
+        nh.param("slamesher/pw_adaptive_seed_selection_margin",
+                 patchwork.adaptive_seed_selection_margin,
+                 d.adaptive_seed_selection_margin);
+        nh.param("slamesher/pw_enable_RVPF",     patchwork.enable_RVPF,     d.enable_RVPF);
+        nh.param("slamesher/pw_enable_TGR",      patchwork.enable_TGR,      d.enable_TGR);
+        std::cout << "patchwork++: " << (use_patchwork_ground ? "ON" : "OFF")
+                  << " sensor_h=" << patchwork.sensor_height
+                  << " r=[" << patchwork.min_range << "," << patchwork.max_range << "]"
+                  << " th_dist=" << patchwork.th_dist
+                  << " th_seeds=" << patchwork.th_seeds
+                  << " upright=" << patchwork.uprightness_thr
+                  << " RVPF=" << patchwork.enable_RVPF
+                  << " TGR=" << patchwork.enable_TGR
+                  << " (RNR 需 intensity，当前管线未提供，自动跳过)" << std::endl;
+    }
     nh.param("slamesher/ground_z_min",        ground_z_min,        -3.0);
     nh.param("slamesher/ground_z_max",        ground_z_max,        -1.5);
     nh.param("slamesher/ground_cell_size",    ground_cell_size,    6.0);
@@ -1267,13 +1297,16 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/ground_fit_max_pts",     ground_fit_max_pts,     150);
     nh.param("slamesher/ground_cell_z_pct",      ground_cell_z_pct,      0.0);
     nh.param("slamesher/ground_cell_z_tol",      ground_cell_z_tol,      0.2);
+    nh.param("slamesher/ground_cell_z_filter",   ground_cell_z_filter,   false);
     nh.param("slamesher/ground_skip_points",  ground_skip_points,  40);
     nh.param("slamesher/ground_reg_cell_size",        ground_reg_cell_size,        3.0);
     nh.param("slamesher/ground_reg_cell_max_pts",       ground_reg_cell_max_pts,       30);
     nh.param("slamesher/ground_reg_cell_max_pts_front", ground_reg_cell_max_pts_front, 90);
     nh.param("slamesher/ground_reg_cell_target_pts",    ground_reg_cell_target_pts,    50);
     nh.param("slamesher/ground_reg_nbr_per_seed",       ground_reg_nbr_per_seed,       40);
-    nh.param("slamesher/ground_reg_y_max",              ground_reg_y_max,              5.0);
+    nh.param("slamesher/ground_reg_y_max",              ground_reg_y_max,              25.0);
+    nh.param("slamesher/ground_reg_total_max",          ground_reg_total_max,          4000);
+    nh.param("slamesher/ground_reg_match_max",          ground_reg_match_max,          2500);
     nh.param("slamesher/ground_reg_fb_x0",              ground_reg_fb_x0,              5.0);
     nh.param("slamesher/ground_reg_fb_front",           ground_reg_fb_front,           0.34);
     nh.param("slamesher/ground_reg_fb_mid",             ground_reg_fb_mid,             0.33);
@@ -1303,7 +1336,8 @@ void Parameter::initParameter(ros::NodeHandle & nh){
               << "  far_z_floor_offset=" << range_image_far_z_floor_offset
               << "  far_min_cluster=" << range_image_far_min_cluster << std::endl;
     std::cout << "obs_rimg_col_step=" << obs_rimg_col_step
-              << "  obs_match_per_surf_max=" << obs_match_per_surf_max << std::endl;
+              << "  obs_match_per_surf_max=" << obs_match_per_surf_max
+              << "  obs_cand_target=" << obs_cand_target << std::endl;
     std::cout << "ground_grid(fine): z_band=[" << ground_z_min << "," << ground_z_max << "]"
               << " cell=" << ground_cell_size
               << "m min_pts=" << ground_cell_min_pts
@@ -1312,6 +1346,7 @@ void Parameter::initParameter(ros::NodeHandle & nh){
               << " cell_max=" << ground_cell_max_pts
               << " (map: XY-first, dense-only downsample)"
               << " fit_max=" << ground_fit_max_pts
+              << " z_filter=" << (ground_cell_z_filter ? "on" : "off")
               << " z_pct=" << ground_cell_z_pct
               << " z_tol=" << ground_cell_z_tol << "m"
               << " reg_cell=" << ground_reg_cell_size << "m"
@@ -1320,6 +1355,8 @@ void Parameter::initParameter(ros::NodeHandle & nh){
               << " reg_target=" << ground_reg_cell_target_pts
               << " reg_nbr/seed=" << ground_reg_nbr_per_seed
               << " reg_y_max=" << ground_reg_y_max << "m"
+              << " reg_total_max=" << ground_reg_total_max
+              << " reg_match_max=" << ground_reg_match_max
               << " fb_x0=" << ground_reg_fb_x0 << "m"
               << " fb(F/M/B)=" << ground_reg_fb_front << "/" << ground_reg_fb_mid << "/" << ground_reg_fb_back
               << std::endl;
@@ -1704,6 +1741,7 @@ void SLAMesher::processFirstFrame(Transf& T_world)
 }
 
 Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                                    const std::vector<uint8_t>& pw_ground_mask,
                                     Transf T_guess,
                                     BSplineMap& bspline_map,
                                     MultiResGroundMap& mr_ground,
@@ -1847,13 +1885,14 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
     for (int iter = 0; iter < max_iters && delta_scale > converge_thr; iter++) {
         std::unordered_map<int, std::vector<int>> obs_surf_to_pts;
         const int col_step = std::max(1, param.obs_rimg_col_step);
+        const int surf_cap = param.obs_match_per_surf_max;
         const double far_match_min_z = farLayerZFloor(ground_z_min);
 
-        auto collectFromRangeImage = [&](const RangeImageProcessor& rp, double obs_min_z) {
+        auto collectFromRangeImage = [&](const RangeImageProcessor& rp, double obs_min_z, int v0) {
             const int W = rp.W_COLS;
             const int H = rp.H_SCANS;
             for (int u = 0; u < H; ++u) {
-                for (int v = 0; v < W; v += col_step) {
+                for (int v = v0; v < W; v += col_step) {
                     const int px_idx = u * W + v;
                     const auto& px = rp.range_image_[px_idx];
                     if (!px.valid) continue;
@@ -1867,21 +1906,50 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 }
             }
         };
-        collectFromRangeImage(rp_near, match_min_z);
-        if (use_far) collectFromRangeImage(rp_far, far_match_min_z);
+        // 逐曲面截顶后的候选量：已满额的大曲面不会因补采而增加，
+        // 补采的增量只落在未满额的小曲面上，故用截顶后的量做触发判据
+        auto cappedTotal = [&]() {
+            int n = 0;
+            for (const auto& [sid, idxs] : obs_surf_to_pts)
+                n += (surf_cap > 0) ? std::min((int)idxs.size(), surf_cap) : (int)idxs.size();
+            return n;
+        };
 
-        if (param.obs_match_per_surf_max > 0) {
+        collectFromRangeImage(rp_near, match_min_z, 0);
+        if (use_far) collectFromRangeImage(rp_far, far_match_min_z, 0);
+
+        const int cand_base = cappedTotal();
+        int extra_pass = 0;
+        if (param.obs_cand_target > 0) {
+            for (int off = 1; off < col_step && cappedTotal() < param.obs_cand_target; ++off) {
+                collectFromRangeImage(rp_near, match_min_z, off);
+                if (use_far) collectFromRangeImage(rp_far, far_match_min_z, off);
+                ++extra_pass;
+            }
+        }
+
+        if (surf_cap > 0) {
             for (auto& [sid, idxs] : obs_surf_to_pts) {
-                const int cap = param.obs_match_per_surf_max;
-                if ((int)idxs.size() > cap) {
-                    const int step = (int)idxs.size() / cap;
+                if ((int)idxs.size() > surf_cap) {
+                    const int step = (int)idxs.size() / surf_cap;
                     std::vector<int> kept;
-                    kept.reserve(cap);
-                    for (int i = 0; i < (int)idxs.size() && (int)kept.size() < cap; i += step)
+                    kept.reserve(surf_cap);
+                    for (int i = 0; i < (int)idxs.size() && (int)kept.size() < surf_cap; i += step)
                         kept.push_back(idxs[i]);
                     idxs = std::move(kept);
                 }
             }
+        }
+
+        if (iter == 0) {
+            int n_below = 0;
+            for (const auto& [sid, idxs] : obs_surf_to_pts)
+                if (surf_cap <= 0 || (int)idxs.size() < surf_cap) ++n_below;
+            std::cout << "  [obs cand] surf=" << obs_surf_to_pts.size()
+                      << " below_cap=" << n_below
+                      << " cand=" << cand_base << "->" << cappedTotal()
+                      << " extra_pass=" << extra_pass << "/" << (col_step - 1)
+                      << " (target=" << param.obs_cand_target << ")" << std::endl;
         }
 
         std::vector<RegMatch> obs_matches;
@@ -1964,6 +2032,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                                     ? param.ground_reg_cell_max_pts_front : reg_cmax;
             const int    reg_tgt  = param.ground_reg_cell_target_pts;
             const int    nbr_cap  = param.ground_reg_nbr_per_seed;
+            const int    seed_bud = param.ground_reg_total_max;
             const double y_max    = param.ground_reg_y_max;
             const double near_x   = param.gnd_near_x_max;
             const double near_y   = param.gnd_near_y_max;
@@ -1977,9 +2046,13 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                     return std::min(near_z, ground_z_max);  // 近区只许更严
                 return ground_z_max;
             };
-            auto passGndLocal = [&](double lx, double ly, double lz) -> bool {
-                if (lz < ground_z_min || lz > zCeilAt(lx, ly)) return false;
+            // 地面判据：有 Patchwork++ mask 时以其为准，否则回退分层 z 带。
+            // |y| 上限属于采样密度控制，两条路径都保留。
+            const bool use_pw = !pw_ground_mask.empty();
+            auto passGndLocal = [&](int idx, double lx, double ly, double lz) -> bool {
                 if (y_max > 0.0 && std::abs(ly) > y_max) return false;
+                if (use_pw) return pw_ground_mask[idx] != 0;
+                if (lz < ground_z_min || lz > zCeilAt(lx, ly)) return false;
                 return true;
             };
 
@@ -1993,7 +2066,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 std::unordered_map<std::int64_t, std::vector<int>> xy_bucket;
                 for (int i = 0; i < (int)scan_local.size(); ++i) {
                     const double lx = scan_local[i].x, ly = scan_local[i].y, lz = scan_local[i].z;
-                    if (!passGndLocal(lx, ly, lz)) continue;
+                    if (!passGndLocal(i, lx, ly, lz)) continue;
                     const Eigen::Vector3d p_w = R_curr *
                         Eigen::Vector3d(lx, ly, lz) + t_curr;
                     const std::int64_t cx = static_cast<std::int64_t>(std::floor(p_w.x() / reg_cs));
@@ -2033,6 +2106,25 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                             seed_neighbors[seed] = std::move(nbrs);
                     }
                 };
+                // 放宽横向门后占用格数成倍增长，逐格配额不变会让查询量随之膨胀。
+                // 按占用格数把每格配额等比压到全局预算内：覆盖范围照常扩大，单帧代价有界。
+                int cmax_eff = reg_cmax, cmax_f_eff = reg_cmax_f;
+                if (seed_bud > 0 && !xy_bucket.empty()) {
+                    const double per_cell_cfg = reg_cmax_f + 2.0 * reg_cmax;
+                    const double per_cell_bud =
+                        static_cast<double>(seed_bud) / static_cast<double>(xy_bucket.size());
+                    if (per_cell_bud < per_cell_cfg) {
+                        const double s = per_cell_bud / per_cell_cfg;
+                        cmax_eff   = std::max(1, (int)std::lround(reg_cmax   * s));
+                        cmax_f_eff = std::max(1, (int)std::lround(reg_cmax_f * s));
+                    }
+                }
+                if (giter == 0)
+                    std::cout << "  [gnd seed] cells=" << xy_bucket.size()
+                              << " cmax(F/M-B)=" << cmax_f_eff << "/" << cmax_eff
+                              << " (cfg " << reg_cmax_f << "/" << reg_cmax
+                              << ", budget=" << seed_bud << ")" << std::endl;
+
                 for (auto& [key, indices] : xy_bucket) {
                     (void)key;
                     std::vector<int> idx_f, idx_m, idx_b;
@@ -2045,16 +2137,16 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                         else if (lx <= -fb_x0) idx_b.push_back(i);
                         else                   idx_m.push_back(i);
                     }
-                    sample_group(idx_f, reg_cmax_f);
-                    sample_group(idx_m, reg_cmax);
-                    sample_group(idx_b, reg_cmax);
+                    sample_group(idx_f, cmax_f_eff);
+                    sample_group(idx_m, cmax_eff);
+                    sample_group(idx_b, cmax_eff);
                 }
             } else {
                 // 退化：旧 skip 模式（无邻居扩容）
                 const int gnd_skip = param.ground_skip_points > 0 ? param.ground_skip_points : skip_points;
                 for (int i = 0; i < (int)scan_local.size(); i += gnd_skip) {
                     const double lx = scan_local[i].x, ly = scan_local[i].y, lz = scan_local[i].z;
-                    if (!passGndLocal(lx, ly, lz)) continue;
+                    if (!passGndLocal(i, lx, ly, lz)) continue;
                     Eigen::Vector3d p_w = R_curr * Eigen::Vector3d(lx, ly, lz) + t_curr;
                     const BSplineSurface* sp = mr_ground.queryNearest(p_w);
                     if (sp) gnd_surf_to_pts[sp].push_back(i);
@@ -2158,12 +2250,17 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 };
 
                 const int total0 = (int)gnd_matches.size();
+                // 桶配额以封顶后的总量为基准：超预算时三桶按同比例缩，
+                // 下面 trim_bucket 在桶内等间隔抽，前后力臂分布不受影响
+                const int tgt_base = (param.ground_reg_match_max > 0)
+                    ? std::min(total0, param.ground_reg_match_max)
+                    : total0;
                 int tgt[3] = {
-                    (int)std::round(total0 * fb_front),
-                    (int)std::round(total0 * fb_mid),
+                    (int)std::round(tgt_base * fb_front),
+                    (int)std::round(tgt_base * fb_mid),
                     0
                 };
-                tgt[2] = total0 - tgt[0] - tgt[1];
+                tgt[2] = tgt_base - tgt[0] - tgt[1];
 
                 std::unordered_set<int> matched_idx;
                 matched_idx.reserve(gnd_matches.size() * 2);
@@ -2235,6 +2332,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
                 if (giter == 0) {
                     std::cout << "  [gnd fb] total0=" << total0
+                              << " cap=" << tgt_base
                               << " +try=" << n_fb_try
                               << " ->" << total
                               << " F=" << idx_bkt[0].size() << "/" << tgt[0]
@@ -2320,12 +2418,24 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             last_matches = obs_saved;
             last_matches.insert(last_matches.end(), gnd_matches.begin(), gnd_matches.end());
 
+            // 点到面残差对绕轴旋转的 Hessian 近似为 H_roll=Σy²、H_pitch=Σx²（法向近似竖直），
+            // 打出 rms 直接反映两个自由度的可观测性差距
+            double sum_x2 = 0.0, sum_y2 = 0.0, max_ay = 0.0;
+            for (const auto& m : gnd_matches) {
+                sum_x2 += m.p_local.x() * m.p_local.x();
+                sum_y2 += m.p_local.y() * m.p_local.y();
+                max_ay = std::max(max_ay, std::abs(m.p_local.y()));
+            }
+            const double inv_n = gnd_matches.empty() ? 0.0 : 1.0 / (double)gnd_matches.size();
             std::cout << "  [gnd] giter=" << giter
                       << " thr=" << gnd_thr
                       << " matches=" << gnd_matches.size()
                       << " roll=" << rpy_z[0]
                       << " pitch=" << rpy_z[1]
                       << " z=" << rpy_z[2]
+                      << " rmsY=" << std::sqrt(sum_y2 * inv_n)
+                      << " rmsX=" << std::sqrt(sum_x2 * inv_n)
+                      << " maxY=" << max_ay
                       << " (xy/yaw fixed from obs)" << std::endl;
         }
     }
@@ -2372,7 +2482,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             },
             "DumpGndScan");
 
-        // whole_gnd：与配准相同的分层 z 带 + |y|<=ground_reg_y_max
+        // whole_gnd：与配准相同的地面判据 + |y|<=ground_reg_y_max
         dumpWorldPts(
             std::filesystem::path(kBsplineBuildDir) / "whole_gnd",
             "whole_gnd_",
@@ -2381,6 +2491,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 const double near_y = param.gnd_near_y_max;
                 const double near_z = param.gnd_near_z_max;
                 const bool   use_near = (near_x > 0.0 && near_y > 0.0);
+                const bool   use_pw_dump = !pw_ground_mask.empty();
                 auto zCeilAt = [&](double lx, double ly) -> double {
                     if (use_near && std::abs(lx) <= near_x && std::abs(ly) <= near_y)
                         return std::min(near_z, ground_z_max);
@@ -2389,7 +2500,8 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 int n = 0;
                 for (int i = 0; i < (int)scan_local.size(); ++i) {
                     const double lx = scan_local[i].x, ly = scan_local[i].y, lz = scan_local[i].z;
-                    if (lz < ground_z_min || lz > zCeilAt(lx, ly)) continue;
+                    if (use_pw_dump) { if (!pw_ground_mask[i]) continue; }
+                    else if (lz < ground_z_min || lz > zCeilAt(lx, ly)) continue;
                     if (y_max_dump > 0.0 && std::abs(ly) > y_max_dump) continue;
                     const Eigen::Vector3d p_w = R_dump *
                         Eigen::Vector3d(lx, ly, lz) + t_dump;
@@ -2503,6 +2615,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 }
 
 void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                     const std::vector<uint8_t>& pw_ground_mask,
                      const Transf& T_world,
                      RangeImageProcessor& range_proc,
                      RangeImageProcessor& range_proc_far,
@@ -2562,48 +2675,54 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
 
     // ground_mask[i]：scan_local[i] 是否为地面候选
     std::vector<bool> ground_mask(N, false);
+    const bool use_pw_mask = !pw_ground_mask.empty();
 
-    // 先建地面专用 RI（不排除任何 z 带，让列传播自己决定）
-    range_proc_gnd.generateRangeImage(scan_local,
-        -1e9, 1e9, /*exclude_ground_band=*/false,
-        0.0, 1e9, gnd_z_floor);
+    if (use_pw_mask) {
+        for (int i = 0; i < N; ++i)
+            ground_mask[i] = (i < (int)pw_ground_mask.size() && pw_ground_mask[i] != 0);
+    } else {
+        // 先建地面专用 RI（不排除任何 z 带，让列传播自己决定）
+        range_proc_gnd.generateRangeImage(scan_local,
+            -1e9, 1e9, /*exclude_ground_band=*/false,
+            0.0, 1e9, gnd_z_floor);
 
-    // 列底→上传播：H_SCANS 行 row=0 最低仰角（FOV_DOWN），row=H_SCANS-1 最高
-    for (int v = 0; v < range_proc_gnd.W_COLS; ++v) {
-        double last_z = std::numeric_limits<double>::quiet_NaN();
-        double seed_z = std::numeric_limits<double>::quiet_NaN();
-        for (int u = 0; u < range_proc_gnd.H_SCANS; ++u) {
-            const int pidx = u * range_proc_gnd.W_COLS + v;
-            const auto& px = range_proc_gnd.range_image_[pidx];
-            if (!px.valid) continue;
-            if (px.z > gnd_z_ceil) break;  // 远区硬顶，整列停止
+        // 列底→上传播：H_SCANS 行 row=0 最低仰角（FOV_DOWN），row=H_SCANS-1 最高
+        for (int v = 0; v < range_proc_gnd.W_COLS; ++v) {
+            double last_z = std::numeric_limits<double>::quiet_NaN();
+            double seed_z = std::numeric_limits<double>::quiet_NaN();
+            for (int u = 0; u < range_proc_gnd.H_SCANS; ++u) {
+                const int pidx = u * range_proc_gnd.W_COLS + v;
+                const auto& px = range_proc_gnd.range_image_[pidx];
+                if (!px.valid) continue;
+                if (px.z > gnd_z_ceil) break;  // 远区硬顶，整列停止
 
-            // 近区更严：超 near_z_max 不当地面，不跟爬，但继续向上找远区点
-            if (px.z > zCeilAt(px.x, px.y)) {
-                last_z = std::numeric_limits<double>::quiet_NaN();
-                continue;
+                // 近区更严：超 near_z_max 不当地面，不跟爬，但继续向上找远区点
+                if (px.z > zCeilAt(px.x, px.y)) {
+                    last_z = std::numeric_limits<double>::quiet_NaN();
+                    continue;
+                }
+
+                const bool have_seed = !std::isnan(seed_z);
+                const bool within_seed =
+                    !have_seed || (px.z <= seed_z + seed_h_up);
+
+                if (std::isnan(last_z)) {
+                    // 新种子（含断链后）：必须仍贴近本列 seed 高度，禁止抬高再开段
+                    if (!within_seed) continue;
+                    seed_z = have_seed ? seed_z : px.z;
+                    last_z = px.z;
+                    const int cidx = range_proc_gnd.pixel_to_cloud_idx_[pidx];
+                    if (cidx >= 0 && cidx < N) ground_mask[cidx] = true;
+                } else if (std::abs(px.z - last_z) <= col_dz_max && within_seed) {
+                    last_z = px.z;
+                    const int cidx = range_proc_gnd.pixel_to_cloud_idx_[pidx];
+                    if (cidx >= 0 && cidx < N) ground_mask[cidx] = true;
+                } else if (std::abs(px.z - last_z) > col_dz_max) {
+                    // 台阶断链：清 last_z，保留 seed_z；抬高点不可再种子
+                    last_z = std::numeric_limits<double>::quiet_NaN();
+                }
+                // else: 连续但高于 seed+h_up → 跳过，保持 last_z（不跟爬）
             }
-
-            const bool have_seed = !std::isnan(seed_z);
-            const bool within_seed =
-                !have_seed || (px.z <= seed_z + seed_h_up);
-
-            if (std::isnan(last_z)) {
-                // 新种子（含断链后）：必须仍贴近本列 seed 高度，禁止抬高再开段
-                if (!within_seed) continue;
-                seed_z = have_seed ? seed_z : px.z;
-                last_z = px.z;
-                const int cidx = range_proc_gnd.pixel_to_cloud_idx_[pidx];
-                if (cidx >= 0 && cidx < N) ground_mask[cidx] = true;
-            } else if (std::abs(px.z - last_z) <= col_dz_max && within_seed) {
-                last_z = px.z;
-                const int cidx = range_proc_gnd.pixel_to_cloud_idx_[pidx];
-                if (cidx >= 0 && cidx < N) ground_mask[cidx] = true;
-            } else if (std::abs(px.z - last_z) > col_dz_max) {
-                // 台阶断链：清 last_z，保留 seed_z；抬高点不可再种子
-                last_z = std::numeric_limits<double>::quiet_NaN();
-            }
-            // else: 连续但高于 seed+h_up → 跳过，保持 last_z（不跟爬）
         }
     }
 
@@ -2616,7 +2735,8 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
         for (int i = 0; i < N; ++i) {
             if (!ground_mask[i]) continue;
             const auto& pt = scan_local.points[i];
-            if (pt.z > zCeilAt(pt.x, pt.y)) {
+            // Patchwork++ 的判定已是最终结论，不再叠加 z 带复核
+            if (!use_pw_mask && pt.z > zCeilAt(pt.x, pt.y)) {
                 ground_mask[i] = false;  // 不进建图，也不从障碍里抠掉
                 continue;
             }
@@ -3213,7 +3333,8 @@ void SLAMesher::process(){
          param.ground_fit_max_pts,
          param.ground_cell_z_pct,
          param.ground_cell_z_tol,
-         param.gnd_normal_z_min},
+         param.gnd_normal_z_min,
+         param.ground_cell_z_filter},
         // 层 1：粗格（远处/稀疏区 fallback）
         {param.ground_coarse_cell_size,
          param.ground_coarse_min_pts,
@@ -3223,7 +3344,8 @@ void SLAMesher::process(){
          param.ground_coarse_fit_max_pts,
          param.ground_cell_z_pct,
          param.ground_cell_z_tol,
-         param.gnd_normal_z_min}
+         param.gnd_normal_z_min,
+         param.ground_cell_z_filter}
     });
     RangeImageProcessor range_proc;
     RangeImageProcessor range_proc_far;  // 远层（range >= range_image_split）
@@ -3247,6 +3369,9 @@ void SLAMesher::process(){
     // 地面点 z 带：传感器系，建图/配准/range-image 排除共用（见 yaml ground_z_min/max）
     const double GROUND_Z_MIN = param.ground_z_min;
     const double GROUND_Z_MAX = param.ground_z_max;
+
+    patchwork_.reset(param.patchwork);
+    std::vector<uint8_t> pw_ground_mask;  // 关闭 Patchwork++ 时保持为空，两条链回退原逻辑
     while(nh.ok()){
         g_data.step++;
         if (param.max_frames > 0 && g_data.step > param.max_frames) {
@@ -3264,9 +3389,21 @@ void SLAMesher::process(){
         }
         std::cout << "===STEP " << g_data.step << "=== points: " << scan_local.size() << std::endl;
 
+        // 地面分割每帧只跑一次，建图链与配准链共用同一份 mask
+        pw_ground_mask.clear();
+        if (param.use_patchwork_ground) {
+            TicToc t_pw;
+            patchwork_.estimateGround(scan_local, pw_ground_mask);
+            const int n_gnd = (int)std::count(pw_ground_mask.begin(), pw_ground_mask.end(),
+                                              uint8_t(1));
+            std::cout << "  [Patchwork++] ground=" << n_gnd << "/" << scan_local.size()
+                      << "  sensor_h=" << patchwork_.sensorHeight()
+                      << "  " << t_pw.toc() << " ms" << std::endl;
+        }
+
         if(g_data.step == 1){
             processFirstFrame(T_world);
-            runMapBuild(scan_local, T_world, range_proc, range_proc_far, range_proc_gnd, bspline_map, mr_ground, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
+            runMapBuild(scan_local, pw_ground_mask, T_world, range_proc, range_proc_far, range_proc_gnd, bspline_map, mr_ground, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
             continue;
         }
 
@@ -3285,7 +3422,7 @@ void SLAMesher::process(){
                                                   split, 1e9, far_z_floor);
         }
 
-        T_world = registerScanToMap(scan_local, T_guess, bspline_map, mr_ground,
+        T_world = registerScanToMap(scan_local, pw_ground_mask, T_guess, bspline_map, mr_ground,
                                     max_rg_iters, converge_thr, match_dist_thr, skip_points,
                                     GROUND_Z_MIN, GROUND_Z_MIN, GROUND_Z_MAX,
                                     range_proc, range_proc_far, (param.range_image_split > 0.0));
@@ -3303,7 +3440,7 @@ void SLAMesher::process(){
             traj_file.flush();
         }
 
-        runMapBuild(scan_local, T_world, range_proc, range_proc_far, range_proc_gnd, bspline_map, mr_ground, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
+        runMapBuild(scan_local, pw_ground_mask, T_world, range_proc, range_proc_far, range_proc_gnd, bspline_map, mr_ground, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
 
         path_pub.publish(g_data.path);
         std::cout << "===STEP " << g_data.step << "=== Total: " << t_step.toc() << " ms===" << std::endl;

@@ -11,7 +11,7 @@ slamesher:
   dump_frame: 0        # 0=不保存；>0 时导出 matched/unmatched/scan_world + 远距 cluster 漏斗统计
   dump_cluster_step: 0   # 0=不保存；>0 时导出 cluster 到 build/output_clusters/
   dump_occluded_step: 0 # 0=不保存；>0 时导出 range image 入图点 + 被遮挡点到 build/rangeimage_*,occluded_*.txt
-  dump_gnd_scan_begin: 1  # 闭区间起点；写 gnd_scan/+whole_gnd/+scan_world/；建地面时写 all_surfaces/all_surfaces_<step>.txt（累计全图）；启动先清空
+  dump_gnd_scan_begin: 100  # 闭区间起点；写 gnd_scan/+whole_gnd/+scan_world/；建地面时写 all_surfaces/all_surfaces_<step>.txt（累计全图）；启动先清空
   dump_gnd_scan_end: 0    # 闭区间终点；任一为 0 则关闭
   console_log_path: "/home/albus/catkin_ws/src/SLAMesh/debug.txt"   # 空=自动写到 file_loc_report/seq##_run_时间.log；也可填绝对路径如 debug.txt
   save_surface_samples: true  # true 时在 global_map/ 下按序号保存曲面稀疏采样点（全序列）
@@ -37,6 +37,26 @@ slamesher:
   range_image_far_min_cluster: 20  # 远层 cluster 最小点数（建议略小于近层 30）
   obs_rimg_col_step: 3         # 障碍配准 range image 列采样间隔（1=全取，3=每3列1点）
   obs_match_per_surf_max: 50   # 每个障碍曲面最多保留的匹配点数（0=不限；防止长物体垄断）
+  obs_cand_target: 1500        # 逐曲面截顶后的候选目标；不足则补采偏移列（0=关闭自适应）
+                               # 已满 cap 的大曲面不受影响，增量只落在未满额的小曲面上
+  # Patchwork++ 地面分割（默认值同 patchwork-plusplus-ros/config/params.yaml）
+  # 开启后地面点由 Patchwork++ 判定，建图与配准共用同一份 mask；
+  # 关闭则回退到 range-image 列传播 + 下方 ground_z_min/max 的 z 带判据
+  use_patchwork_ground: true
+  pw_sensor_height: 1.723    # 传感器离地高度；会被 A-GLE 每帧自适应更新
+  pw_num_iter: 3             # 平面拟合迭代次数
+  pw_num_lpr: 20             # 参与最低点代表（LPR）均值的点数上限
+  pw_num_min_pts: 10         # patch 内点数少于此值直接判非地面
+  pw_th_seeds: 0.3           # 地面种子高度阈值（相对 LPR）
+  pw_th_dist: 0.125          # 地面厚度阈值（米）
+  pw_th_seeds_v: 0.25        # 竖直结构种子高度阈值
+  pw_th_dist_v: 0.1          # 竖直结构厚度阈值
+  pw_max_r: 80.0             # 地面估计最大半径（米）
+  pw_min_r: 2.7              # 地面估计最小半径（米）；小于此半径不参与
+  pw_uprightness_thr: 0.707  # 法向 z 分量下限（GLE 直立性判据）
+  pw_adaptive_seed_selection_margin: -1.2  # 低于 margin*sensor_height 的点不做种子
+  pw_enable_RVPF: true       # Region-wise Vertical Plane Fitting
+  pw_enable_TGR: true        # Temporal Ground Revert
   # XY 栅格地面地图
   ground_z_min: -3.8         # 传感器系地面点 z 下界（建图/配准共用）
   ground_z_max: -0.9         # 配准远区 z 上界；近区改用 gnd_near_z_max（与建图分层一致）
@@ -47,15 +67,33 @@ slamesher:
   ground_map_skip_points: 1  # 已废弃（保留兼容）：建图先投 XY 再按格密度 cap，不再全局 skip
   ground_cell_max_pts: 400   # 每格最多保留点数（超出均匀下采样）
   ground_fit_max_pts: 150    # 每格 BSpline 拟合最多用点数
-  ground_cell_z_pct: 0.0     # 建图格内 z 参考：(0,1]=分位；<=0 用均值（默认）
-  ground_cell_z_tol: 0.1     # 建图：砍掉 z > z_ref+tol 的点（米）；<=0 关闭
+  # 建图格内高度过滤总开关。false = 直接用 Patchwork++ 给出的地面点建图。
+  # 该过滤是单边的（只砍高点不砍低点），而配准侧不做同样处理，两侧点集不一致，
+  # 拟合面系统性偏低 → 每帧优化器把位姿往下压，同向累积。下面两个数值仅在 on 时生效。
+  ground_cell_z_filter: false
+  # z_ref 用中位数而非均值：均值会被格内一侧的坡/沟整体拽走。
+  # tol 放到 0.4：6m 格在 5% 坡上本身就有约 0.3m 高差，0.1m 会把整格上坡侧削掉，
+  # 使拟合面系统性朝低侧倾斜（roll 世界系倾斜的来源之一）。
+  ground_cell_z_pct: 0.5     # 建图格内 z 参考：(0,1]=分位；<=0 用均值
+  ground_cell_z_tol: 0.4     # 建图：砍掉 z > z_ref+tol 的点（米）；<=0 关闭
   ground_skip_points: 40     # 地面配准采样间隔（ground_reg_cell_size>0 时不生效）
   ground_reg_cell_size: 5.0  # 配准时 XY 均匀采样格边长（米）；0=退化为 skip 模式
   ground_reg_cell_max_pts: 30 # 后/中区每格均匀初抽种子数
   ground_reg_cell_max_pts_front: 90 # 前区（lx>=fb_x0）每格初抽上限；更密，缓解前向点少
-  ground_reg_cell_target_pts: 50 # 过 thr 后每格目标匹配数；不够用种子邻居填充；<=0 关闭
+  # 扩容量 = 每格补到 target。这一步的点要过 buildGroundMatches（每点 6 步 Newton
+  # footprint），是配准里最贵的一段，50->25 直接砍掉一半扩容点。降的是格内密度不是
+  # 覆盖格数，pitch/roll 的可观测性靠覆盖，不靠同一格里堆点。
+  ground_reg_cell_target_pts: 25 # 过 thr 后每格目标匹配数；不够用种子邻居填充；<=0 关闭
   ground_reg_nbr_per_seed: 40 # 每个种子挂的同格邻居上限（未抽中点里均匀取）；<=0 不截断
-  ground_reg_y_max: 5.0      # 配准：雷达系 |y|<=此值（米）；<=0 不限制（减少两侧障碍脏点）
+  # 建图侧不设 |y| 门（收 360°），配准侧原本只取 ±5m 走廊，两者点集总体不一致：
+  # 拿路中心子集去贴一张由更宽范围定义的曲面，差值只能被位姿吸收，而 H_roll=Σy²
+  # 是最软的自由度，就由它来背。放宽到 25m 让两侧总体对齐，同时把 roll 杠杆拉长。
+  ground_reg_y_max: 25.0     # 配准：雷达系 |y|<=此值（米）；<=0 不限制
+  ground_reg_total_max: 4000 # 每帧地面种子总预算：按占用格数等比压每格配额；<=0 不限
+  # total_max 只管种子，扩容会把总量涨回去（实测 3854 种子 -> 5904 最终）。这里是
+  # 唯一真正封顶的地方，裁在前/中/后三桶内等间隔做，桶比例和力臂分布不变。
+  # 只减 Ceres 规模，不减 footprint（裁剪在 buildGroundMatches 之后）。<=0 不限。
+  ground_reg_match_max: 2500 # 每帧地面最终匹配数上限
   # 前/后/中配额：不足用成功种子邻居补，超额再裁；<=0 关闭
   ground_reg_fb_x0: 5.0      # |x|<x0 为中桶；x>=x0 前桶；x<=-x0 后桶（米）
   ground_reg_fb_front: 0.40  # 前桶比例

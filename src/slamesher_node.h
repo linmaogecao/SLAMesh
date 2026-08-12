@@ -9,6 +9,7 @@
 #include "BSplineMap.h"
 #include "BSplineSDMErr.h"
 #include "MultiResGroundMap.h"
+#include "PatchworkppGround.h"
 #include <sensor_msgs/point_cloud_conversion.h>
 #include <pcl/registration/icp.h>
 #include <unordered_set>
@@ -34,6 +35,10 @@ public:
     // 障碍配准采样（range image 模式）
     int    obs_rimg_col_step{3};           // range image 列方向采样间隔（1=全取，3=每3列取1）
     int    obs_match_per_surf_max{50};     // 每个障碍曲面最多保留的匹配点数（0=不限）
+    int    obs_cand_target{1500};          // 逐曲面截顶后的候选目标；不足则补采偏移列（0=关闭）
+    // Patchwork++ 地面分割：每帧一份 mask，建图链与配准链共用
+    bool   use_patchwork_ground{true};  // false 回退到原 range-image 列传播 + z 带
+    PatchworkppConfig patchwork;
     // XY 栅格地面地图
     double ground_z_min{-3.0};        // 传感器系地面点 z 下界（建图/配准共用）
     double ground_z_max{-1.5};        // 传感器系地面点 z 上界（建图/配准共用）
@@ -46,13 +51,22 @@ public:
     int    ground_fit_max_pts{150};   // 每格 BSpline 拟合最多用点数
     double ground_cell_z_pct{0.0};    // 建图：格内 z 参考；(0,1]=分位，<=0 用均值
     double ground_cell_z_tol{0.2};    // 建图：相对参考高度上容差（米）；<=0 关闭
+    // 建图格内相对高度过滤总开关；false 时忽略 z_pct/z_tol 直接用输入点建图。
+    // 该过滤是单边的（只砍 z>z_ref+tol），而配准侧不做同样处理，两侧点集不一致会
+    // 使拟合面系统性偏低，每帧把位姿往下压。数值保留不动，便于 A/B 来回切。
+    bool   ground_cell_z_filter{false};
     int    ground_skip_points{40};    // 地面配准采样间隔（已被 XY 格子采样替代，仅作初筛备用）
     double ground_reg_cell_size{3.0}; // 地面配准 XY 格子采样边长（米）；0=退化回 skip 模式
     int    ground_reg_cell_max_pts{30}; // 后/中区：每 XY 格均匀初抽种子数
     int    ground_reg_cell_max_pts_front{90}; // 前区（lx>=fb_x0）：更密初抽；<=0 同 max_pts
     int    ground_reg_cell_target_pts{50}; // 过 thr 后每格目标匹配数；不足则用种子邻居填充；<=0 关闭扩容
     int    ground_reg_nbr_per_seed{40}; // 每个种子最多挂的同格邻居数（均匀取自未抽中点）；<=0 不截断
-    double ground_reg_y_max{5.0};     // 配准：雷达系 |y| 上限（米）；<=0 不限制
+    double ground_reg_y_max{25.0};    // 配准：雷达系 |y| 上限（米）；<=0 不限制
+    int    ground_reg_total_max{4000}; // 每帧地面种子总预算；超出按占用格数等比缩每格配额；<=0 不限
+    // 每帧地面「最终匹配」总预算。total_max 只约束种子，扩容会把总量涨回去，
+    // 这里是唯一能真正封顶的地方。裁剪在前/中/后三桶内各自等间隔进行，
+    // 桶比例与力臂分布不变。<=0 不限；需 ground_reg_fb_front>0 才生效。
+    int    ground_reg_match_max{2500};
     // 前后配额：thr 后按雷达系 x 分前/中/后；不足用成功种子邻居补，超额再裁；<=0 关闭
     double ground_reg_fb_x0{5.0};    // |x|<x0 为中桶；x>=x0 前，x<=-x0 后
     double ground_reg_fb_front{0.34}; // 前桶目标比例；<=0 关闭前后配额
@@ -232,7 +246,9 @@ private:
     // 第 1 帧：初始化位姿并建图
     void processFirstFrame(Transf& T_world);
 
+    // pw_ground_mask 非空时取代 z 带判据作为地面点来源；为空则沿用原逻辑
     Transf registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                             const std::vector<uint8_t>& pw_ground_mask,
                              Transf T_guess,
                              BSplineMap& bspline_map,
                              MultiResGroundMap& mr_ground,
@@ -249,6 +265,7 @@ private:
 
     // 统一建图：近/远两层 range image 分割 → z 分流地面/障碍 → 按各自 interval 决定是否建图
     void runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                     const std::vector<uint8_t>& pw_ground_mask,
                      const Transf& T_world,
                      RangeImageProcessor& range_proc,
                      RangeImageProcessor& range_proc_far,
@@ -258,6 +275,8 @@ private:
                      double match_dist_thr,
                      double ground_z_min,
                      double ground_z_max);
+
+    PatchworkppGround patchwork_;
 
     void printMapSummary(const BSplineMap& bspline_map) const;
     void saveGroundGridZ(const MultiResGroundMap& mr_ground) const;
