@@ -771,7 +771,7 @@ void Log::pose_print(ros::Publisher & cloud_pub) const{//ok
 void Log::savePath2TxtKitti(std::ofstream & file_out, nav_msgs::Path & path_msg){
     //write kitti format pose txt file, from path_msg, before write, transform to the camera frame using provided extrinsic
     if(file_out){
-        for(int i = 1; i<= step; i++){
+        for(int i = 1; i< step; i++){
             Transf T_rectified;
             Transf T_velo2cam = Eigen::Matrix4d::Identity();
             if(param.seq == "/00" || param.seq == "/01" || param.seq == "/02" || param.seq == "/13" || param.seq == "/14" ||
