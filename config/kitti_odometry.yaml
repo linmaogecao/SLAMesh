@@ -24,7 +24,7 @@ slamesher:
   range_min: 1.2
   register_times: 4
   # 无 odom 时第 2 帧配准初值：相对第 1 帧 Velodyne +X 方向平移 (m)
-  bootstrap_step2_tx: 0.2
+  bootstrap_step2_tx: 0.6
   bootstrap_step2_ty: 0.0
   bootstrap_step2_tz: 0.0
   map_update_interval: 5      # 障碍 MapUpdate 间隔（帧）；step % N == 0 时建障碍曲面
@@ -89,6 +89,13 @@ slamesher:
   # 拿路中心子集去贴一张由更宽范围定义的曲面，差值只能被位姿吸收，而 H_roll=Σy²
   # 是最软的自由度，就由它来背。放宽到 25m 让两侧总体对齐，同时把 roll 杠杆拉长。
   ground_reg_y_max: 25.0     # 配准：雷达系 |y|<=此值（米）；<=0 不限制
+  ground_reg_x_max: 0.0      # 配准：雷达系 |x|<=此值（米）；<=0 不限制
+  ground_reg_x_max_front: 0.0 # 配准：只限前方 lx<=此值（米）；<=0 不限制
+  ground_thr_last: 0.30      # 地面阶段末轮匹配硬门（米）；原硬编码 0.03
+  predict_horizontal_only: false # 匀速外推只作用 x/y/yaw；roll/pitch/z 沿用上一帧
+  reg_alternations: 1        # 障碍(x/y/yaw)与地面(roll/pitch/z)交替求解轮数；1=原单遍
+  obs_thr_last: 0.2          # 障碍阶段末轮匹配门（米）；从 0.8 几何收紧到此值；<=0 关闭
+  ground_map_r_max: 0.0      # 建图：只收雷达系水平距离<=此值的地面点（米）；<=0 不限制
   ground_reg_total_max: 4000 # 每帧地面种子总预算：按占用格数等比压每格配额；<=0 不限
   # total_max 只管种子，扩容会把总量涨回去（实测 3854 种子 -> 5904 最终）。这里是
   # 唯一真正封顶的地方，裁在前/中/后三桶内等间隔做，桶比例和力臂分布不变。

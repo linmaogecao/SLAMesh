@@ -62,6 +62,25 @@ public:
     int    ground_reg_cell_target_pts{50}; // 过 thr 后每格目标匹配数；不足则用种子邻居填充；<=0 关闭扩容
     int    ground_reg_nbr_per_seed{40}; // 每个种子最多挂的同格邻居数（均匀取自未抽中点）；<=0 不截断
     double ground_reg_y_max{25.0};    // 配准：雷达系 |y| 上限（米）；<=0 不限制
+    // 障碍阶段末轮匹配门（米），从 match_dist_thr(0.8) 几何收紧到此值；<=0 关闭恒为 0.8。
+    double obs_thr_last{0.0};
+    // 障碍(x/y/yaw) 与 地面(roll/pitch/z) 两组自由度的交替求解轮数；1=原单遍。
+    int    reg_alternations{1};
+    // 匀速外推只作用于 x/y/yaw；roll/pitch/z 沿用上一帧值，不做速率延拓。
+    bool   predict_horizontal_only{false};
+    // 地面阶段末轮的匹配硬门（米）。门越紧，存活点越是"已经和当前估计吻合"的那批，
+    // 估计量趋于自身预测的不动点。原硬编码 0.03。
+    double ground_thr_last{0.03};
+    // 配准：雷达系 |x| 上限（米）；<=0 不限制。pitch 绕传感器原点转，残差对 pitch 的
+    // 灵敏度正比于 x，远前方点单独主导 pitch；而那里扫描最稀、地图格最不成熟。
+    double ground_reg_x_max{0.0};
+    // 只作用于前方（lx>0）的纵向上限（米）；<=0 不限制。实测远前方桶(x>35m)的竖直
+    // 残差与其余各桶反号且大 6 倍，是 pitch 偏置的唯一来源；远后方桶残差正常且要
+    // 留着撑力臂，所以门必须是单边的。
+    double ground_reg_x_max_front{0.0};
+    // 建图：只收雷达系水平距离 <= 此值的地面点（米）；<=0 不限制。远距离观测的高度
+    // 误差正比于距离，且格内旧的远观测被均匀抽样永久保留，会把拟合面钉在偏差上。
+    double ground_map_r_max{0.0};
     int    ground_reg_total_max{4000}; // 每帧地面种子总预算；超出按占用格数等比缩每格配额；<=0 不限
     // 每帧地面「最终匹配」总预算。total_max 只约束种子，扩容会把总量涨回去，
     // 这里是唯一能真正封顶的地方。裁剪在前/中/后三桶内各自等间隔进行，

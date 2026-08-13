@@ -1305,6 +1305,13 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/ground_reg_cell_target_pts",    ground_reg_cell_target_pts,    50);
     nh.param("slamesher/ground_reg_nbr_per_seed",       ground_reg_nbr_per_seed,       40);
     nh.param("slamesher/ground_reg_y_max",              ground_reg_y_max,              25.0);
+    nh.param("slamesher/ground_reg_x_max",              ground_reg_x_max,              0.0);
+    nh.param("slamesher/ground_reg_x_max_front",        ground_reg_x_max_front,        0.0);
+    nh.param("slamesher/ground_thr_last",               ground_thr_last,               0.03);
+    nh.param("slamesher/predict_horizontal_only",       predict_horizontal_only,       false);
+    nh.param("slamesher/reg_alternations",              reg_alternations,              1);
+    nh.param("slamesher/obs_thr_last",                  obs_thr_last,                  0.0);
+    nh.param("slamesher/ground_map_r_max",              ground_map_r_max,              0.0);
     nh.param("slamesher/ground_reg_total_max",          ground_reg_total_max,          4000);
     nh.param("slamesher/ground_reg_match_max",          ground_reg_match_max,          2500);
     nh.param("slamesher/ground_reg_fb_x0",              ground_reg_fb_x0,              5.0);
@@ -1355,6 +1362,9 @@ void Parameter::initParameter(ros::NodeHandle & nh){
               << " reg_target=" << ground_reg_cell_target_pts
               << " reg_nbr/seed=" << ground_reg_nbr_per_seed
               << " reg_y_max=" << ground_reg_y_max << "m"
+              << " reg_x_max=" << ground_reg_x_max << "m"
+              << " reg_x_max_f=" << ground_reg_x_max_front << "m"
+              << " map_r_max=" << ground_map_r_max << "m"
               << " reg_total_max=" << ground_reg_total_max
               << " reg_match_max=" << ground_reg_match_max
               << " fb_x0=" << ground_reg_fb_x0 << "m"
@@ -1452,6 +1462,18 @@ Transf SLAMesher::getOdom(){
         else if (g_data.step > 2) {
             // 匀速外推：T_{t-1} * (T_{t-2}^{-1} T_{t-1})
             odom = g_data.T_seq[g_data.step - 1] * g_data.T_seq[g_data.step - 2].inverse() * g_data.T_seq[g_data.step - 1];
+            if (param.predict_horizontal_only) {
+                // roll/pitch/z 由地面阶段求解，而地面阶段的修正量恒等于「本帧速率减
+                // 上帧速率」，对速率本身没有回复力。再对这三个自由度做匀速外推，等于
+                // 给它们各接一个自由积分器：任何速率都是不动点，早期噪声取到的漂移率
+                // 会被永久保持下去。只外推 x/y/yaw（每帧真有米级运动，障碍阶段需要）。
+                const Transf& Tp = g_data.T_seq[g_data.step - 1];
+                double r_e, p_e, y_e, r_p, p_p, y_p;
+                matrixToRPY(odom.block<3, 3>(0, 0), r_e, p_e, y_e);
+                matrixToRPY(Tp.block<3, 3>(0, 0),   r_p, p_p, y_p);
+                odom = makePoseFromXYZRPY(odom(0, 3), odom(1, 3), Tp(2, 3),
+                                          r_p, p_p, y_e);
+            }
         }
     }
     std::cout << "Pose Odom:" << "x: " << odom(0, 3) << "  y: " << odom(1, 3) << "  z: " << odom(2, 3) << "\n";
@@ -1765,6 +1787,9 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
     std::unordered_map<const BSplineSurface*, std::vector<int>> gnd_prev_indices;
     std::unordered_map<const BSplineSurface*, std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>>> gnd_prev_uv;
 
+    // 障碍阶段逐轮收紧的匹配门；地面阶段在自己的循环里复位成 match_dist_thr
+    double cur_match_thr = match_dist_thr;
+
     // 匹配辅助 lambda：对 surf_to_pts 中所有 (sid, indices) 做 footprint 并写入 matches
     auto buildMatches = [&](const std::unordered_map<int, std::vector<int>>& surf_to_pts,
                             bool want_ground,
@@ -1803,7 +1828,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
             for (int k = 0; k < (int)indices.size(); k++) {
                 double d = std::sqrt(std::abs(dists[k]));
-                if (d > match_dist_thr || d < 1e-6) continue;
+                if (d > cur_match_thr || d < 1e-6) continue;
 
                 auto [paraU, paraV] = footprints[k];
                 SurfaceCurvature curv = surf->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
@@ -1879,10 +1904,29 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         }
     };
 
+    // 阶段 2 的产物，外层交替时每轮覆盖，循环结束后给 dump 用
+    std::vector<int> gnd_enter_indices;      // 最后一轮进入地面匹配的点索引
+    std::vector<RegMatch> last_gnd_matches;  // 最后一轮过 thr、进 Ceres 的地面匹配
+
+    // 障碍解 x/y/yaw 时 roll/pitch/z 取自外推，地面解完 roll/pitch/z 后不再回头，
+    // 于是用错误姿态算出的 x/y/yaw 永久留在结果里。多跑几轮让两组自由度互相收敛。
+    const int n_alt = std::max(1, param.reg_alternations);
+    for (int alt = 0; alt < n_alt; ++alt) {
+    delta_scale = 100.0;
+
     // ══════════════════════════════════════════════════════════════════════
     // 阶段 1：障碍匹配 — 只优化世界系 x / y / yaw；z / roll / pitch 固定
     // ══════════════════════════════════════════════════════════════════════
     for (int iter = 0; iter < max_iters && delta_scale > converge_thr; iter++) {
+        // 首轮用大门吃掉外推残差，之后几何收紧到 obs_thr_last 剔外点（动态车辆、
+        // 植被、鬼面）。原实现四轮恒定 0.8 m，末轮仍在吸收明显不该要的对应。
+        cur_match_thr = match_dist_thr;
+        if (param.obs_thr_last > 0.0 && param.obs_thr_last < match_dist_thr
+            && max_iters > 1) {
+            const double t = (double)std::min(iter, max_iters - 1) / (max_iters - 1);
+            cur_match_thr = match_dist_thr
+                          * std::pow(param.obs_thr_last / match_dist_thr, t);
+        }
         std::unordered_map<int, std::vector<int>> obs_surf_to_pts;
         const int col_step = std::max(1, param.obs_rimg_col_step);
         const int surf_cap = param.obs_match_per_surf_max;
@@ -2005,18 +2049,31 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
     // ══════════════════════════════════════════════════════════════════════
     // 阶段 2：地面匹配 — 点到平面；只优化世界系 roll / pitch / z
     // ══════════════════════════════════════════════════════════════════════
-    std::vector<int> gnd_enter_indices;  // 最后一轮进入地面匹配（送入曲面查询）的点索引
-    std::vector<RegMatch> last_gnd_matches;  // 最后一轮过 thr、进 Ceres 的地面匹配
     {
+        gnd_enter_indices.clear();
+        last_gnd_matches.clear();
+        cur_match_thr = match_dist_thr;  // 地面阶段自带 gnd_thr 调度，这里复位
         const std::vector<RegMatch> obs_saved = last_matches;
         const double x_fix = T_curr(0, 3);
         const double y_fix = T_curr(1, 3);
         double roll_i = 0.0, pitch_i = 0.0, yaw_fix = 0.0;
         matrixToRPY(T_curr.block<3, 3>(0, 0), roll_i, pitch_i, yaw_fix);
 
+        // 地面阶段入口态：与出口态相减即地面阶段的净修正，用于把"外推+障碍带进来的
+        // 姿态"与"地面加上去的"分开归因
+        std::cout << "  [gnd in] roll=" << roll_i
+                  << " pitch=" << pitch_i
+                  << " z=" << T_curr(2, 3)
+                  << " guess_pitch=" << [&]{
+                         double r, p, y;
+                         matrixToRPY(T_guess.block<3, 3>(0, 0), r, p, y);
+                         return p;
+                     }() << std::endl;
+
         constexpr int kGndIters = 3;
-        auto gndMatchDistForIter = [](int it) -> double {
-            static constexpr double kSched[3] = {1, 0.3, 0.03};
+        const double gnd_thr_last = param.ground_thr_last;
+        auto gndMatchDistForIter = [&](int it) -> double {
+            const double kSched[3] = {1, 0.3, gnd_thr_last};
             return kSched[std::min(std::max(it, 0), kGndIters - 1)];
         };
 
@@ -2034,6 +2091,8 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             const int    nbr_cap  = param.ground_reg_nbr_per_seed;
             const int    seed_bud = param.ground_reg_total_max;
             const double y_max    = param.ground_reg_y_max;
+            const double x_max    = param.ground_reg_x_max;
+            const double x_max_f  = param.ground_reg_x_max_front;
             const double near_x   = param.gnd_near_x_max;
             const double near_y   = param.gnd_near_y_max;
             const double near_z   = param.gnd_near_z_max;
@@ -2051,6 +2110,8 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             const bool use_pw = !pw_ground_mask.empty();
             auto passGndLocal = [&](int idx, double lx, double ly, double lz) -> bool {
                 if (y_max > 0.0 && std::abs(ly) > y_max) return false;
+                if (x_max > 0.0 && std::abs(lx) > x_max) return false;
+                if (x_max_f > 0.0 && lx > x_max_f) return false;
                 if (use_pw) return pw_ground_mask[idx] != 0;
                 if (lz < ground_z_min || lz > zCeilAt(lx, ly)) return false;
                 return true;
@@ -2383,6 +2444,25 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 }
             }
 
+            if (giter == 0) {
+                // 求解前按雷达系 x 分桶的竖直残差：残差场若沿 x 单调（前后反号），
+                // 驱动的就是 pitch。用它定位推力来自哪个纵向区段。
+                static constexpr double kEdge[6] = {-35, -20, -8, 8, 20, 35};
+                double sum[7] = {0}; int num[7] = {0};
+                for (const auto& m : gnd_matches) {
+                    const double lx = m.p_local.x();
+                    int b = 0;
+                    while (b < 6 && lx >= kEdge[b]) ++b;
+                    sum[b] += (m.p_world.z() - m.curvature.point.z());
+                    num[b] += 1;
+                }
+                std::cout << "  [gnd resid]";
+                for (int b = 0; b < 7; ++b)
+                    std::cout << " " << (num[b] ? sum[b] / num[b] : 0.0)
+                              << "/" << num[b];
+                std::cout << std::endl;
+            }
+
             if ((int)gnd_matches.size() < 10) {
                 std::cout << "  [gnd] giter=" << giter
                           << " thr=" << gnd_thr
@@ -2439,6 +2519,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                       << " (xy/yaw fixed from obs)" << std::endl;
         }
     }
+    }  // 外层交替
 
     const Eigen::Matrix3d R_dump = T_curr.block<3, 3>(0, 0);
     const Eigen::Vector3d t_dump = T_curr.block<3, 1>(0, 3);
@@ -2732,9 +2813,14 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
         cloud_gnd_world.reserve(static_cast<size_t>(N / 4));
         std::vector<Eigen::Vector3d> gnd_lidar_pts;
         gnd_lidar_pts.reserve(static_cast<size_t>(N / 4));
+        const double map_r_max = param.ground_map_r_max;
         for (int i = 0; i < N; ++i) {
             if (!ground_mask[i]) continue;
             const auto& pt = scan_local.points[i];
+            // 超距点不进图，但仍算地面：置 false 会让它漏进 scan_obs 污染障碍匹配
+            if (map_r_max > 0.0 &&
+                (double)pt.x * pt.x + (double)pt.y * pt.y > map_r_max * map_r_max)
+                continue;
             // Patchwork++ 的判定已是最终结论，不再叠加 z 带复核
             if (!use_pw_mask && pt.z > zCeilAt(pt.x, pt.y)) {
                 ground_mask[i] = false;  // 不进建图，也不从障碍里抠掉
