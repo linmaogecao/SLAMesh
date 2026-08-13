@@ -68,6 +68,13 @@ public:
     int    reg_alternations{1};
     // 匀速外推只作用于 x/y/yaw；roll/pitch/z 沿用上一帧值，不做速率延拓。
     bool   predict_horizontal_only{false};
+    // HDL-64 竖直角标定修正（度）。0=关闭。KITTI 公认值 0.205，见 pyLiDAR-SLAM
+    // correct_scan。帧内运动去畸变已实测无效（两个符号都试过，均值 1.408→1.633，
+    // 且高速的 01 恶化最多，与机制预期相反），KISS-ICP 在 KITTI 上同样 deskew=False。
+    double scan_correct_deg{0.0};
+    // 只修正 Patchwork++ 标出的地面点。全量修正会挪动 range image 的行分箱，
+    // 在特征稀少处打散障碍聚类（seq01 失锁段障碍匹配 256→178，整条 2.1→17.7）。
+    bool   scan_correct_ground_only{true};
     // 地面阶段末轮的匹配硬门（米）。门越紧，存活点越是"已经和当前估计吻合"的那批，
     // 估计量趋于自身预测的不动点。原硬编码 0.03。
     double ground_thr_last{0.03};

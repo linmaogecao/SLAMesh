@@ -115,6 +115,34 @@ inline Transf makePoseFromXYZRPY(double x, double y, double z,
     return T;
 }
 
+// KITTI 的 HDL-64 有约 0.205° 的竖直角标定偏差：同一块地面在不同距离上被测出
+// 不同高度，误差正比于水平距离（40 m 处 0.14 m）。地图里存的是这块地面更远时的
+// 观测，当前帧在更近处看它，两者之差正比于这期间的距离变化，也就是正比于行驶
+// 距离，最后被位姿吸收成同号的 pitch 偏置。
+// 修正为绕 a = normalize(p × ẑ) 转 theta；a ⊥ p，Rodrigues 只剩两项。
+// 取自 pyLiDAR-SLAM correct_scan，KISS-ICP / SAGE-ICP 在 KITTI 上同样先做这一步。
+// mask 非空时只修正标记点：该缺陷表现为与距离成正比的高度误差，只对地面链的
+// 竖直点到面残差有意义；障碍链匹配完整三维面，地图与扫描同转一个小角近乎无
+// 操作，却会把 range image 的行分箱整体挪 0.155°（HDL-64 行距约 0.4°），在
+// 特征稀少处打散聚类。seq01 实测全量修正时失锁段障碍匹配 256→178。
+void correctScanCalib(pcl::PointCloud<pcl::PointXYZ>& scan, double theta,
+                      const std::vector<uint8_t>* mask)
+{
+    const double c = std::cos(theta), s = std::sin(theta);
+    const int n = static_cast<int>(scan.size());
+#pragma omp parallel for schedule(static)
+    for (int i = 0; i < n; ++i) {
+        if (mask && (i >= static_cast<int>(mask->size()) || (*mask)[i] == 0)) continue;
+        auto& p = scan.points[static_cast<size_t>(i)];
+        const double x = p.x, y = p.y, z = p.z;
+        const double rho = std::hypot(x, y);
+        if (rho < 1e-6) continue;
+        p.x = static_cast<float>(x * c - (x * z / rho) * s);
+        p.y = static_cast<float>(y * c - (y * z / rho) * s);
+        p.z = static_cast<float>(z * c + rho * s);
+    }
+}
+
 // 地面：点到平面 r = scale * n·(R p + t - q)；只优化 [roll, pitch, z]
 struct GroundPointToPlaneZRP {
     GroundPointToPlaneZRP(const Eigen::Vector3d& p_local,
@@ -1309,6 +1337,8 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/ground_reg_x_max_front",        ground_reg_x_max_front,        0.0);
     nh.param("slamesher/ground_thr_last",               ground_thr_last,               0.03);
     nh.param("slamesher/predict_horizontal_only",       predict_horizontal_only,       false);
+    nh.param("slamesher/scan_correct_deg",              scan_correct_deg,              0.0);
+    nh.param("slamesher/scan_correct_ground_only",      scan_correct_ground_only,      true);
     nh.param("slamesher/reg_alternations",              reg_alternations,              1);
     nh.param("slamesher/obs_thr_last",                  obs_thr_last,                  0.0);
     nh.param("slamesher/ground_map_r_max",              ground_map_r_max,              0.0);
@@ -1345,6 +1375,9 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     std::cout << "obs_rimg_col_step=" << obs_rimg_col_step
               << "  obs_match_per_surf_max=" << obs_match_per_surf_max
               << "  obs_cand_target=" << obs_cand_target << std::endl;
+    std::cout << "scan_correct_deg: " << scan_correct_deg
+              << (scan_correct_deg != 0.0 ? " (HDL-64 vertical angle fix on)" : " (off)")
+              << "  ground_only=" << (scan_correct_ground_only ? "yes" : "no") << std::endl;
     std::cout << "ground_grid(fine): z_band=[" << ground_z_min << "," << ground_z_max << "]"
               << " cell=" << ground_cell_size
               << "m min_pts=" << ground_cell_min_pts
@@ -3485,6 +3518,16 @@ void SLAMesher::process(){
             std::cout << "  [Patchwork++] ground=" << n_gnd << "/" << scan_local.size()
                       << "  sensor_h=" << patchwork_.sensorHeight()
                       << "  " << t_pw.toc() << " ms" << std::endl;
+        }
+
+        // 竖直角标定修正：必须在建 range image / 配准 / 建图之前。原地改写，
+        // 下标不变，pw_ground_mask 仍然对齐。ground_only 时只动地面点，障碍链
+        // 拿到的仍是原始几何（runMapBuild 按 !ground_mask 取障碍点）。
+        if (param.scan_correct_deg != 0.0) {
+            const bool gnd_only = param.scan_correct_ground_only
+                               && !pw_ground_mask.empty();
+            correctScanCalib(scan_local, param.scan_correct_deg * M_PI / 180.0,
+                             gnd_only ? &pw_ground_mask : nullptr);
         }
 
         if(g_data.step == 1){

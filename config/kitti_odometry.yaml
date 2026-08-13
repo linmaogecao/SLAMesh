@@ -93,6 +93,14 @@ slamesher:
   ground_reg_x_max_front: 0.0 # 配准：只限前方 lx<=此值（米）；<=0 不限制
   ground_thr_last: 0.30      # 地面阶段末轮匹配硬门（米）；原硬编码 0.03
   predict_horizontal_only: false # 匀速外推只作用 x/y/yaw；roll/pitch/z 沿用上一帧
+  # HDL-64 竖直角标定修正（度）。KITTI 公认值 0.205（pyLiDAR-SLAM correct_scan，
+  # KISS-ICP / SAGE-ICP 全序列都先做）。同一块地面在不同距离上测出的高度差正比于
+  # 水平距离，地图与当前帧的观测距离不同，差值被吸收成同号 pitch 偏置。0=关闭。
+  # 0.205 是公认值，但那是点到点 ICP 全云匹配下的；本算法地面链是竖直点到面，
+  # 响应不同。实测四条序列的 pitch 偏置过零点落在 0.145~0.167，取 0.155。
+  scan_correct_deg: 0.155
+  # 只修正地面点：全量修正会挪动 range image 行分箱，打散障碍聚类。
+  scan_correct_ground_only: true
   reg_alternations: 1        # 障碍(x/y/yaw)与地面(roll/pitch/z)交替求解轮数；1=原单遍
   obs_thr_last: 0.2          # 障碍阶段末轮匹配门（米）；从 0.8 几何收紧到此值；<=0 关闭
   ground_map_r_max: 0.0      # 建图：只收雷达系水平距离<=此值的地面点（米）；<=0 不限制
