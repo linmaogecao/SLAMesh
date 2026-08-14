@@ -161,7 +161,7 @@ public:
 #pragma omp parallel for schedule(dynamic) num_threads(npar)
         for (int i = 0; i < (int)tasks.size(); ++i) {
             auto& t = tasks[i];
-            t.surf = std::make_shared<BSplineSurface>(3, 3, num_cp_, num_cp_, 0.25);
+            t.surf = std::make_shared<BSplineSurface>(3, 3, num_cp_, num_cp_);
             t.ok = t.surf->apply(t.cloud, 30, 1, 1, 0.05);
         }
 
@@ -447,7 +447,7 @@ private:
         auto cloud = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
         subsampleToCloud(cell.pts, fit_max_pts_, *cloud);
 
-        auto new_surf = std::make_shared<BSplineSurface>(3, 3, num_cp_, num_cp_, 0.25);
+        auto new_surf = std::make_shared<BSplineSurface>(3, 3, num_cp_, num_cp_);
         if (!new_surf->apply(cloud, 30, 1, 1, 0.05))
             return false;
         if (!checkNormalUpward(*new_surf, normal_z_min_))

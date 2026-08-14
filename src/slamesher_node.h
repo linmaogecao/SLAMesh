@@ -46,7 +46,6 @@ public:
     int    ground_cell_min_pts{80};   // 格内点数达此值才拟合曲面
     int    ground_cell_num_cp{5};     // BSpline 每维控制点数
     int    ground_query_radius{1};    // 配准查询格半径（格数）
-    int    ground_map_skip_points{1}; // 已废弃：建图改为先投 XY 格再按格密度降采样，此参数不再使用
     int    ground_cell_max_pts{400};  // 每格最多保留点数（超出均匀下采样）
     int    ground_fit_max_pts{150};   // 每格 BSpline 拟合最多用点数
     double ground_cell_z_pct{0.0};    // 建图：格内 z 参考；(0,1]=分位，<=0 用均值
@@ -64,6 +63,86 @@ public:
     double ground_reg_y_max{25.0};    // 配准：雷达系 |y| 上限（米）；<=0 不限制
     // 障碍阶段末轮匹配门（米），从 match_dist_thr(0.8) 几何收紧到此值；<=0 关闭恒为 0.8。
     double obs_thr_last{0.0};
+    // 障碍 Ceres Huber 阈值（米）。原硬编码 0.5，大于末轮门 0.2，末轮几乎全体二次。
+    // 拟合噪声中位 0.13 m，0.5 把植被级外点当内点。<=0 回退 0.5。
+    double obs_huber{0.5};
+    // 障碍 Ceres 内层迭代。原硬编码 1：外层 4 轮各走 1 步 Gauss-Newton 后重找对应。
+    // 地面阶段内层是 10。<=0 回退 1。
+    int    obs_ceres_iters{1};
+    // 障碍 range-image BFS 的相邻像素法向夹角上限（度）。>0 时折边处拆 cluster。
+    // 0=关闭（原行为）。45° 对应 cos=0.707，只切开明显折边，缓曲面仍连在一起。
+    double obs_seg_normal_deg{0.0};
+    // 建图：拟合残差超过此值（米）的障碍面不入库。<=0 关闭。
+    // 用 obs_fit_weight_adj 决定样本内还是无偏化残差。只砍极端尾，不重加权。
+    double obs_fit_max_dist{0.0};
+    // 建图：无偏化残差超过此值且点数>=60 时沿最长 PCA 轴对半拆开再拟合。
+    // 两片子片都成功且残差都低于母片才替换，否则保留母片。<=0 关闭。
+    double obs_fit_split_dist{0.0};
+    // 障碍匹配中足点被夹在参数域边界([0,1])的对应如何处理。牛顿被夹说明最近点落在该片
+    // PCA 数据支撑框之外，此时 |p-足点| 由切向偏移主导，与残差主项（法向分量）不是一个量。
+    //   0 = 照旧用三维足点距离过门
+    //   1 = 直接丢弃（实测 7 序列水平 0.411→0.525，09/10 崩，已否定）
+    //   2 = 改用法向距离过门，并把该匹配的切向残差归零、横向偏移限在 obs_edge_tan_max
+    int    obs_edge_mode{0};
+    // 模式 2 的横向偏移上限（米）：防止把点粘到远处共面的另一段结构上
+    double obs_edge_tan_max{2.0};
+    // 建图：新障碍面覆盖旧面占据体素达此比例时退役旧面（<=0 关闭）。不开时同一面墙每次
+    // 建图各拟合一张，seq06 单帧参与候选的曲面数 91 -> 570，且这些碎片位姿逐渐漂移、
+    // 彼此不一致。
+    double obs_map_replace_frac{0.0};
+    // 建图：新障碍面占据的体素里把旧障碍面全摘掉（按体素论归属）。与 replace_frac 相比
+    // 直接对准"同一体素塞着多张漂移碎片"这个机制。
+    bool   obs_map_voxel_owner{false};
+    // 障碍面拟合的目标点密度（点/控制点）；>0 时取代原分档表反解控制网格边长。
+    // 原分档在低端只有 5 点/控制点，欠定拟合的误差集中在参数域边缘。
+    double obs_fit_pts_per_cp{0.0};
+    // 障碍面拟合的收敛判据。原值 10 / 0.05：相对下降连续两次低于 5% 即停，而实测停下时
+    // 平均点到面距离中位仍有 0.13 m（传感器噪声 0.02 m，末轮匹配门限 0.2 m），
+    // 即残差主导项是拟合误差而非位姿误差。
+    int    obs_fit_max_iter{10};
+    double obs_fit_eps{0.05};
+    // 障碍残差按所匹配曲面自身的拟合距离做反方差加权：w ∝ 1/sqrt(sigma^2 + fit^2)，
+    // sigma 为传感器测距噪声（米）。权重整体归一到均值 1，以保持 Huber 尺度不变。
+    // <=0 关闭。等权时一张 0.4 m 的植被片和一张 0.02 m 的墙面片对位姿的影响相同。
+    double obs_fit_weight_sigma{0.0};
+    // 加权用样本内残差还是乘过 sqrt(n/(n-p)) 的无偏化值。样本内残差在 48 自由度拟合
+    // 80~200 点时会把最过拟合（最不可信）的片评为最优。
+    bool   obs_fit_weight_adj{false};
+    // 障碍残差数塌陷时把 xy 平面的步长往匀速外推值收缩（方向与 yaw 保留求解结果）。
+    // 实测 seq02 按末轮残差数分箱：res<202 的 227 帧（4.9%）步长相对误差 21~28%，
+    // res>395 的 2343 帧只有 1.7%；seq00 残差数最小 215、全程无此效应，各分箱平的
+    // （1.8~3.1%），故 hi<=210 时 seq00 不受影响。
+    // 权重 w=clamp((res-lo)/(hi-lo),0,1)，步长取 w*解 + (1-w)*外推。lo<=0 或 hi<=lo 关闭。
+    int    obs_starve_res_lo{0};
+    int    obs_starve_res_hi{0};
+    // 建图预热期地图近空、残差数天然低（实测 seq02 前 25 帧全部触发），而此时匀速外推还
+    // 挂在 bootstrap_step2_tx 上（0.6 m，真值约 1.05 m），回退会把步长钉死在引导值。
+    // 此帧数之前不启用回退。
+    int    obs_starve_warmup{30};
+    // 障碍阶段的运动模型先验（Tikhonov 正则）：把 x/y/yaw 往匀速外推值拉，残差
+    // (x-x_pred)/sigma_xy 等，无 Huber。依据：seq02 第4432~4540帧 rcond 掉到 0.15、
+    // dom 0.50（法向半数挤在一个 22.5° 方位桶），沿轨方向接近秩亏，解塌向"没动"；
+    // 而匀速外推对该段真值步长的预测误差只有 0.007 m。先验信息只填零空间：约束强的
+    // 方向上 n*lambda_max≈137 远压过先验，退化方向上 n*lambda_min≈20 与先验同量级。
+    // <=0 关闭。sigma_yaw 单位度。
+    double obs_prior_sigma_xy{0.0};
+    double obs_prior_sigma_yaw{0.0};
+    // true：先验只约束沿轨分量（残差 = 增量在预测行进方向上的投影 - 预测步长），横向与
+    // yaw 不约束。各向同性版实测 seq02 2.780->0.740 但 seq10 0.679->0.855（偏航是 10 的
+    // 最大误差轴，被 1° 偏航先验压住），放松到 0.6/5° 则 seq02 退回 1.397。
+    bool   obs_prior_along_only{false};
+    // 障碍匹配左右平衡：任一侧（雷达系 y>=0 为左）不得超过该比例，超出则按 scan_idx
+    // 等间隔下采样。平行街道里一侧墙垄断时 yaw 被单边点到面残差拽偏，08 航向全程同号
+    // 累积 4.5°。<=0 或 >=1 关闭。
+    double obs_lr_max_frac{0.0};
+    // 障碍残差按水平距离加权：w *= min(1, ref/r)。yaw 的 J ∝ r、JtJ ∝ r²，远距 13 cm
+    // 拟合噪声的角误差更大却对 yaw 贡献更大。<=0 关闭。
+    double obs_range_ref{0.0};
+    // 地面阶段的姿态零阶保持先验强度（度/帧）；<=0 关闭。真值 roll 一步预测 std 0.152 °/帧，
+    // 而本系统 roll 帧间抖动全序列超额（窄街段达 1.3°/帧），roll 误差 std ~1.0° 正好等于
+    // 超额抖动 0.103 °/帧走 100 帧的随机游走幅度。pitch 无超额，默认关闭。
+    double gnd_roll_prior_sigma{0.0};
+    double gnd_pitch_prior_sigma{0.0};
     // 障碍(x/y/yaw) 与 地面(roll/pitch/z) 两组自由度的交替求解轮数；1=原单遍。
     int    reg_alternations{1};
     // 匀速外推只作用于 x/y/yaw；roll/pitch/z 沿用上一帧值，不做速率延拓。
@@ -267,6 +346,13 @@ private:
         SurfaceCurvature curvature;
         int scan_idx  = -1;
         bool is_ground = false;
+        // 足点被夹在参数域边界：q 是片边缘点而非真最近点，切向残差编码的是"沿面滑动"
+        // 的虚假约束，只保留法向分量。
+        bool drop_tangent = false;
+        // 所匹配曲面自身的平均拟合距离（米），<0 表示未拟合过
+        double fit_dist = -1.0;
+        // 残差整体缩放系数（反方差加权用），1.0 为原等权行为
+        double weight = 1.0;
     };
 
     // 第 1 帧：初始化位姿并建图
@@ -317,5 +403,5 @@ private:
                                 int step_end = 0) const;
 
     // 3 阶 B-spline：u/v 同尺寸，范围 [4, 15]
-    static int chooseControlGridSize(int num_fitting_points);
+    static int chooseControlGridSize(int num_fitting_points, double pts_per_cp = 0.0);
 };

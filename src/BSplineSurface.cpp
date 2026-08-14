@@ -287,72 +287,8 @@ Vector3d BSplineSurface::getPos(const Parameter& paraU, const Parameter& paraV, 
     return evaluateSurface(paraU, paraV, knotsU, knotsV, controls, num_cp_v).pos;
 }
 
-Vector3d BSplineSurface::getFirstDiff(const Parameter& paraU, const Parameter& paraV, const vector<double>& knotsU, const vector<double>& knotsV, const std::vector<Vector3d>& controls,int num_cp_v, bool is_diff_u)
-{
-    const SurfaceEval eval = evaluateSurface(paraU, paraV, knotsU, knotsV, controls, num_cp_v);
-    return is_diff_u ? eval.Su : eval.Sv;
-}
-
-Vector3d BSplineSurface::getSecondDiff(const Parameter& paraU, const Parameter& paraV, const vector<double>& knotsU, const vector<double>& knotsV, const std::vector<Vector3d>& controls,int num_cp_v, int type) {
-    const SurfaceEval eval = evaluateSurface(paraU, paraV, knotsU, knotsV, controls, num_cp_v);
-    if (type == 0) return eval.Suu;
-    if (type == 1) return eval.Svv;
-    return eval.Suv;
-}
-
-
 SurfaceCurvature BSplineSurface::getCurvature(const Parameter& paraU, const Parameter& paraV, const vector<double>& knotsU, const vector<double>& knotsV, const std::vector<Vector3d>& controls,int num_cp_v) {
     return curvatureFromEval(evaluateSurface(paraU, paraV, knotsU, knotsV, controls, num_cp_v));
-}
-
-void BSplineSurface::buildRangeGrid(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud, int grid_res) {
-    if (!cloud || cloud->empty()) return;
-
-    // Use global bounds (already computed in initControlPoint)
-    grid_origin_x_ = min_x;
-    grid_origin_y_ = min_y;
-
-    double range_x = max_x - min_x;
-    double range_y = max_y - min_y;
-
-    // Determine grid resolution based on data range
-    grid_res_x_ = grid_res;
-    grid_res_y_ = grid_res;
-    grid_cell_size_x_ = range_x / grid_res_x_;
-    grid_cell_size_y_ = range_y / grid_res_y_;
-
-    // Avoid division by zero
-    if (grid_cell_size_x_ < 1e-9) grid_cell_size_x_ = 1.0;
-    if (grid_cell_size_y_ < 1e-9) grid_cell_size_y_ = 1.0;
-
-    // Initialize grid
-    range_grid_.clear();
-    range_grid_.resize(grid_res_x_, std::vector<LocalRange>(grid_res_y_));
-
-    // Fill grid with point data
-    for (const auto& pt : cloud->points) {
-        int ix = static_cast<int>((pt.x - grid_origin_x_) / grid_cell_size_x_);
-        int iy = static_cast<int>((pt.y - grid_origin_y_) / grid_cell_size_y_);
-
-        // Clamp to valid range
-        ix = std::max(0, std::min(ix, grid_res_x_ - 1));
-        iy = std::max(0, std::min(iy, grid_res_y_ - 1));
-
-        LocalRange& cell = range_grid_[ix][iy];
-        if (!cell.has_data) {
-            cell.min_x = cell.max_x = pt.x;
-            cell.min_y = cell.max_y = pt.y;
-            cell.min_z = cell.max_z = pt.z;
-            cell.has_data = true;
-        } else {
-            cell.min_x = std::min(cell.min_x, (double)pt.x);
-            cell.max_x = std::max(cell.max_x, (double)pt.x);
-            cell.min_y = std::min(cell.min_y, (double)pt.y);
-            cell.max_y = std::max(cell.max_y, (double)pt.y);
-            cell.min_z = std::min(cell.min_z, (double)pt.z);
-            cell.max_z = std::max(cell.max_z, (double)pt.z);
-        }
-    }
 }
 
 double BSplineSurface::findFootPrint(const vector<Vector3d> &givepoints, vector<pair<Parameter, Parameter>> &footPrints, vector<double> &point_dists) {
@@ -360,13 +296,6 @@ double BSplineSurface::findFootPrint(const vector<Vector3d> &givepoints, vector<
     footPrints.clear();
     coldInitUVFromPCA(givepoints, footPrints);
     return findFootPrintWarm(givepoints, footPrints, point_dists, /*newton_steps=*/6);
-}
-
-std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter> BSplineSurface:: getPara(int index) {
-    if (index < 0 || index >= (int)sampling_paras_.size()) {
-        return {Parameter(0, 0.0), Parameter(0, 0.0)};
-    }
-    return sampling_paras_[index];
 }
 
 // ─── UV 工具：给定全局参数 t ∈ [0,1]，找所在 knot span ───────────────────────
@@ -558,7 +487,7 @@ void BSplineSurface::initControlPointPCA(const pcl::PointCloud<pcl::PointXYZ>::P
     computePlaneFrame(cloud);
     if (!plane_frame_.valid) return;
 
-    // ----- 2. 全局 AABB 仍要保存, 供 isPointValid / buildRangeGrid 使用 -----
+    // ----- 2. 全局 AABB 供 apply() 里的边界约束使用 -----
     Eigen::Vector4f min_pt_4f, max_pt_4f;
     pcl::getMinMax3D(*cloud, min_pt_4f, max_pt_4f);
     max_x = max_pt_4f[0]; min_x = min_pt_4f[0];
@@ -614,80 +543,10 @@ void BSplineSurface::initControlPointPCA(const pcl::PointCloud<pcl::PointXYZ>::P
         }
     }
 }
-bool BSplineSurface::isPointValid(const Vector3d& p) {
-    double global_margin = 0.03;
-    if (p.x() < (min_x - global_margin) || p.x() > (max_x + global_margin) ||
-        p.y() < (min_y - global_margin) || p.y() > (max_y + global_margin) ||
-        p.z() < (min_z - global_margin) || p.z() > (max_z + global_margin)) {
-        cn1++;
-        return false;
-        }
-    if (range_grid_.empty()) {
-        return true;
-    }
-
-    // Find grid cell for this point
-    int ix = static_cast<int>((p.x() - grid_origin_x_) / grid_cell_size_x_);
-    int iy = static_cast<int>((p.y() - grid_origin_y_) / grid_cell_size_y_);
-
-    // Clamp to valid range
-    ix = std::max(0, std::min(ix, grid_res_x_ - 1));
-    iy = std::max(0, std::min(iy, grid_res_y_ - 1));
-
-    // Check current cell and neighboring cells (3x3 neighborhood)
-    double local_min_x = std::numeric_limits<double>::max();
-    double local_max_x = std::numeric_limits<double>::lowest();
-    double local_min_y = std::numeric_limits<double>::max();
-    double local_max_y = std::numeric_limits<double>::lowest();
-    double local_min_z = std::numeric_limits<double>::max();
-    double local_max_z = std::numeric_limits<double>::lowest();
-    bool found_data = false;
-
-    for (int di = -1; di <= 1; ++di) {
-        for (int dj = -1; dj <= 1; ++dj) {
-            int ni = ix + di;
-            int nj = iy + dj;
-            if (ni >= 0 && ni < grid_res_x_ && nj >= 0 && nj < grid_res_y_) {
-                const LocalRange& cell = range_grid_[ni][nj];
-                if (cell.has_data) {
-                    found_data = true;
-                    local_min_x = std::min(local_min_x, cell.min_x);
-                    local_max_x = std::max(local_max_x, cell.max_x);
-                    local_min_y = std::min(local_min_y, cell.min_y);
-                    local_max_y = std::max(local_max_y, cell.max_y);
-                    local_min_z = std::min(local_min_z, cell.min_z);
-                    local_max_z = std::max(local_max_z, cell.max_z);
-                }
-            }
-        }
-    }
-
-    // If no data in neighborhood, reject the point (it's in an empty region)
-    if (!found_data) {
-        cn2++;
-        return false;
-    }
-
-    // Check if point is within local range + margin
-    double local_margin = 0.02;
-    if (p.x() < (local_min_x - local_margin) || p.x() > (local_max_x + local_margin) ||
-        p.y() < (local_min_y - local_margin) || p.y() > (local_max_y + local_margin) ||
-        p.z() < (local_min_z - local_margin) || p.z() > (local_max_z + local_margin)) {
-        cn3++;
-        return false;
-    }
-
-
-    return true;
-}
-
 void BSplineSurface::setNewControl(const vector<Vector3d> &controlPs, int num_u, int num_v,bool isCut) {
     controls = controlPs;
     controls_num_u = num_u;
     controls_num_v = num_v;
-    positions.clear();
-    sampling_paras_.clear();
-    span_sample_index_.clear();
 }
 
 void BSplineSurface::setKnotParams(int num_cp_u,int num_cp_v) {
@@ -741,15 +600,13 @@ bool BSplineSurface::apply(
     };
     auto t0 = std::chrono::high_resolution_clock::now();
 
-    this->input_cloud_ = points;
-
     vector<Vector3d> controlPs;
 
     const int expected = controls_num_u * controls_num_v;
     if (!ext_init_controls_.empty() && (int)ext_init_controls_.size() == expected) {
         // 使用外部提供的初始控制点（range-image 行列采样），跳过 PCA 初始化
         controlPs = ext_init_controls_;
-        // AABB 仍需更新，供 isPointValid / buildRangeGrid 使用
+        // AABB 供 apply() 里的边界约束使用
         Eigen::Vector4f min_pt_4f, max_pt_4f;
         pcl::getMinMax3D(*points, min_pt_4f, max_pt_4f);
         max_x = max_pt_4f[0]; min_x = min_pt_4f[0];
@@ -772,8 +629,6 @@ bool BSplineSurface::apply(
     }
     double t_init = ms_since(t0); t0 = std::chrono::high_resolution_clock::now();
 
-    buildRangeGrid(points, 50);
-    double t_grid = ms_since(t0); t0 = std::chrono::high_resolution_clock::now();
     setKnotParams(controls_num_u, controls_num_v);
     setNewControl(controlPs, controls_num_u, controls_num_v);
     double t_set = ms_since(t0); t0 = std::chrono::high_resolution_clock::now();
@@ -955,11 +810,11 @@ bool BSplineSurface::apply(
         ceres::Solve(options, &problem, &summary);
         ++ceres_solves;
         sum_solve += ms_since(t1);
-        // Ceres 直接在 controls[].data() 上修改，无需再调 setNewControl 重建 positions[]
+        // Ceres 直接在 controls[].data() 上修改，无需再调 setNewControl
     }
 
     if (!g_apply_profile_log_path.empty()) {
-        const double total_ms = t_init + t_grid + t_set + sum_fp + sum_pre + sum_data_res
+        const double total_ms = t_init + t_set + sum_fp + sum_pre + sum_data_res
                               + sum_smooth + sum_bound + sum_solve;
         const int idx = g_apply_profile_index++;
         ++g_apply_profile_count;
@@ -985,14 +840,21 @@ bool BSplineSurface::apply(
             << point_num << ' ' << maxIterNum << ' '
             << loop_iters << ' ' << ceres_solves << ' '
             << exit_reason << ' '
-            << total_ms << ' ' << t_init << ' ' << t_grid << ' ' << t_set << ' '
+            << total_ms << ' ' << t_init << ' ' << t_set << ' '
             << sum_fp << ' ' << sum_pre << ' ' << sum_data_res << ' '
             << sum_smooth << ' ' << sum_bound << ' ' << sum_solve << ' '
             << final_rmse;
         appendApplyProfileLine(oss.str());
     }
 
-    // 把最终控制点提交（同时清空过时的 positions[]）
     setNewControl(controls, controls_num_u, controls_num_v);
+    fit_mean_dist_ = final_rmse;
+    // 样本内残差在过参数化下会低估真实误差：每点 1 个残差、参数量 3*cp_u*cp_v，
+    // 80 点的片只有 32 个剩余自由度。乘无偏化因子后点少的片被相应放大。
+    {
+        const int n_par = 3 * controls_num_u * controls_num_v;
+        const int dof   = std::max(1, point_num - n_par);
+        fit_mean_dist_adj_ = final_rmse * std::sqrt((double)point_num / dof);
+    }
     return exit_reason != "max_iter";
 }

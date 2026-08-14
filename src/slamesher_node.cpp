@@ -78,7 +78,28 @@ Log g_data;//global variables
 static ConsoleLogTee g_console_log_tee;
 
 namespace {
-constexpr const char* kBsplineBuildDir = "/home/albus/slam-math/Bspline/build";
+// dump 产物按工作区分目录。多个 catkin workspace 的二进制共用一个 dump 目录时，
+// all_surfaces / frame1_apply_profile / 轨迹 txt 会被后跑的那轮覆盖，A/B 无法归因。
+// 工作区名取自 /proc/self/exe 中 devel 的上一级，因此归属的是产出该二进制的工作区。
+std::string bsplineDumpDir()
+{
+    constexpr const char* kBase = "/home/albus/slam-math/Bspline/build";
+    std::string dir = std::string(kBase) + "/unknown_ws";
+
+    std::error_code ec;
+    const std::filesystem::path exe = std::filesystem::read_symlink("/proc/self/exe", ec);
+    if (!ec) {
+        for (std::filesystem::path p = exe; p != p.parent_path(); p = p.parent_path()) {
+            if (p.filename() == "devel" && p.has_parent_path()) {
+                dir = std::string(kBase) + "/" + p.parent_path().filename().string();
+                break;
+            }
+        }
+    }
+    std::filesystem::create_directories(dir, ec);
+    return dir;
+}
+const std::string kBsplineBuildDir = bsplineDumpDir();
 constexpr double kMatchDropRatioThr = 0.70;
 constexpr int kMatchDropAbsThr = 150;
 
@@ -143,6 +164,33 @@ void correctScanCalib(pcl::PointCloud<pcl::PointXYZ>& scan, double theta,
     }
 }
 
+// 姿态零阶保持先验：把 roll 或 pitch 拉回上一帧的值，残差 = (角 - 上帧角)/sigma。
+// 只有 roll 需要：点到面残差对绕轴旋转的 Hessian 是 H_roll=Σy²、H_pitch=Σx²，KITTI 实测
+// rmsY 9.6 m vs rmsX 25.6 m，roll 弱 7 倍；窄街区间 rmsY 掉到 4 m，弱 8 倍以上，roll 帧间
+// 摆幅达 1.3°。11 条序列的 roll 帧间抖动全部超出真值（超额 0.007~0.117 °/帧），pitch 全部
+// 不超额，与 Hessian 差距一致。真值 roll 零阶保持一步预测 std 只有 0.152 °/帧；线性外推对
+// 真值更准（0.128）但把量测噪声放大 2.24 倍，故取零阶保持。
+struct AttitudeHoldPrior {
+    AttitudeHoldPrior(int idx, double target, double w)
+        : idx_(idx), t_(target), w_(w) {}
+
+    template <typename T>
+    bool operator()(const T* const rpy_z, T* residual) const
+    {
+        residual[0] = T(w_) * (rpy_z[idx_] - T(t_));
+        return true;
+    }
+
+    static ceres::CostFunction* Create(int idx, double target, double w)
+    {
+        return new ceres::AutoDiffCostFunction<AttitudeHoldPrior, 1, 3>(
+            new AttitudeHoldPrior(idx, target, w));
+    }
+
+    int idx_;
+    double t_, w_;
+};
+
 // 地面：点到平面 r = scale * n·(R p + t - q)；只优化 [roll, pitch, z]
 struct GroundPointToPlaneZRP {
     GroundPointToPlaneZRP(const Eigen::Vector3d& p_local,
@@ -200,18 +248,100 @@ struct GroundPointToPlaneZRP {
 };
 
 // 障碍：SDM 残差；只优化 [x, y, yaw]，z/roll/pitch 固定
+// 只约束沿轨分量的运动模型先验：残差 = (增量在预测行进方向上的投影 - 预测步长)/sigma。
+// 匀速外推的精度是各向异性的：对步长的预测误差 0.007 m（seq02 失速段实测），而横向随
+// 转向变化大得多。秩亏也只出现在沿轨方向。故横向与 yaw 完全不约束。
+struct MotionPriorAlongTrack {
+    MotionPriorAlongTrack(double x_prev, double y_prev,
+                          double ux, double uy, double len_pred, double w)
+        : x0_(x_prev), y0_(y_prev), ux_(ux), uy_(uy), len_(len_pred), w_(w) {}
+
+    template <typename T>
+    bool operator()(const T* const xy_yaw, T* residual) const
+    {
+        const T along = (xy_yaw[0] - T(x0_)) * T(ux_) + (xy_yaw[1] - T(y0_)) * T(uy_);
+        residual[0] = T(w_) * (along - T(len_));
+        return true;
+    }
+
+    static ceres::CostFunction* Create(double x_prev, double y_prev,
+                                       double ux, double uy, double len_pred, double w)
+    {
+        return new ceres::AutoDiffCostFunction<MotionPriorAlongTrack, 1, 3>(
+            new MotionPriorAlongTrack(x_prev, y_prev, ux, uy, len_pred, w));
+    }
+
+    double x0_, y0_, ux_, uy_, len_, w_;
+};
+
+// 只约束 yaw：残差 = wrap(yaw - yaw_pred)/sigma。along_only 把横向放开之后，
+// 平行街道里 yaw 仍可能接近零空间；各向同性版伤 seq10 是因为连横向一起锁死。
+struct MotionPriorYaw {
+    MotionPriorYaw(double yaw_pred, double w) : yaw_(yaw_pred), w_(w) {}
+
+    template <typename T>
+    bool operator()(const T* const xy_yaw, T* residual) const
+    {
+        T dyaw = xy_yaw[2] - T(yaw_);
+        while (dyaw > T(M_PI))  dyaw -= T(2.0 * M_PI);
+        while (dyaw < T(-M_PI)) dyaw += T(2.0 * M_PI);
+        residual[0] = T(w_) * dyaw;
+        return true;
+    }
+
+    static ceres::CostFunction* Create(double yaw_pred, double w)
+    {
+        return new ceres::AutoDiffCostFunction<MotionPriorYaw, 1, 3>(
+            new MotionPriorYaw(yaw_pred, w));
+    }
+
+    double yaw_, w_;
+};
+
+// 障碍阶段的运动模型先验：把 [x, y, yaw] 往匀速外推值拉。信息量只在数据的零空间里
+// 起作用，故不设触发判据，也不加 Huber（先验不是观测，没有外点一说）。
+struct MotionPriorXYYaw {
+    MotionPriorXYYaw(double x_pred, double y_pred, double yaw_pred,
+                     double w_xy, double w_yaw)
+        : x_(x_pred), y_(y_pred), yaw_(yaw_pred), w_xy_(w_xy), w_yaw_(w_yaw) {}
+
+    template <typename T>
+    bool operator()(const T* const xy_yaw, T* residual) const
+    {
+        residual[0] = T(w_xy_) * (xy_yaw[0] - T(x_));
+        residual[1] = T(w_xy_) * (xy_yaw[1] - T(y_));
+        T dyaw = xy_yaw[2] - T(yaw_);
+        while (dyaw > T(M_PI))  dyaw -= T(2.0 * M_PI);
+        while (dyaw < T(-M_PI)) dyaw += T(2.0 * M_PI);
+        residual[2] = T(w_yaw_) * dyaw;
+        return true;
+    }
+
+    static ceres::CostFunction* Create(double x_pred, double y_pred, double yaw_pred,
+                                       double w_xy, double w_yaw)
+    {
+        return new ceres::AutoDiffCostFunction<MotionPriorXYYaw, 3, 3>(
+            new MotionPriorXYYaw(x_pred, y_pred, yaw_pred, w_xy, w_yaw));
+    }
+
+    double x_, y_, yaw_, w_xy_, w_yaw_;
+};
+
 struct ObstaclePointToSurfaceXYYaw {
     ObstaclePointToSurfaceXYYaw(const Eigen::Vector3d& p_local,
                                 const Eigen::Vector3d& p_world,
                                 const SurfaceCurvature& frame,
                                 double roll_fixed,
                                 double pitch_fixed,
-                                double z_fixed)
-        : p_local_(p_local), q_(frame.point),
+                                double z_fixed,
+                                bool drop_tangent = false,
+                                double weight = 1.0)
+        : weight_(weight), p_local_(p_local), q_(frame.point),
           tangent1_(frame.tangent1), tangent2_(frame.tangent2),
           normal_(frame.normal.normalized()),
           roll_(roll_fixed), pitch_(pitch_fixed), z_(z_fixed)
     {
+        if (drop_tangent) return;  // 系数留 0：足点在片边缘时切向约束是假的
         const double dist = (p_world - frame.point).dot(normal_);
         const auto coefficient = [dist](double curvature) {
             constexpr double kEps = 1e-4;
@@ -253,9 +383,10 @@ struct ObstaclePointToSurfaceXYYaw {
         Eigen::Matrix<T, 3, 1> p(T(p_local_.x()), T(p_local_.y()), T(p_local_.z()));
         Eigen::Matrix<T, 3, 1> t(x, y, T(z_));
         const Eigen::Matrix<T, 3, 1> diff = R * p + t - q_.template cast<T>();
-        residual[0] = T(coeff_t1_) * diff.dot(tangent1_.template cast<T>());
-        residual[1] = T(coeff_t2_) * diff.dot(tangent2_.template cast<T>());
-        residual[2] = diff.dot(normal_.template cast<T>());
+        const T w = T(weight_);
+        residual[0] = w * T(coeff_t1_) * diff.dot(tangent1_.template cast<T>());
+        residual[1] = w * T(coeff_t2_) * diff.dot(tangent2_.template cast<T>());
+        residual[2] = w * diff.dot(normal_.template cast<T>());
         return true;
     }
 
@@ -264,13 +395,17 @@ struct ObstaclePointToSurfaceXYYaw {
                                        const SurfaceCurvature& frame,
                                        double roll_fixed,
                                        double pitch_fixed,
-                                       double z_fixed)
+                                       double z_fixed,
+                                       bool drop_tangent = false,
+                                       double weight = 1.0)
     {
         return new ceres::AutoDiffCostFunction<ObstaclePointToSurfaceXYYaw, 3, 3>(
             new ObstaclePointToSurfaceXYYaw(
-                p_local, p_world, frame, roll_fixed, pitch_fixed, z_fixed));
+                p_local, p_world, frame, roll_fixed, pitch_fixed, z_fixed,
+                drop_tangent, weight));
     }
 
+    double weight_{1.0};
     Eigen::Vector3d p_local_, q_, tangent1_, tangent2_, normal_;
     double roll_, pitch_, z_, coeff_t1_{0.0}, coeff_t2_{0.0};
 };
@@ -1320,7 +1455,6 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/ground_cell_min_pts", ground_cell_min_pts, 80);
     nh.param("slamesher/ground_cell_num_cp",  ground_cell_num_cp,  5);
     nh.param("slamesher/ground_query_radius", ground_query_radius, 1);
-    nh.param("slamesher/ground_map_skip_points", ground_map_skip_points, 1);  // 废弃，建图未使用
     nh.param("slamesher/ground_cell_max_pts",    ground_cell_max_pts,    400);
     nh.param("slamesher/ground_fit_max_pts",     ground_fit_max_pts,     150);
     nh.param("slamesher/ground_cell_z_pct",      ground_cell_z_pct,      0.0);
@@ -1341,6 +1475,20 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/scan_correct_ground_only",      scan_correct_ground_only,      true);
     nh.param("slamesher/reg_alternations",              reg_alternations,              1);
     nh.param("slamesher/obs_thr_last",                  obs_thr_last,                  0.0);
+    nh.param("slamesher/obs_huber",                     obs_huber,                     0.5);
+    nh.param("slamesher/obs_ceres_iters",               obs_ceres_iters,               1);
+    nh.param("slamesher/obs_seg_normal_deg",            obs_seg_normal_deg,            0.0);
+    nh.param("slamesher/obs_fit_max_dist",              obs_fit_max_dist,              0.0);
+    nh.param("slamesher/obs_fit_split_dist",            obs_fit_split_dist,            0.0);
+    nh.param("slamesher/obs_edge_mode",                 obs_edge_mode,                 0);
+    nh.param("slamesher/obs_edge_tan_max",              obs_edge_tan_max,              2.0);
+    nh.param("slamesher/obs_map_replace_frac",          obs_map_replace_frac,          0.0);
+    nh.param("slamesher/obs_map_voxel_owner",           obs_map_voxel_owner,           false);
+    nh.param("slamesher/obs_fit_pts_per_cp",            obs_fit_pts_per_cp,            0.0);
+    nh.param("slamesher/obs_fit_max_iter",              obs_fit_max_iter,              10);
+    nh.param("slamesher/obs_fit_eps",                   obs_fit_eps,                   0.05);
+    nh.param("slamesher/obs_fit_weight_sigma",          obs_fit_weight_sigma,          0.0);
+    nh.param("slamesher/obs_fit_weight_adj",            obs_fit_weight_adj,            false);
     nh.param("slamesher/ground_map_r_max",              ground_map_r_max,              0.0);
     nh.param("slamesher/ground_reg_total_max",          ground_reg_total_max,          4000);
     nh.param("slamesher/ground_reg_match_max",          ground_reg_match_max,          2500);
@@ -1362,6 +1510,16 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/gnd_col_max_step",   gnd_col_max_step,    0.3);
     nh.param("slamesher/gnd_col_seed_h_up",  gnd_col_seed_h_up,   0.4);
     nh.param("slamesher/gnd_normal_z_min",   gnd_normal_z_min,    0.5);
+    nh.param("slamesher/obs_starve_res_lo",  obs_starve_res_lo,   0);
+    nh.param("slamesher/obs_starve_res_hi",  obs_starve_res_hi,   0);
+    nh.param("slamesher/obs_starve_warmup",  obs_starve_warmup,  30);
+    nh.param("slamesher/obs_prior_sigma_xy", obs_prior_sigma_xy,  0.0);
+    nh.param("slamesher/obs_prior_sigma_yaw",obs_prior_sigma_yaw, 0.0);
+    nh.param("slamesher/obs_prior_along_only", obs_prior_along_only, false);
+    nh.param("slamesher/obs_lr_max_frac",      obs_lr_max_frac,      0.0);
+    nh.param("slamesher/obs_range_ref",        obs_range_ref,        0.0);
+    nh.param("slamesher/gnd_roll_prior_sigma", gnd_roll_prior_sigma, 0.0);
+    nh.param("slamesher/gnd_pitch_prior_sigma", gnd_pitch_prior_sigma, 0.0);
     nh.param("slamesher/bootstrap_step2_tx", bootstrap_step2_tx, 0.5);
     nh.param("slamesher/bootstrap_step2_ty", bootstrap_step2_ty, 0.0);
     nh.param("slamesher/bootstrap_step2_tz", bootstrap_step2_tz, 0.0);
@@ -1374,7 +1532,20 @@ void Parameter::initParameter(ros::NodeHandle & nh){
               << "  far_min_cluster=" << range_image_far_min_cluster << std::endl;
     std::cout << "obs_rimg_col_step=" << obs_rimg_col_step
               << "  obs_match_per_surf_max=" << obs_match_per_surf_max
-              << "  obs_cand_target=" << obs_cand_target << std::endl;
+              << "  obs_cand_target=" << obs_cand_target
+              << "  obs_edge_mode=" << obs_edge_mode
+              << "  obs_edge_tan_max=" << obs_edge_tan_max
+              << "  obs_map_replace_frac=" << obs_map_replace_frac
+              << "  obs_map_voxel_owner=" << (obs_map_voxel_owner ? "on" : "off")
+              << "  obs_fit_pts_per_cp=" << obs_fit_pts_per_cp
+              << "  obs_fit_max_iter=" << obs_fit_max_iter
+              << "  obs_fit_eps=" << obs_fit_eps
+              << "  obs_lr_max_frac=" << obs_lr_max_frac
+              << "  obs_range_ref=" << obs_range_ref
+              << "  obs_seg_normal_deg=" << obs_seg_normal_deg
+              << "  obs_fit_max_dist=" << obs_fit_max_dist
+              << "  obs_fit_split_dist=" << obs_fit_split_dist
+              << "  obs_ceres_iters=" << obs_ceres_iters << std::endl;
     std::cout << "scan_correct_deg: " << scan_correct_deg
               << (scan_correct_deg != 0.0 ? " (HDL-64 vertical angle fix on)" : " (off)")
               << "  ground_only=" << (scan_correct_ground_only ? "yes" : "no") << std::endl;
@@ -1764,10 +1935,19 @@ void SLAMesher::pubTf(){
 
 // ========== process 子步骤 ==========
 
-int SLAMesher::chooseControlGridSize(int num_fitting_points)
+int SLAMesher::chooseControlGridSize(int num_fitting_points, double pts_per_cp)
 {
     constexpr int kMinCp = 4;
     constexpr int kMaxCp = 15;
+
+    // 每个控制点 3 个自由度，下面这套分档在低端只有 5 点/控制点（80 点拟合 48 个自由度），
+    // 属欠定：曲面会去插值噪声，且欠定在参数域边缘最严重——而 23%~56% 的配准匹配足点
+    // 正落在边缘。>0 时改按目标点密度反解控制网格边长。
+    if (pts_per_cp > 0.0) {
+        const int m = (int)std::lround(
+            std::sqrt((double)num_fitting_points / pts_per_cp));
+        return std::max(kMinCp, std::min(m, kMaxCp));
+    }
 
     int n;
     if (num_fitting_points < 80)
@@ -1823,6 +2003,10 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
     // 障碍阶段逐轮收紧的匹配门；地面阶段在自己的循环里复位成 match_dist_thr
     double cur_match_thr = match_dist_thr;
 
+    // 观测计数：足点被夹到参数域边界说明最近点落在 PCA 数据支撑框之外，此时 d 由切向
+    // 偏移主导而残差主项是法向分量，两个量不是一回事。分开统计过门与被门毙掉的边界命中。
+    int stat_edge_kept = 0, stat_edge_rej = 0, stat_gate_rej = 0;
+
     // 匹配辅助 lambda：对 surf_to_pts 中所有 (sid, indices) 做 footprint 并写入 matches
     auto buildMatches = [&](const std::unordered_map<int, std::vector<int>>& surf_to_pts,
                             bool want_ground,
@@ -1861,12 +2045,55 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
             for (int k = 0; k < (int)indices.size(); k++) {
                 double d = std::sqrt(std::abs(dists[k]));
-                if (d > cur_match_thr || d < 1e-6) continue;
+                constexpr double kEdgeEps = 1e-4;
+                const bool on_edge =
+                    footprints[k].first.second  < kEdgeEps ||
+                    footprints[k].first.second  > 1.0 - kEdgeEps ||
+                    footprints[k].second.second < kEdgeEps ||
+                    footprints[k].second.second > 1.0 - kEdgeEps;
+                if (d < 1e-6) { ++stat_gate_rej; if (on_edge) ++stat_edge_rej; continue; }
 
+                // 地面片是瓦片式铺开的，瓦片边缘的足点由邻接瓦片正常覆盖，不算外点；
+                // 边界处理只对障碍片生效。
+                const bool edge_obs = on_edge && !want_ground;
                 auto [paraU, paraV] = footprints[k];
-                SurfaceCurvature curv = surf->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
-                if (curv.normal.norm() < 1e-9) continue;
-                curv.normal.normalize();
+
+                SurfaceCurvature curv;
+                bool curv_ready = false;
+                bool drop_tangent = false;
+
+                if (edge_obs && param.obs_edge_mode == 2) {
+                    curv = surf->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
+                    if (curv.normal.norm() < 1e-9) continue;
+                    curv.normal.normalize();
+                    curv_ready = true;
+                    const Eigen::Vector3d r = pts_world[k] - curv.point;
+                    const double dn  = std::abs(curv.normal.dot(r));
+                    const double dtan = std::sqrt(std::max(0.0, r.squaredNorm() - dn * dn));
+                    if (dn > cur_match_thr || dtan > param.obs_edge_tan_max) {
+                        ++stat_gate_rej;
+                        ++stat_edge_rej;
+                        continue;
+                    }
+                    drop_tangent = true;
+                } else {
+                    if (d > cur_match_thr) {
+                        ++stat_gate_rej;
+                        if (on_edge) ++stat_edge_rej;
+                        continue;
+                    }
+                    if (edge_obs && param.obs_edge_mode == 1) {
+                        ++stat_edge_kept;
+                        continue;
+                    }
+                }
+                if (on_edge) ++stat_edge_kept;
+
+                if (!curv_ready) {
+                    curv = surf->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
+                    if (curv.normal.norm() < 1e-9) continue;
+                    curv.normal.normalize();
+                }
 
                 RegMatch m;
                 m.p_local   = Eigen::Vector3d(scan_local[indices[k]].x,
@@ -1876,6 +2103,9 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 m.curvature = curv;
                 m.scan_idx  = indices[k];
                 m.is_ground = want_ground;
+                m.drop_tangent = drop_tangent;
+                m.fit_dist  = param.obs_fit_weight_adj ? surf->getFitMeanDistAdj()
+                                                       : surf->getFitMeanDist();
                 out.push_back(m);
             }
         }
@@ -1886,8 +2116,21 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             const std::unordered_map<const BSplineSurface*, std::vector<int>>& surf_to_pts,
             double thr,
             std::vector<RegMatch>& out) {
-        for (auto& [surf_ptr, indices] : surf_to_pts) {
-            if (!surf_ptr) continue;
+        // 按点集最小扫描下标定序后再遍历。原实现直接迭代以曲面指针为 key 的
+        // unordered_map，顺序随堆地址（ASLR）变化；而下游按 out 的顺序做每格截顶
+        // （每格只留前 reg_tgt 个），于是同配置重跑保留的匹配子集不同，实测 seq06
+        // 第 2 帧 z 就差 1.5 mm。每个扫描点只归一张最近面，点集不相交，最小下标严格可比。
+        std::vector<std::pair<int, const BSplineSurface*>> order;
+        order.reserve(surf_to_pts.size());
+        for (const auto& [sp, idxs] : surf_to_pts) {
+            if (!sp || idxs.empty()) continue;
+            order.emplace_back(*std::min_element(idxs.begin(), idxs.end()), sp);
+        }
+        std::sort(order.begin(), order.end());
+
+        for (const auto& [order_key, surf_ptr] : order) {
+            (void)order_key;
+            const std::vector<int>& indices = surf_to_pts.at(surf_ptr);
             const auto& knU  = surf_ptr->getKnotsU();
             const auto& knV  = surf_ptr->getKnotsV();
             const auto& cps  = surf_ptr->getControls();
@@ -1950,6 +2193,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
     // ══════════════════════════════════════════════════════════════════════
     // 阶段 1：障碍匹配 — 只优化世界系 x / y / yaw；z / roll / pitch 固定
     // ══════════════════════════════════════════════════════════════════════
+    int obs_last_res = -1;
     for (int iter = 0; iter < max_iters && delta_scale > converge_thr; iter++) {
         // 首轮用大门吃掉外推残差，之后几何收紧到 obs_thr_last 剔外点（动态车辆、
         // 植被、鬼面）。原实现四轮恒定 0.8 m，末轮仍在吸收明显不该要的对应。
@@ -1992,6 +2236,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             return n;
         };
 
+        TicToc t_obs_collect;
         collectFromRangeImage(rp_near, match_min_z, 0);
         if (use_far) collectFromRangeImage(rp_far, far_match_min_z, 0);
 
@@ -2029,9 +2274,113 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                       << " (target=" << param.obs_cand_target << ")" << std::endl;
         }
 
+        int n_pairs_in = 0, n_pairs_dup = 0;
+        for (const auto& [sid, idxs] : obs_surf_to_pts) {
+            n_pairs_in += (int)idxs.size();
+            std::unordered_set<int> uniq(idxs.begin(), idxs.end());
+            n_pairs_dup += (int)idxs.size() - (int)uniq.size();
+        }
+        const double ms_collect = t_obs_collect.toc();
+
         std::vector<RegMatch> obs_matches;
         obs_matches.reserve(bspline_map.size() * param.obs_match_per_surf_max);
+        stat_edge_kept = stat_edge_rej = stat_gate_rej = 0;
+        TicToc t_obs_build;
         buildMatches(obs_surf_to_pts, false, obs_matches);
+        const double ms_build = t_obs_build.toc();
+
+        // 一个扫描点会被推进每一张候选面（见上方 queryCandidates 循环），过门后同点
+        // 多残差在 Huber 下等于重复计权。mult>1 即存在这种重复计权。
+        {
+            std::unordered_set<int> kept_pts;
+            for (const auto& m : obs_matches) kept_pts.insert(m.scan_idx);
+            const int n_res = (int)obs_matches.size();
+            const int n_pts = (int)kept_pts.size();
+            obs_last_res = n_res;
+            int nL = 0, nR = 0;
+            for (const auto& m : obs_matches)
+                (m.p_local.y() >= 0.0 ? nL : nR)++;
+
+            // x/y/yaw 解的条件数。法向残差 r = n·(R p + t - q)，R = Rz(yaw)Ry Rx，
+            // 故 ∂r/∂yaw = n·(Ez R p) = n_y v_x - n_x v_y，v = p_world - t。yaw 列量纲是
+            // 米，先用 |v_xy| 的均方根归一，λmin/λmax 才在各帧间可比。
+            const Eigen::Vector3d t_curr = T_curr.block<3, 1>(0, 3);
+            double sum_r2 = 0.0;
+            for (const auto& m : obs_matches) {
+                const Eigen::Vector3d v = m.p_world - t_curr;
+                sum_r2 += v.x() * v.x() + v.y() * v.y();
+            }
+            const double L = n_res > 0 ? std::sqrt(sum_r2 / n_res) : 1.0;
+
+            Eigen::Matrix3d JtJ = Eigen::Matrix3d::Zero();
+            std::array<int, 8> az_bins{};
+            for (const auto& m : obs_matches) {
+                const Eigen::Vector3d& n = m.curvature.normal;
+                const Eigen::Vector3d v = m.p_world - t_curr;
+                Eigen::Vector3d j(n.x(), n.y(),
+                                  (n.y() * v.x() - n.x() * v.y()) / std::max(L, 1e-9));
+                JtJ += j * j.transpose();
+                // 平面法向有正负二义，按 [0,π) 分箱
+                double az = std::atan2(n.y(), n.x());
+                if (az < 0.0) az += M_PI;
+                ++az_bins[std::min<int>(7, (int)(az / (M_PI / 8.0)))];
+            }
+            JtJ /= std::max(n_res, 1);
+            const Eigen::Vector3d ev =
+                Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(JtJ).eigenvalues();
+            const double lmin = ev(0), lmax = ev(2);
+            const int dom = *std::max_element(az_bins.begin(), az_bins.end());
+
+            char buf[520];
+            snprintf(buf, sizeof(buf),
+                     "  [obs stat] iter=%d thr=%.3f pairs=%d dup=%d res=%d pts=%d"
+                     " mult=%.3f surv=%.1f%% edge_keep=%d edge_rej=%d gate_rej=%d"
+                     " eigmin=%.5f rcond=%.5f dom=%.2f LR=%d/%d"
+                     " t_coll=%.1f t_build=%.1f ms",
+                     iter, cur_match_thr, n_pairs_in, n_pairs_dup, n_res, n_pts,
+                     n_pts > 0 ? (double)n_res / n_pts : 0.0,
+                     n_pairs_in > 0 ? 100.0 * n_res / n_pairs_in : 0.0,
+                     stat_edge_kept, stat_edge_rej, stat_gate_rej,
+                     lmin, lmax > 1e-12 ? lmin / lmax : 0.0,
+                     n_res > 0 ? (double)dom / n_res : 0.0,
+                     nL, nR,
+                     ms_collect, ms_build);
+            std::cout << buf << std::endl;
+        }
+
+        // 左右平衡：一侧墙垄断时点到面残差把 yaw 往单边拽。雷达系 y>=0 为左。
+        // 任一侧超过 max_frac 时，该侧保留 keep = frac/(1-frac)*对侧 个，按 scan_idx 等间隔取。
+        if (param.obs_lr_max_frac > 0.0 && param.obs_lr_max_frac < 1.0
+            && obs_matches.size() >= 10) {
+            int nL = 0, nR = 0;
+            for (const auto& m : obs_matches)
+                (m.p_local.y() >= 0.0 ? nL : nR)++;
+            const double f = param.obs_lr_max_frac;
+            const int capL = nR > 0 ? (int)std::floor(f / (1.0 - f) * nR) : 0;
+            const int capR = nL > 0 ? (int)std::floor(f / (1.0 - f) * nL) : 0;
+            auto downsample = [&](bool left, int keep) {
+                std::vector<int> idx;
+                for (int i = 0; i < (int)obs_matches.size(); ++i)
+                    if ((obs_matches[i].p_local.y() >= 0.0) == left) idx.push_back(i);
+                if ((int)idx.size() <= keep) return;
+                std::sort(idx.begin(), idx.end(), [&](int a, int b) {
+                    return obs_matches[a].scan_idx < obs_matches[b].scan_idx;
+                });
+                const int n = (int)idx.size();
+                std::vector<char> keep_flag(obs_matches.size(), 1);
+                for (int i : idx) keep_flag[i] = 0;
+                for (int k = 0; k < keep; ++k) keep_flag[idx[k * n / keep]] = 1;
+                std::vector<RegMatch> out;
+                out.reserve(obs_matches.size() - (n - keep));
+                for (int i = 0; i < (int)obs_matches.size(); ++i)
+                    if (keep_flag[i]) out.push_back(obs_matches[i]);
+                obs_matches.swap(out);
+            };
+            if (nL > 0 && nR > 0) {
+                if (nL > capL) downsample(true,  std::max(10, capL));
+                if (nR > capR) downsample(false, std::max(10, capR));
+            }
+        }
 
         appendMatchDropEvent(g_data.step, iter, prev_match_count,
                              static_cast<int>(obs_matches.size()), 0,
@@ -2050,21 +2399,87 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         const double z_fix = T_curr(2, 3);
         double xy_yaw[3] = {T_curr(0, 3), T_curr(1, 3), yaw_init};
 
-        ceres::LossFunction* loss = new ceres::HuberLoss(0.5);
+        // 反方差加权：残差噪声 = 传感器测距噪声与该片自身拟合误差的正交和。等权时一张
+        // 0.4 m 的植被片和一张 0.02 m 的墙面片对位姿影响相同，而实测障碍面拟合距离中位
+        // 0.13 m、33% 超 0.15 m。归一到均值 1 是为了不改变 Huber(0.5) 的实际稳健尺度。
+        if (param.obs_fit_weight_sigma > 0.0) {
+            const double s2 = param.obs_fit_weight_sigma * param.obs_fit_weight_sigma;
+            double sum_w = 0.0;
+            for (auto& m : obs_matches) {
+                const double fit = m.fit_dist >= 0.0 ? m.fit_dist : 0.0;
+                m.weight = 1.0 / std::sqrt(s2 + fit * fit);
+                sum_w += m.weight;
+            }
+            const double scale = obs_matches.size() / std::max(sum_w, 1e-12);
+            for (auto& m : obs_matches) m.weight *= scale;
+        } else {
+            for (auto& m : obs_matches) m.weight = 1.0;
+        }
+        // yaw 的 J ∝ r，等权下远距匹配（拟合噪声 ~0.13 m）角误差大却主导航向。
+        // 乘 min(1, ref/r) 后近处匹配主导；再归一到均值 1，Huber(0.5) 尺度不变。
+        if (param.obs_range_ref > 0.0 && !obs_matches.empty()) {
+            const double ref = param.obs_range_ref;
+            double sum_w = 0.0;
+            for (auto& m : obs_matches) {
+                const double r = std::hypot(m.p_local.x(), m.p_local.y());
+                m.weight *= ref / std::max(r, ref);
+                sum_w += m.weight;
+            }
+            const double scale = obs_matches.size() / std::max(sum_w, 1e-12);
+            for (auto& m : obs_matches) m.weight *= scale;
+        }
+
+        ceres::LossFunction* loss = new ceres::HuberLoss(
+            param.obs_huber > 0.0 ? param.obs_huber : 0.5);
         ceres::Problem problem;
         for (auto& m : obs_matches) {
             problem.AddResidualBlock(
                 ObstaclePointToSurfaceXYYaw::Create(
                     m.p_local, m.p_world, m.curvature,
-                    roll_fix, pitch_fix, z_fix),
+                    roll_fix, pitch_fix, z_fix, m.drop_tangent, m.weight),
                 loss, xy_yaw);
+        }
+
+        if (param.obs_prior_sigma_xy > 0.0 && param.obs_prior_along_only
+            && g_data.step >= 2) {
+            const Transf& T_p = g_data.T_seq[g_data.step - 1];
+            const double dx = T_guess(0, 3) - T_p(0, 3);
+            const double dy = T_guess(1, 3) - T_p(1, 3);
+            const double len = std::hypot(dx, dy);
+            if (len > 1e-3) {
+                problem.AddResidualBlock(
+                    MotionPriorAlongTrack::Create(
+                        T_p(0, 3), T_p(1, 3), dx / len, dy / len, len,
+                        1.0 / param.obs_prior_sigma_xy),
+                    nullptr, xy_yaw);
+            }
+            if (param.obs_prior_sigma_yaw > 0.0) {
+                double r_g, p_g, yaw_g;
+                matrixToRPY(T_guess.block<3, 3>(0, 0), r_g, p_g, yaw_g);
+                problem.AddResidualBlock(
+                    MotionPriorYaw::Create(
+                        yaw_g, 1.0 / (param.obs_prior_sigma_yaw * M_PI / 180.0)),
+                    nullptr, xy_yaw);
+            }
+        } else if (param.obs_prior_sigma_xy > 0.0 && param.obs_prior_sigma_yaw > 0.0) {
+            double r_g, p_g, yaw_g;
+            matrixToRPY(T_guess.block<3, 3>(0, 0), r_g, p_g, yaw_g);
+            problem.AddResidualBlock(
+                MotionPriorXYYaw::Create(
+                    T_guess(0, 3), T_guess(1, 3), yaw_g,
+                    1.0 / param.obs_prior_sigma_xy,
+                    1.0 / (param.obs_prior_sigma_yaw * M_PI / 180.0)),
+                nullptr, xy_yaw);
         }
 
         ceres::Solver::Options opts;
         opts.linear_solver_type = ceres::DENSE_QR;
-        opts.max_num_iterations = 1;
+        opts.max_num_iterations = param.obs_ceres_iters > 0 ? param.obs_ceres_iters : 1;
         opts.minimizer_progress_to_stdout = false;
-        opts.num_threads = 4;
+        // 多线程下残差块到线程的划分每次运行都变，每线程 scratch 的分部分和分组随之
+        // 变化，总 cost 在 bit 级不同，trust-region 的接受判定就可能分叉。实测同配置
+        // 重跑 seq02 摆幅达 0.8/2.6，A/B 无法测量。3 个参数 + DENSE_QR，单线程代价可忽略。
+        opts.num_threads = 1;
         ceres::Solver::Summary summary;
         ceres::Solve(opts, &problem, &summary);
 
@@ -2077,6 +2492,37 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         std::cout << "  iter " << iter << ": obs=" << obs_matches.size()
                   << " delta=" << delta_scale
                   << " (z/roll/pitch fixed)" << std::endl;
+    }
+
+    // 残差数塌陷时沿轨平移不可观测：存活对应方向高度集中（seq02 失效段 dom 0.42~0.54 对
+    // 正常 0.27），解被地图粘在滞后位置上，步长逐帧衰减约 7%，二十帧后估计步长 0.055 m 而
+    // 真值 1.41 m。衰减是正反馈：位姿滞后 -> 匀速外推继承已缩小的增量 -> 下一帧更滞后。
+    // 只回退步长、保留解出的方向与 yaw：实测饿死帧上求解的转角误差 0.135°/帧优于外推的
+    // 0.174°/帧（该段真值累计转角 41.65°，全靠外推会欠 17°），而步长用真值历史做匀速外推
+    // 的预测误差仅 0.007 m。z/roll/pitch 归地面阶段，这里只动 xy。
+    if (param.obs_starve_res_lo > 0
+        && param.obs_starve_res_hi > param.obs_starve_res_lo
+        && obs_last_res >= 0 && obs_last_res < param.obs_starve_res_hi
+        && g_data.step > param.obs_starve_warmup) {
+        const double span = param.obs_starve_res_hi - param.obs_starve_res_lo;
+        double w = (obs_last_res - param.obs_starve_res_lo) / span;
+        w = std::max(0.0, std::min(1.0, w));
+        const Transf& T_prev = g_data.T_seq[g_data.step - 1];
+        const Eigen::Vector2d d_solve(T_curr(0, 3) - T_prev(0, 3),
+                                      T_curr(1, 3) - T_prev(1, 3));
+        const Eigen::Vector2d d_pred(T_guess(0, 3) - T_prev(0, 3),
+                                     T_guess(1, 3) - T_prev(1, 3));
+        const double l_solve = d_solve.norm();
+        const double l_target = w * l_solve + (1.0 - w) * d_pred.norm();
+        if (l_solve > 1e-6) {
+            const Eigen::Vector2d t_new =
+                Eigen::Vector2d(T_prev(0, 3), T_prev(1, 3))
+                + d_solve * (l_target / l_solve);
+            std::cout << "  [obs starve] res=" << obs_last_res << " w=" << w
+                      << " step " << l_solve << " -> " << l_target << " m" << std::endl;
+            T_curr(0, 3) = t_new.x();
+            T_curr(1, 3) = t_new.y();
+        }
     }
 
     // ══════════════════════════════════════════════════════════════════════
@@ -2446,37 +2892,6 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 gnd_matches.swap(balanced);
             }
 
-            {
-                static std::ofstream gnd_dist_file;
-                if (!gnd_dist_file.is_open()) {
-                    gnd_dist_file.open(std::string(kBsplineBuildDir) + "/gnd_match_dist.txt",
-                                       std::ios::out | std::ios::trunc);
-                    gnd_dist_file << std::fixed << std::setprecision(5);
-                    gnd_dist_file << "# dist_normal  dist_abs"
-                                  << "  p_w_x  p_w_y  p_w_z  surf_z\n";
-                }
-                double sum_d = 0, sum_dz = 0;
-                int cnt = 0;
-                for (const auto& m : gnd_matches) {
-                    const double d_n = (m.p_world - m.curvature.point).dot(m.curvature.normal);
-                    sum_d += std::abs(d_n);
-                    sum_dz += (m.p_world.z() - m.curvature.point.z());
-                    ++cnt;
-                    gnd_dist_file << d_n << "  " << std::abs(d_n)
-                                  << "  " << m.p_world.x()
-                                  << "  " << m.p_world.y()
-                                  << "  " << m.p_world.z()
-                                  << "  " << m.curvature.point.z() << "\n";
-                }
-                if (cnt > 0) {
-                    gnd_dist_file << "# step=" << g_data.step << " giter=" << giter
-                                  << " n_gnd=" << cnt
-                                  << " mean|d|=" << (sum_d / cnt)
-                                  << " mean_dz=" << (sum_dz / cnt) << "\n";
-                    gnd_dist_file.flush();
-                }
-            }
-
             if (giter == 0) {
                 // 求解前按雷达系 x 分桶的竖直残差：残差场若沿 x 单调（前后反号），
                 // 驱动的就是 pitch。用它定位推力来自哪个纵向区段。
@@ -2515,11 +2930,31 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                         x_fix, y_fix, yaw_fix, 1.0),
                     loss, rpy_z);
             }
+
+            if (g_data.step >= 2
+                && (param.gnd_roll_prior_sigma > 0.0
+                    || param.gnd_pitch_prior_sigma > 0.0)) {
+                double r_p, p_p, y_p;
+                matrixToRPY(g_data.T_seq[g_data.step - 1].block<3, 3>(0, 0),
+                            r_p, p_p, y_p);
+                const double kDeg = M_PI / 180.0;
+                if (param.gnd_roll_prior_sigma > 0.0)
+                    problem.AddResidualBlock(
+                        AttitudeHoldPrior::Create(
+                            0, r_p, 1.0 / (param.gnd_roll_prior_sigma * kDeg)),
+                        nullptr, rpy_z);
+                if (param.gnd_pitch_prior_sigma > 0.0)
+                    problem.AddResidualBlock(
+                        AttitudeHoldPrior::Create(
+                            1, p_p, 1.0 / (param.gnd_pitch_prior_sigma * kDeg)),
+                        nullptr, rpy_z);
+            }
+
             ceres::Solver::Options opts;
             opts.linear_solver_type = ceres::DENSE_QR;
             opts.max_num_iterations = 10;
             opts.minimizer_progress_to_stdout = false;
-            opts.num_threads = 4;
+            opts.num_threads = 1;  // 同上：可复现优先
             ceres::Solver::Summary summary;
             ceres::Solve(opts, &problem, &summary);
 
@@ -2891,6 +3326,10 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
         if (!ground_mask[i]) scan_obs.push_back(scan_local[i]);
     }
 
+    // 遮挡点只有 dump 要用，平时不收集（KITTI 单帧碰撞点数与点云同量级）
+    range_proc.setCollectOccluded(dump_occluded);
+    range_proc_far.setCollectOccluded(dump_occluded);
+
     range_proc.generateRangeImage(scan_obs,
         -1e9, 1e9, /*exclude_ground_band=*/false,
         0.0, use_far_layer ? split_dist : 1e9, ground_z_min);
@@ -2950,7 +3389,8 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
 
     // 地面点已在投影阶段排除；分割侧 exclude=true 作双保险
     SegmentationResult seg = range_proc.segmentRangeImage(
-        5, 0.1, MIN_CLUSTER_PTS, ground_z_min, ground_z_max, true);
+        5, 0.1, MIN_CLUSTER_PTS, ground_z_min, ground_z_max, true,
+        param.obs_seg_normal_deg);
     range_proc.downsampleClusters(
         seg,
         param.cluster_ds_min_pts,
@@ -2963,7 +3403,8 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
     if (use_far_layer) {
         const int far_min = param.range_image_far_min_cluster;
         seg_far = range_proc_far.segmentRangeImage(
-            5, 0.1, far_min, ground_z_min, ground_z_max, true);
+            5, 0.1, far_min, ground_z_min, ground_z_max, true,
+            param.obs_seg_normal_deg);
         if (dump_far_funnel)
             seg_far_pre_ds = seg_far;
         range_proc_far.downsampleClusters(
@@ -2992,6 +3433,7 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
         bool ok = false;
     };
 
+    std::vector<double> obs_fit_dists;
     // 障碍建图 lambda：A 收集 → B 并行 apply → C 串行入库
     auto buildObsFromSeg = [&](RangeImageProcessor& proc, SegmentationResult& s, int min_pts) {
         // ── 阶段 A：串行筛 cluster + footprint 匹配，打包 tasks ──
@@ -3073,7 +3515,7 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
             if (n_unmatched < min_pts) continue;
             if (static_cast<double>(n_unmatched) / n_valid < param.map_unmatched_ratio_min) continue;
 
-            const int num_cp = chooseControlGridSize(n_unmatched);
+            const int num_cp = chooseControlGridSize(n_unmatched, param.obs_fit_pts_per_cp);
             auto cloud_world = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
             pcl::transformPointCloud(*cloud_local, *cloud_world, T_world.cast<float>());
 
@@ -3096,17 +3538,92 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
 #pragma omp parallel for schedule(dynamic) num_threads(n_omp)
         for (int i = 0; i < (int)tasks.size(); ++i) {
             auto& t = tasks[i];
-            t.surf = std::make_shared<BSplineSurface>(3, 3, t.num_cp, t.num_cp, 0.25);
+            t.surf = std::make_shared<BSplineSurface>(3, 3, t.num_cp, t.num_cp);
             t.surf->setExternalInitControls(t.init_cp);
-            t.ok = t.surf->apply(t.cloud_world, 10, 1, 1, 0.05);
+            t.ok = t.surf->apply(t.cloud_world, param.obs_fit_max_iter, 1, 1,
+                                 param.obs_fit_eps);
         }
 
         // ── 阶段 C：串行入库 ──
+        int n_fit_rej = 0, n_split_ok = 0, n_split_keep = 0;
+        auto addObsSurf = [&](std::shared_ptr<BSplineSurface> surf,
+                              pcl::PointCloud<pcl::PointXYZ>::Ptr cloud) {
+            bspline_map.addSurface(surf, cloud, /*is_ground=*/false, g_data.step,
+                                   param.obs_map_replace_frac, param.obs_map_voxel_owner);
+            obs_fit_dists.push_back(surf->getFitMeanDist());
+            ++n_added_obs;
+        };
+        auto fitDistOf = [&](const std::shared_ptr<BSplineSurface>& surf) {
+            return param.obs_fit_weight_adj ? surf->getFitMeanDistAdj()
+                                            : surf->getFitMeanDist();
+        };
         for (auto& t : tasks) {
             if (!t.ok) continue;
-            bspline_map.addSurface(t.surf, t.cloud_world, /*is_ground=*/false, g_data.step);
-            ++n_added_obs;
+            const double fd = fitDistOf(t.surf);
+            const int npts = (int)t.cloud_world->size();
+            bool replaced = false;
+            if (param.obs_fit_split_dist > 0.0 && fd > param.obs_fit_split_dist && npts >= 60) {
+                Eigen::Vector3d c = Eigen::Vector3d::Zero();
+                for (const auto& p : t.cloud_world->points)
+                    c += Eigen::Vector3d(p.x, p.y, p.z);
+                c /= npts;
+                Eigen::Matrix3d cov = Eigen::Matrix3d::Zero();
+                for (const auto& p : t.cloud_world->points) {
+                    Eigen::Vector3d d = Eigen::Vector3d(p.x, p.y, p.z) - c;
+                    cov += d * d.transpose();
+                }
+                const Eigen::Vector3d axis =
+                    Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(cov).eigenvectors().col(2);
+                std::vector<double> proj(npts);
+                for (int i = 0; i < npts; ++i) {
+                    const auto& p = t.cloud_world->points[i];
+                    proj[i] = (Eigen::Vector3d(p.x, p.y, p.z) - c).dot(axis);
+                }
+                std::vector<double> proj_s = proj;
+                std::nth_element(proj_s.begin(), proj_s.begin() + npts / 2, proj_s.end());
+                const double mid = proj_s[npts / 2];
+                auto c0 = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+                auto c1 = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+                for (int i = 0; i < npts; ++i)
+                    (proj[i] < mid ? c0 : c1)->push_back(t.cloud_world->points[i]);
+                if ((int)c0->size() >= 30 && (int)c1->size() >= 30) {
+                    auto fitChild = [&](pcl::PointCloud<pcl::PointXYZ>::Ptr cloud)
+                        -> std::shared_ptr<BSplineSurface> {
+                        const int ncp = chooseControlGridSize((int)cloud->size(),
+                                                              param.obs_fit_pts_per_cp);
+                        auto s = std::make_shared<BSplineSurface>(3, 3, ncp, ncp);
+                        if (!s->apply(cloud, param.obs_fit_max_iter, 1, 1, param.obs_fit_eps))
+                            return nullptr;
+                        return s;
+                    };
+                    auto s0 = fitChild(c0);
+                    auto s1 = fitChild(c1);
+                    if (s0 && s1 && fitDistOf(s0) < fd && fitDistOf(s1) < fd) {
+                        addObsSurf(s0, c0);
+                        addObsSurf(s1, c1);
+                        ++n_split_ok;
+                        replaced = true;
+                    } else {
+                        ++n_split_keep;
+                    }
+                } else {
+                    ++n_split_keep;
+                }
+            }
+            if (replaced) continue;
+            if (param.obs_fit_max_dist > 0.0 && fd > param.obs_fit_max_dist) {
+                ++n_fit_rej;
+                continue;
+            }
+            addObsSurf(t.surf, t.cloud_world);
         }
+        if (n_fit_rej > 0)
+            std::cout << "  [obs fit-rej] n=" << n_fit_rej
+                      << " thr=" << param.obs_fit_max_dist << std::endl;
+        if (n_split_ok + n_split_keep > 0)
+            std::cout << "  [obs split] ok=" << n_split_ok
+                      << " keep=" << n_split_keep
+                      << " thr=" << param.obs_fit_split_dist << std::endl;
     };
 
     // 近层建图
@@ -3151,7 +3668,29 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
               << (use_far_layer ? " far_clusters=" + std::to_string(seg_far.clusters.size()) : "")
               << " +gnd_cells_refit=" << n_added_gnd << " +obs=" << n_added_obs
               << " obs_total=" << bspline_map.size()
+              << " alive=" << bspline_map.aliveSurfaceCount()
+              << " retired=" << bspline_map.retiredCount()
               << " (" << t_upd.toc() << " ms)" << std::endl;
+
+    // 新入库障碍面自身的平均点到面距离分布（米）。传感器测距噪声约 0.02 m，
+    // 超出部分是拟合/几何误差，直接进配准残差。
+    if (!obs_fit_dists.empty()) {
+        std::sort(obs_fit_dists.begin(), obs_fit_dists.end());
+        const int n = (int)obs_fit_dists.size();
+        const double sum = std::accumulate(obs_fit_dists.begin(), obs_fit_dists.end(), 0.0);
+        int n_over_5cm = 0, n_over_15cm = 0;
+        for (double d : obs_fit_dists) {
+            if (d > 0.05) ++n_over_5cm;
+            if (d > 0.15) ++n_over_15cm;
+        }
+        char fbuf[220];
+        snprintf(fbuf, sizeof(fbuf),
+                 "  [obs fit] n=%d mean=%.4f p50=%.4f p90=%.4f max=%.4f"
+                 " over5cm=%.0f%% over15cm=%.0f%%",
+                 n, sum / n, obs_fit_dists[n / 2], obs_fit_dists[(int)(n * 0.9)],
+                 obs_fit_dists[n - 1], 100.0 * n_over_5cm / n, 100.0 * n_over_15cm / n);
+        std::cout << fbuf << std::endl;
+    }
 }
 
 
@@ -3481,7 +4020,8 @@ void SLAMesher::process(){
     const int    skip_points    = 20;    // 每隔几个点取一个用于配准 (降低计算量)
     static std::ofstream traj_file;
     if (!traj_file.is_open()) {
-        traj_file.open("/tmp/bspline_traj_xyz.txt", std::ios::out | std::ios::trunc);
+        traj_file.open(kBsplineBuildDir + "/bspline_traj_xyz.txt",
+                       std::ios::out | std::ios::trunc);
         traj_file << std::fixed << std::setprecision(6);
     }
 

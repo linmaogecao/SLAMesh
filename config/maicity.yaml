@@ -7,7 +7,7 @@ slamesher:
   read_offline_pcd: true 
   dataset: 2 # Means using Maicity dataset
   max_steps: 10000
-  save_mesh_map: true
+  save_mesh_map: true       # 当前无效：mesh 链只能从 visualize/saveResult 进，两者均未被调用
   #register param
   range_max: 100
   range_min: 1.2
