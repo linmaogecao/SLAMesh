@@ -1420,6 +1420,7 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/obs_rimg_col_step",           obs_rimg_col_step,           3);
     nh.param("slamesher/obs_match_per_surf_max",      obs_match_per_surf_max,      50);
     nh.param("slamesher/obs_cand_target",             obs_cand_target,             1500);
+    nh.param("slamesher/obs_reg_use_pw_mask",         obs_reg_use_pw_mask,         true);
     nh.param("slamesher/use_patchwork_ground", use_patchwork_ground, true);
     {
         const PatchworkppConfig d;
@@ -1533,6 +1534,7 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     std::cout << "obs_rimg_col_step=" << obs_rimg_col_step
               << "  obs_match_per_surf_max=" << obs_match_per_surf_max
               << "  obs_cand_target=" << obs_cand_target
+              << "  obs_reg_use_pw_mask=" << (obs_reg_use_pw_mask ? "on" : "off")
               << "  obs_edge_mode=" << obs_edge_mode
               << "  obs_edge_tan_max=" << obs_edge_tan_max
               << "  obs_map_replace_frac=" << obs_map_replace_frac
@@ -4031,6 +4033,7 @@ void SLAMesher::process(){
 
     patchwork_.reset(param.patchwork);
     std::vector<uint8_t> pw_ground_mask;  // 关闭 Patchwork++ 时保持为空，两条链回退原逻辑
+    std::vector<bool>    obs_exclude_mask; // 配准侧障碍 range image 的地面排除位（复用缓冲）
     while(nh.ok()){
         g_data.step++;
         if (param.max_frames > 0 && g_data.step > param.max_frames) {
@@ -4079,16 +4082,25 @@ void SLAMesher::process(){
         TicToc t_register;
         Transf T_guess = getOdom();
 
-        // 为配准生成 range image：排除已用于地面提取的 z 带点，仅剩余点进障碍链
+        // 为配准生成 range image：排除地面点，仅剩余点进障碍链。
+        // 有 Patchwork++ mask 时按 mask 排除，与 runMapBuild 建障碍面所用的点集
+        // （!ground_mask）逐点一致；否则回退 z 带排除（原行为）。
         {
             const double split = param.range_image_split;
             const bool use_far = (split > 0.0);
             const double far_z_floor = farLayerZFloor(GROUND_Z_MIN);
+            const bool use_mask = param.obs_reg_use_pw_mask && !pw_ground_mask.empty();
+            if (use_mask) {
+                obs_exclude_mask.assign(scan_local.size(), false);
+                for (size_t i = 0; i < obs_exclude_mask.size(); ++i)
+                    obs_exclude_mask[i] = (i < pw_ground_mask.size() && pw_ground_mask[i] != 0);
+            }
+            const std::vector<bool>* excl = use_mask ? &obs_exclude_mask : nullptr;
             range_proc.generateRangeImage(scan_local, GROUND_Z_MIN, GROUND_Z_MAX, true,
-                                          0.0, use_far ? split : 1e9, GROUND_Z_MIN);
+                                          0.0, use_far ? split : 1e9, GROUND_Z_MIN, excl);
             if (use_far)
                 range_proc_far.generateRangeImage(scan_local, GROUND_Z_MIN, GROUND_Z_MAX, true,
-                                                  split, 1e9, far_z_floor);
+                                                  split, 1e9, far_z_floor, excl);
         }
 
         T_world = registerScanToMap(scan_local, pw_ground_mask, T_guess, bspline_map, mr_ground,

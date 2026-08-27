@@ -36,6 +36,15 @@ public:
     int    obs_rimg_col_step{3};           // range image 列方向采样间隔（1=全取，3=每3列取1）
     int    obs_match_per_surf_max{50};     // 每个障碍曲面最多保留的匹配点数（0=不限）
     int    obs_cand_target{1500};          // 逐曲面截顶后的候选目标；不足则补采偏移列（0=关闭）
+    // 配准侧障碍 range image 用 Patchwork++ 地面 mask 排除地面点，而非 z 带
+    // [ground_z_min, ground_z_max]。建图侧（runMapBuild）本来就是按 mask 取 !ground
+    // 的点建障碍面，配准侧却按 z 带取点，两侧的「障碍点」定义不一致：
+    //   - mask 判地面但 z 出带（上坡、路缘、远处地面被俯仰抬高）：建图不入障碍库，
+    //     配准却拿它去匹配障碍面，只能落到旁边的墙/植被面上，产生虚假残差；
+    //   - mask 判非地面但 z 落在带内（矮墙、车体下半、路缘石、灌木下部）：建图会拟合
+    //     成障碍面，配准侧永远取不到点，地图里的面白建。
+    // 差值最终都被位姿吸收。<=0 或 Patchwork++ 关闭时回退 z 带（原行为）。
+    bool   obs_reg_use_pw_mask{true};
     // Patchwork++ 地面分割：每帧一份 mask，建图链与配准链共用
     bool   use_patchwork_ground{true};  // false 回退到原 range-image 列传播 + z 带
     PatchworkppConfig patchwork;
