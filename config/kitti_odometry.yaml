@@ -39,6 +39,16 @@ slamesher:
   obs_match_per_surf_max: 50   # 每个障碍曲面最多保留的匹配点数（0=不限；防止长物体垄断）
   obs_cand_target: 1500        # 逐曲面截顶后的候选目标；不足则补采偏移列（0=关闭自适应）
                                # 已满 cap 的大曲面不受影响，增量只落在未满额的小曲面上
+  # 配准侧障碍 range image 按 Patchwork++ mask 排除地面点，而不是按 z 带
+  # [ground_z_min, ground_z_max]。建图侧一直是按 mask 取 !ground 的点拟合障碍面，
+  # 配准侧却按 z 带取点，两侧「障碍点」定义不一致：
+  #   - mask 判地面但 z 出带（上坡、路缘、远处地面被俯仰抬高）：建图不入障碍库，配准
+  #     却拿它去匹配障碍面，只能落到旁边的墙/植被上，是虚假残差；
+  #   - mask 判非地面但 z 在带内（矮墙、车体下半、路缘石、灌木下部）：建图会拟合成障碍
+  #     面，配准侧永远取不到点去匹配，这些面白建。
+  # 两边点集的差值最终都被位姿吸收，与地面链此前修掉的 ground_reg_y_max / z_filter
+  # 是同一类问题。false = 回退 z 带（原行为），便于 A/B。
+  obs_reg_use_pw_mask: true
   # Patchwork++ 地面分割（默认值同 patchwork-plusplus-ros/config/params.yaml）
   # 开启后地面点由 Patchwork++ 判定，建图与配准共用同一份 mask；
   # 关闭则回退到 range-image 列传播 + 下方 ground_z_min/max 的 z 带判据
