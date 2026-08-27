@@ -158,7 +158,8 @@ void BSplineSurface::clearApplyProfileLog() {
 SurfaceEval BSplineSurface::evaluateSurface(
         const Parameter& paraU, const Parameter& paraV,
         const vector<double>& knotsU, const vector<double>& knotsV,
-        const std::vector<Vector3d>& controls, int num_cp_v) const
+        const std::vector<Vector3d>& controls, int num_cp_v,
+        bool second_order) const
 {
     SurfaceEval eval;
 
@@ -175,25 +176,30 @@ SurfaceEval BSplineSurface::evaluateSurface(
     const double u2 = u * u, u3 = u2 * u;
     const double v2 = v * v, v3 = v2 * v;
 
-    Vector4d B0_u, B1_u, B2_u, B0_v, B1_v, B2_v;
+    Vector4d B0_u, B1_u, B0_v, B1_v;
     B0_u << 1.0, u, u2, u3;
     B1_u << 0.0, 1.0, 2.0 * u, 3.0 * u2;
-    B2_u << 0.0, 0.0, 2.0, 6.0 * u;
     B0_v << 1.0, v, v2, v3;
     B1_v << 0.0, 1.0, 2.0 * v, 3.0 * v2;
-    B2_v << 0.0, 0.0, 2.0, 6.0 * v;
 
     const double inv_dt_u  = (dt_u > 1e-9) ? (1.0 / dt_u) : 0.0;
-    const double inv_dt2_u = inv_dt_u * inv_dt_u;
     const double inv_dt_v  = (dt_v > 1e-9) ? (1.0 / dt_v) : 0.0;
-    const double inv_dt2_v = inv_dt_v * inv_dt_v;
 
     eval.w_pos_u = B0_u.transpose() * matU;
     const RowVector4d w_du_u  = (B1_u.transpose() * matU) * inv_dt_u;
-    const RowVector4d w_duu_u = (B2_u.transpose() * matU) * inv_dt2_u;
     eval.w_pos_v = B0_v.transpose() * matV;
     const RowVector4d w_dv_v  = (B1_v.transpose() * matV) * inv_dt_v;
-    const RowVector4d w_dvv_v = (B2_v.transpose() * matV) * inv_dt2_v;
+
+    RowVector4d w_duu_u, w_dvv_v;
+    if (second_order) {
+        Vector4d B2_u, B2_v;
+        B2_u << 0.0, 0.0, 2.0, 6.0 * u;
+        B2_v << 0.0, 0.0, 2.0, 6.0 * v;
+        const double inv_dt2_u = inv_dt_u * inv_dt_u;
+        const double inv_dt2_v = inv_dt_v * inv_dt_v;
+        w_duu_u = (B2_u.transpose() * matU) * inv_dt2_u;
+        w_dvv_v = (B2_v.transpose() * matV) * inv_dt2_v;
+    }
 
     for (int i = 0; i < 4; ++i) {
         for (int j = 0; j < 4; ++j) {
@@ -206,9 +212,11 @@ SurfaceEval BSplineSurface::evaluateSurface(
             eval.pos += w_pos * cp;
             eval.Su  += (w_du_u(i)  * eval.w_pos_v(j)) * cp;
             eval.Sv  += (eval.w_pos_u(i) * w_dv_v(j)) * cp;
-            eval.Suu += (w_duu_u(i) * eval.w_pos_v(j)) * cp;
-            eval.Svv += (eval.w_pos_u(i) * w_dvv_v(j)) * cp;
-            eval.Suv += (w_du_u(i)  * w_dv_v(j)) * cp;
+            if (second_order) {
+                eval.Suu += (w_duu_u(i) * eval.w_pos_v(j)) * cp;
+                eval.Svv += (eval.w_pos_u(i) * w_dvv_v(j)) * cp;
+                eval.Suv += (w_du_u(i)  * w_dv_v(j)) * cp;
+            }
         }
     }
     return eval;
@@ -347,11 +355,13 @@ void BSplineSurface::coldInitUVFromPCA(const vector<Vector3d>& givepoints,
 double BSplineSurface::findFootPrintWarm(const vector<Vector3d>& givepoints,
                                          vector<pair<Parameter,Parameter>>& uv_state,
                                          vector<double>& point_dists,
-                                         int newton_steps)
+                                         int newton_steps,
+                                         vector<SurfaceEval>* out_evals)
 {
     if (uv_state.empty()) coldInitUVFromPCA(givepoints, uv_state);
     const int n = static_cast<int>(givepoints.size());
     point_dists.resize(n, 0.0);
+    if (out_evals) out_evals->resize(n);
     double squareSum = 0.0;
 
     for (int i = 0; i < n; ++i) {
@@ -359,7 +369,8 @@ double BSplineSurface::findFootPrintWarm(const vector<Vector3d>& givepoints,
         auto [paraU, paraV] = uv_state[i];
 
         for (int nr = 0; nr < newton_steps; ++nr) {
-            const SurfaceEval eval = evaluateSurface(paraU, paraV, knots_u, knots_v, controls, controls_num_v);
+            const SurfaceEval eval = evaluateSurface(
+                paraU, paraV, knots_u, knots_v, controls, controls_num_v, false);
             Vector3d r = eval.pos - p;
 
             double a00 = eval.Su.dot(eval.Su), a01 = eval.Su.dot(eval.Sv), a11 = eval.Sv.dot(eval.Sv);
@@ -375,11 +386,15 @@ double BSplineSurface::findFootPrintWarm(const vector<Vector3d>& givepoints,
             paraU = {findSpanGlobal(new_tf_u, knots_u, controls_num_u), new_tf_u};
             paraV = {findSpanGlobal(new_tf_v, knots_v, controls_num_v), new_tf_v};
 
-            if (std::abs(du) < 1e-6 && std::abs(dv) < 1e-6) break;
+            if (std::abs(du) < 5e-3 && std::abs(dv) < 5e-3) break;
         }
 
         uv_state[i] = {paraU, paraV};
-        const SurfaceEval final_eval = evaluateSurface(paraU, paraV, knots_u, knots_v, controls, controls_num_v);
+        // apply 要曲率时拿完整末次求值；配准只需要 pos，走一阶即可。
+        const SurfaceEval final_eval = evaluateSurface(
+            paraU, paraV, knots_u, knots_v, controls, controls_num_v,
+            /*second_order=*/out_evals != nullptr);
+        if (out_evals) (*out_evals)[i] = final_eval;
         double dist_sq = (final_eval.pos - p).squaredNorm();
         point_dists[i] = dist_sq;
         squareSum += std::sqrt(dist_sq);
@@ -655,7 +670,9 @@ bool BSplineSurface::apply(
         vector<double> point_dists;
         auto t1 = std::chrono::high_resolution_clock::now();
         // uv_cache 既是输入（warm start）也是输出（精化后结果），下次迭代自动复用
-        double current_sq_dist = findFootPrintWarm(givepoints, uv_cache, point_dists, /*newton_steps=*/5);
+        vector<SurfaceEval> fp_evals;
+        double current_sq_dist = findFootPrintWarm(
+            givepoints, uv_cache, point_dists, /*newton_steps=*/5, &fp_evals);
         sum_fp += ms_since(t1);
         t1 = std::chrono::high_resolution_clock::now();
         double diff = last_error - current_sq_dist;
@@ -713,7 +730,7 @@ bool BSplineSurface::apply(
                 continue; // 直接当噪声，跳过
             }
             Parameter paraU = uv_cache[i].first, paraV = uv_cache[i].second;
-            const SurfaceEval eval = evaluateSurface(paraU, paraV, knots_u, knots_v, controls, controls_num_v);
+            const SurfaceEval& eval = fp_evals[i];
             SurfaceCurvature surf_info = curvatureFromEval(eval);
 
             const int span_u = paraU.first;

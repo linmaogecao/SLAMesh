@@ -375,6 +375,28 @@ private:
                              const RangeImageProcessor& rp_far,
                              bool use_far);
 
+    // 障碍/地面匹配：对 surf_to_pts 中每张候选面做 footprint 并把过门的对应写入 out。
+    // prev_indices/prev_uv 是跨迭代的足点热启动缓存（同一批下标复用上次收敛的 uv），
+    // stat_* 是过门/边界统计计数器，由调用方在每轮开头清零。
+    void buildObsMatches(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                        const Transf& T_curr,
+                        double cur_match_thr,
+                        bool want_ground,
+                        BSplineMap& bspline_map,
+                        const std::unordered_map<int, std::vector<int>>& surf_to_pts,
+                        std::unordered_map<int, std::vector<int>>& prev_indices,
+                        std::unordered_map<int, std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>>>& prev_uv,
+                        int& stat_edge_kept, int& stat_edge_rej, int& stat_gate_rej,
+                        std::vector<RegMatch>& out);
+
+    void buildGroundMatches(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                           const Transf& T_curr,
+                           double thr,
+                           const std::unordered_map<const BSplineSurface*, std::vector<int>>& surf_to_pts,
+                           std::unordered_map<const BSplineSurface*, std::vector<int>>& prev_indices,
+                           std::unordered_map<const BSplineSurface*, std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>>>& prev_uv,
+                           std::vector<RegMatch>& out);
+
     // 统一建图：近/远两层 range image 分割 → z 分流地面/障碍 → 按各自 interval 决定是否建图
     void runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                      const std::vector<uint8_t>& pw_ground_mask,
@@ -395,6 +417,8 @@ private:
     // out_path 空：写 build/gnd_surfaces.txt；否则写指定路径（地面采样点 xyz）
     void saveGndSurfacesToTxt(const MultiResGroundMap& mr_ground,
                               const std::string& out_path = "") const;
+    // 地面控制点：gnd_controls/<layer>_<ix>_<iy>.txt，与障碍 controls/ 同一世界系 xyz
+    void saveGroundControlsToTxt(const MultiResGroundMap& mr_ground) const;
     // dump_gnd_scan 区间内：每次建完地面，累计快照到 all_surfaces/all_surfaces_<step>.txt
     void dumpGndAllSurfacesAtBuild(const MultiResGroundMap& mr_ground) const;
     void saveControlPointsToTxt(const BSplineMap& bspline_map,

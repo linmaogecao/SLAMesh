@@ -1975,6 +1975,193 @@ void SLAMesher::processFirstFrame(Transf& T_world)
     path_pub.publish(g_data.path);
 }
 
+// 障碍匹配：对 surf_to_pts 中所有 (sid, indices) 做 footprint 并写入 matches
+void SLAMesher::buildObsMatches(
+        const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+        const Transf& T_curr,
+        double cur_match_thr,
+        bool want_ground,
+        BSplineMap& bspline_map,
+        const std::unordered_map<int, std::vector<int>>& surf_to_pts,
+        std::unordered_map<int, std::vector<int>>& prev_indices,
+        std::unordered_map<int, std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>>>& prev_uv,
+        int& stat_edge_kept, int& stat_edge_rej, int& stat_gate_rej,
+        std::vector<RegMatch>& out)
+{
+    for (auto& [sid, indices] : surf_to_pts) {
+        const BSplineMapEntry* entry = bspline_map.getEntry(sid);
+        if (!entry || !entry->surface) continue;
+        if (entry->is_ground != want_ground) continue;
+
+        auto& surf = entry->surface;
+        const auto& knU = surf->getKnotsU();
+        const auto& knV = surf->getKnotsV();
+        const auto& cps = surf->getControls();
+        int num_cpv     = surf->getNumCpV();
+
+        std::vector<Eigen::Vector3d> pts_world;
+        pts_world.reserve(indices.size());
+        for (int idx : indices)
+            pts_world.push_back(T_curr.block<3,3>(0,0) *
+                Eigen::Vector3d(scan_local[idx].x, scan_local[idx].y, scan_local[idx].z) +
+                T_curr.block<3,1>(0,3));
+
+        std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
+        std::vector<double> dists;
+        auto prev_idx_it = prev_indices.find(sid);
+        auto prev_uv_it = prev_uv.find(sid);
+        if (prev_idx_it != prev_indices.end() &&
+            prev_uv_it != prev_uv.end() &&
+            prev_idx_it->second == indices &&
+            prev_uv_it->second.size() == indices.size()) {
+            footprints = prev_uv_it->second;
+        }
+        surf->findFootPrintWarm(pts_world, footprints, dists, /*newton_steps=*/6);
+        prev_indices[sid] = indices;
+        prev_uv[sid] = footprints;
+
+        for (int k = 0; k < (int)indices.size(); k++) {
+            double d = std::sqrt(std::abs(dists[k]));
+            constexpr double kEdgeEps = 1e-4;
+            const bool on_edge =
+                footprints[k].first.second  < kEdgeEps ||
+                footprints[k].first.second  > 1.0 - kEdgeEps ||
+                footprints[k].second.second < kEdgeEps ||
+                footprints[k].second.second > 1.0 - kEdgeEps;
+            if (d < 1e-6) { ++stat_gate_rej; if (on_edge) ++stat_edge_rej; continue; }
+
+            // 地面片是瓦片式铺开的，瓦片边缘的足点由邻接瓦片正常覆盖，不算外点；
+            // 边界处理只对障碍片生效。
+            const bool edge_obs = on_edge && !want_ground;
+            auto [paraU, paraV] = footprints[k];
+
+            SurfaceCurvature curv;
+            bool curv_ready = false;
+            bool drop_tangent = false;
+
+            if (edge_obs && param.obs_edge_mode == 2) {
+                curv = surf->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
+                if (curv.normal.norm() < 1e-9) continue;
+                curv.normal.normalize();
+                curv_ready = true;
+                const Eigen::Vector3d r = pts_world[k] - curv.point;
+                const double dn  = std::abs(curv.normal.dot(r));
+                const double dtan = std::sqrt(std::max(0.0, r.squaredNorm() - dn * dn));
+                if (dn > cur_match_thr || dtan > param.obs_edge_tan_max) {
+                    ++stat_gate_rej;
+                    ++stat_edge_rej;
+                    continue;
+                }
+                drop_tangent = true;
+            } else {
+                if (d > cur_match_thr) {
+                    ++stat_gate_rej;
+                    if (on_edge) ++stat_edge_rej;
+                    continue;
+                }
+                if (edge_obs && param.obs_edge_mode == 1) {
+                    ++stat_edge_kept;
+                    continue;
+                }
+            }
+            if (on_edge) ++stat_edge_kept;
+
+            if (!curv_ready) {
+                curv = surf->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
+                if (curv.normal.norm() < 1e-9) continue;
+                curv.normal.normalize();
+            }
+
+            RegMatch m;
+            m.p_local   = Eigen::Vector3d(scan_local[indices[k]].x,
+                                          scan_local[indices[k]].y,
+                                          scan_local[indices[k]].z);
+            m.p_world   = pts_world[k];
+            m.curvature = curv;
+            m.scan_idx  = indices[k];
+            m.is_ground = want_ground;
+            m.drop_tangent = drop_tangent;
+            m.fit_dist  = param.obs_fit_weight_adj ? surf->getFitMeanDistAdj()
+                                                   : surf->getFitMeanDist();
+            out.push_back(m);
+        }
+    }
+}
+
+// 地面匹配：使用 GroundGridMap；门限由调用方在收集后过滤
+void SLAMesher::buildGroundMatches(
+        const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+        const Transf& T_curr,
+        double thr,
+        const std::unordered_map<const BSplineSurface*, std::vector<int>>& surf_to_pts,
+        std::unordered_map<const BSplineSurface*, std::vector<int>>& prev_indices,
+        std::unordered_map<const BSplineSurface*, std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>>>& prev_uv,
+        std::vector<RegMatch>& out)
+{
+    // 按点集最小扫描下标定序后再遍历。原实现直接迭代以曲面指针为 key 的
+    // unordered_map，顺序随堆地址（ASLR）变化；而下游按 out 的顺序做每格截顶
+    // （每格只留前 reg_tgt 个），于是同配置重跑保留的匹配子集不同，实测 seq06
+    // 第 2 帧 z 就差 1.5 mm。每个扫描点只归一张最近面，点集不相交，最小下标严格可比。
+    std::vector<std::pair<int, const BSplineSurface*>> order;
+    order.reserve(surf_to_pts.size());
+    for (const auto& [sp, idxs] : surf_to_pts) {
+        if (!sp || idxs.empty()) continue;
+        order.emplace_back(*std::min_element(idxs.begin(), idxs.end()), sp);
+    }
+    std::sort(order.begin(), order.end());
+
+    for (const auto& [order_key, surf_ptr] : order) {
+        (void)order_key;
+        const std::vector<int>& indices = surf_to_pts.at(surf_ptr);
+        const auto& knU  = surf_ptr->getKnotsU();
+        const auto& knV  = surf_ptr->getKnotsV();
+        const auto& cps  = surf_ptr->getControls();
+        int num_cpv      = surf_ptr->getNumCpV();
+
+        std::vector<Eigen::Vector3d> pts_world;
+        pts_world.reserve(indices.size());
+        for (int idx : indices)
+            pts_world.push_back(T_curr.block<3,3>(0,0) *
+                Eigen::Vector3d(scan_local[idx].x, scan_local[idx].y, scan_local[idx].z) +
+                T_curr.block<3,1>(0,3));
+
+        std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
+        std::vector<double> dists;
+        auto prev_idx_it = prev_indices.find(surf_ptr);
+        auto prev_uv_it = prev_uv.find(surf_ptr);
+        if (prev_idx_it != prev_indices.end() &&
+            prev_uv_it != prev_uv.end() &&
+            prev_idx_it->second == indices &&
+            prev_uv_it->second.size() == indices.size()) {
+            footprints = prev_uv_it->second;
+        }
+        const_cast<BSplineSurface*>(surf_ptr)->findFootPrintWarm(
+            pts_world, footprints, dists, /*newton_steps=*/6);
+        prev_indices[surf_ptr] = indices;
+        prev_uv[surf_ptr] = footprints;
+
+        for (int k = 0; k < (int)indices.size(); k++) {
+            double d = std::sqrt(std::abs(dists[k]));
+            if (d > thr || d < 1e-6) continue;
+            auto [paraU, paraV] = footprints[k];
+            SurfaceCurvature curv = const_cast<BSplineSurface*>(surf_ptr)
+                ->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
+            if (curv.normal.norm() < 1e-9) continue;
+            curv.normal.normalize();
+
+            RegMatch m;
+            m.p_local   = Eigen::Vector3d(scan_local[indices[k]].x,
+                                          scan_local[indices[k]].y,
+                                          scan_local[indices[k]].z);
+            m.p_world   = pts_world[k];
+            m.curvature = curv;
+            m.scan_idx  = indices[k];
+            m.is_ground = true;
+            out.push_back(m);
+        }
+    }
+}
+
 Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                                     const std::vector<uint8_t>& pw_ground_mask,
                                     Transf T_guess,
@@ -2006,179 +2193,6 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
     // 观测计数：足点被夹到参数域边界说明最近点落在 PCA 数据支撑框之外，此时 d 由切向
     // 偏移主导而残差主项是法向分量，两个量不是一回事。分开统计过门与被门毙掉的边界命中。
     int stat_edge_kept = 0, stat_edge_rej = 0, stat_gate_rej = 0;
-
-    // 匹配辅助 lambda：对 surf_to_pts 中所有 (sid, indices) 做 footprint 并写入 matches
-    auto buildMatches = [&](const std::unordered_map<int, std::vector<int>>& surf_to_pts,
-                            bool want_ground,
-                            std::vector<RegMatch>& out) {
-        for (auto& [sid, indices] : surf_to_pts) {
-            const BSplineMapEntry* entry = bspline_map.getEntry(sid);
-            if (!entry || !entry->surface) continue;
-            if (entry->is_ground != want_ground) continue;
-
-            auto& surf = entry->surface;
-            const auto& knU = surf->getKnotsU();
-            const auto& knV = surf->getKnotsV();
-            const auto& cps = surf->getControls();
-            int num_cpv     = surf->getNumCpV();
-
-            std::vector<Eigen::Vector3d> pts_world;
-            pts_world.reserve(indices.size());
-            for (int idx : indices)
-                pts_world.push_back(T_curr.block<3,3>(0,0) *
-                    Eigen::Vector3d(scan_local[idx].x, scan_local[idx].y, scan_local[idx].z) +
-                    T_curr.block<3,1>(0,3));
-
-            std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
-            std::vector<double> dists;
-            auto prev_idx_it = obs_prev_indices.find(sid);
-            auto prev_uv_it = obs_prev_uv.find(sid);
-            if (prev_idx_it != obs_prev_indices.end() &&
-                prev_uv_it != obs_prev_uv.end() &&
-                prev_idx_it->second == indices &&
-                prev_uv_it->second.size() == indices.size()) {
-                footprints = prev_uv_it->second;
-            }
-            surf->findFootPrintWarm(pts_world, footprints, dists, /*newton_steps=*/6);
-            obs_prev_indices[sid] = indices;
-            obs_prev_uv[sid] = footprints;
-
-            for (int k = 0; k < (int)indices.size(); k++) {
-                double d = std::sqrt(std::abs(dists[k]));
-                constexpr double kEdgeEps = 1e-4;
-                const bool on_edge =
-                    footprints[k].first.second  < kEdgeEps ||
-                    footprints[k].first.second  > 1.0 - kEdgeEps ||
-                    footprints[k].second.second < kEdgeEps ||
-                    footprints[k].second.second > 1.0 - kEdgeEps;
-                if (d < 1e-6) { ++stat_gate_rej; if (on_edge) ++stat_edge_rej; continue; }
-
-                // 地面片是瓦片式铺开的，瓦片边缘的足点由邻接瓦片正常覆盖，不算外点；
-                // 边界处理只对障碍片生效。
-                const bool edge_obs = on_edge && !want_ground;
-                auto [paraU, paraV] = footprints[k];
-
-                SurfaceCurvature curv;
-                bool curv_ready = false;
-                bool drop_tangent = false;
-
-                if (edge_obs && param.obs_edge_mode == 2) {
-                    curv = surf->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
-                    if (curv.normal.norm() < 1e-9) continue;
-                    curv.normal.normalize();
-                    curv_ready = true;
-                    const Eigen::Vector3d r = pts_world[k] - curv.point;
-                    const double dn  = std::abs(curv.normal.dot(r));
-                    const double dtan = std::sqrt(std::max(0.0, r.squaredNorm() - dn * dn));
-                    if (dn > cur_match_thr || dtan > param.obs_edge_tan_max) {
-                        ++stat_gate_rej;
-                        ++stat_edge_rej;
-                        continue;
-                    }
-                    drop_tangent = true;
-                } else {
-                    if (d > cur_match_thr) {
-                        ++stat_gate_rej;
-                        if (on_edge) ++stat_edge_rej;
-                        continue;
-                    }
-                    if (edge_obs && param.obs_edge_mode == 1) {
-                        ++stat_edge_kept;
-                        continue;
-                    }
-                }
-                if (on_edge) ++stat_edge_kept;
-
-                if (!curv_ready) {
-                    curv = surf->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
-                    if (curv.normal.norm() < 1e-9) continue;
-                    curv.normal.normalize();
-                }
-
-                RegMatch m;
-                m.p_local   = Eigen::Vector3d(scan_local[indices[k]].x,
-                                              scan_local[indices[k]].y,
-                                              scan_local[indices[k]].z);
-                m.p_world   = pts_world[k];
-                m.curvature = curv;
-                m.scan_idx  = indices[k];
-                m.is_ground = want_ground;
-                m.drop_tangent = drop_tangent;
-                m.fit_dist  = param.obs_fit_weight_adj ? surf->getFitMeanDistAdj()
-                                                       : surf->getFitMeanDist();
-                out.push_back(m);
-            }
-        }
-    };
-
-    // 地面匹配：使用 GroundGridMap；门限由调用方在收集后过滤
-    auto buildGroundMatches = [&](
-            const std::unordered_map<const BSplineSurface*, std::vector<int>>& surf_to_pts,
-            double thr,
-            std::vector<RegMatch>& out) {
-        // 按点集最小扫描下标定序后再遍历。原实现直接迭代以曲面指针为 key 的
-        // unordered_map，顺序随堆地址（ASLR）变化；而下游按 out 的顺序做每格截顶
-        // （每格只留前 reg_tgt 个），于是同配置重跑保留的匹配子集不同，实测 seq06
-        // 第 2 帧 z 就差 1.5 mm。每个扫描点只归一张最近面，点集不相交，最小下标严格可比。
-        std::vector<std::pair<int, const BSplineSurface*>> order;
-        order.reserve(surf_to_pts.size());
-        for (const auto& [sp, idxs] : surf_to_pts) {
-            if (!sp || idxs.empty()) continue;
-            order.emplace_back(*std::min_element(idxs.begin(), idxs.end()), sp);
-        }
-        std::sort(order.begin(), order.end());
-
-        for (const auto& [order_key, surf_ptr] : order) {
-            (void)order_key;
-            const std::vector<int>& indices = surf_to_pts.at(surf_ptr);
-            const auto& knU  = surf_ptr->getKnotsU();
-            const auto& knV  = surf_ptr->getKnotsV();
-            const auto& cps  = surf_ptr->getControls();
-            int num_cpv      = surf_ptr->getNumCpV();
-
-            std::vector<Eigen::Vector3d> pts_world;
-            pts_world.reserve(indices.size());
-            for (int idx : indices)
-                pts_world.push_back(T_curr.block<3,3>(0,0) *
-                    Eigen::Vector3d(scan_local[idx].x, scan_local[idx].y, scan_local[idx].z) +
-                    T_curr.block<3,1>(0,3));
-
-            std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
-            std::vector<double> dists;
-            auto prev_idx_it = gnd_prev_indices.find(surf_ptr);
-            auto prev_uv_it = gnd_prev_uv.find(surf_ptr);
-            if (prev_idx_it != gnd_prev_indices.end() &&
-                prev_uv_it != gnd_prev_uv.end() &&
-                prev_idx_it->second == indices &&
-                prev_uv_it->second.size() == indices.size()) {
-                footprints = prev_uv_it->second;
-            }
-            const_cast<BSplineSurface*>(surf_ptr)->findFootPrintWarm(
-                pts_world, footprints, dists, /*newton_steps=*/6);
-            gnd_prev_indices[surf_ptr] = indices;
-            gnd_prev_uv[surf_ptr] = footprints;
-
-            for (int k = 0; k < (int)indices.size(); k++) {
-                double d = std::sqrt(std::abs(dists[k]));
-                if (d > thr || d < 1e-6) continue;
-                auto [paraU, paraV] = footprints[k];
-                SurfaceCurvature curv = const_cast<BSplineSurface*>(surf_ptr)
-                    ->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
-                if (curv.normal.norm() < 1e-9) continue;
-                curv.normal.normalize();
-
-                RegMatch m;
-                m.p_local   = Eigen::Vector3d(scan_local[indices[k]].x,
-                                              scan_local[indices[k]].y,
-                                              scan_local[indices[k]].z);
-                m.p_world   = pts_world[k];
-                m.curvature = curv;
-                m.scan_idx  = indices[k];
-                m.is_ground = true;
-                out.push_back(m);
-            }
-        }
-    };
 
     // 阶段 2 的产物，外层交替时每轮覆盖，循环结束后给 dump 用
     std::vector<int> gnd_enter_indices;      // 最后一轮进入地面匹配的点索引
@@ -2236,17 +2250,13 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             return n;
         };
 
-        TicToc t_obs_collect;
         collectFromRangeImage(rp_near, match_min_z, 0);
         if (use_far) collectFromRangeImage(rp_far, far_match_min_z, 0);
 
-        const int cand_base = cappedTotal();
-        int extra_pass = 0;
         if (param.obs_cand_target > 0) {
             for (int off = 1; off < col_step && cappedTotal() < param.obs_cand_target; ++off) {
                 collectFromRangeImage(rp_near, match_min_z, off);
                 if (use_far) collectFromRangeImage(rp_far, far_match_min_z, off);
-                ++extra_pass;
             }
         }
 
@@ -2263,90 +2273,13 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             }
         }
 
-        if (iter == 0) {
-            int n_below = 0;
-            for (const auto& [sid, idxs] : obs_surf_to_pts)
-                if (surf_cap <= 0 || (int)idxs.size() < surf_cap) ++n_below;
-            std::cout << "  [obs cand] surf=" << obs_surf_to_pts.size()
-                      << " below_cap=" << n_below
-                      << " cand=" << cand_base << "->" << cappedTotal()
-                      << " extra_pass=" << extra_pass << "/" << (col_step - 1)
-                      << " (target=" << param.obs_cand_target << ")" << std::endl;
-        }
-
-        int n_pairs_in = 0, n_pairs_dup = 0;
-        for (const auto& [sid, idxs] : obs_surf_to_pts) {
-            n_pairs_in += (int)idxs.size();
-            std::unordered_set<int> uniq(idxs.begin(), idxs.end());
-            n_pairs_dup += (int)idxs.size() - (int)uniq.size();
-        }
-        const double ms_collect = t_obs_collect.toc();
-
         std::vector<RegMatch> obs_matches;
         obs_matches.reserve(bspline_map.size() * param.obs_match_per_surf_max);
         stat_edge_kept = stat_edge_rej = stat_gate_rej = 0;
-        TicToc t_obs_build;
-        buildMatches(obs_surf_to_pts, false, obs_matches);
-        const double ms_build = t_obs_build.toc();
-
-        // 一个扫描点会被推进每一张候选面（见上方 queryCandidates 循环），过门后同点
-        // 多残差在 Huber 下等于重复计权。mult>1 即存在这种重复计权。
-        {
-            std::unordered_set<int> kept_pts;
-            for (const auto& m : obs_matches) kept_pts.insert(m.scan_idx);
-            const int n_res = (int)obs_matches.size();
-            const int n_pts = (int)kept_pts.size();
-            obs_last_res = n_res;
-            int nL = 0, nR = 0;
-            for (const auto& m : obs_matches)
-                (m.p_local.y() >= 0.0 ? nL : nR)++;
-
-            // x/y/yaw 解的条件数。法向残差 r = n·(R p + t - q)，R = Rz(yaw)Ry Rx，
-            // 故 ∂r/∂yaw = n·(Ez R p) = n_y v_x - n_x v_y，v = p_world - t。yaw 列量纲是
-            // 米，先用 |v_xy| 的均方根归一，λmin/λmax 才在各帧间可比。
-            const Eigen::Vector3d t_curr = T_curr.block<3, 1>(0, 3);
-            double sum_r2 = 0.0;
-            for (const auto& m : obs_matches) {
-                const Eigen::Vector3d v = m.p_world - t_curr;
-                sum_r2 += v.x() * v.x() + v.y() * v.y();
-            }
-            const double L = n_res > 0 ? std::sqrt(sum_r2 / n_res) : 1.0;
-
-            Eigen::Matrix3d JtJ = Eigen::Matrix3d::Zero();
-            std::array<int, 8> az_bins{};
-            for (const auto& m : obs_matches) {
-                const Eigen::Vector3d& n = m.curvature.normal;
-                const Eigen::Vector3d v = m.p_world - t_curr;
-                Eigen::Vector3d j(n.x(), n.y(),
-                                  (n.y() * v.x() - n.x() * v.y()) / std::max(L, 1e-9));
-                JtJ += j * j.transpose();
-                // 平面法向有正负二义，按 [0,π) 分箱
-                double az = std::atan2(n.y(), n.x());
-                if (az < 0.0) az += M_PI;
-                ++az_bins[std::min<int>(7, (int)(az / (M_PI / 8.0)))];
-            }
-            JtJ /= std::max(n_res, 1);
-            const Eigen::Vector3d ev =
-                Eigen::SelfAdjointEigenSolver<Eigen::Matrix3d>(JtJ).eigenvalues();
-            const double lmin = ev(0), lmax = ev(2);
-            const int dom = *std::max_element(az_bins.begin(), az_bins.end());
-
-            char buf[520];
-            snprintf(buf, sizeof(buf),
-                     "  [obs stat] iter=%d thr=%.3f pairs=%d dup=%d res=%d pts=%d"
-                     " mult=%.3f surv=%.1f%% edge_keep=%d edge_rej=%d gate_rej=%d"
-                     " eigmin=%.5f rcond=%.5f dom=%.2f LR=%d/%d"
-                     " t_coll=%.1f t_build=%.1f ms",
-                     iter, cur_match_thr, n_pairs_in, n_pairs_dup, n_res, n_pts,
-                     n_pts > 0 ? (double)n_res / n_pts : 0.0,
-                     n_pairs_in > 0 ? 100.0 * n_res / n_pairs_in : 0.0,
-                     stat_edge_kept, stat_edge_rej, stat_gate_rej,
-                     lmin, lmax > 1e-12 ? lmin / lmax : 0.0,
-                     n_res > 0 ? (double)dom / n_res : 0.0,
-                     nL, nR,
-                     ms_collect, ms_build);
-            std::cout << buf << std::endl;
-        }
+        buildObsMatches(scan_local, T_curr, cur_match_thr, /*want_ground=*/false,
+                       bspline_map, obs_surf_to_pts, obs_prev_indices, obs_prev_uv,
+                       stat_edge_kept, stat_edge_rej, stat_gate_rej, obs_matches);
+        obs_last_res = (int)obs_matches.size();
 
         // 左右平衡：一侧墙垄断时点到面残差把 yaw 往单边拽。雷达系 y>=0 为左。
         // 任一侧超过 max_frac 时，该侧保留 keep = frac/(1-frac)*对侧 个，按 scan_idx 等间隔取。
@@ -2488,10 +2421,6 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         delta_scale = (T_new.block<3,1>(0,3) - T_curr.block<3,1>(0,3)).norm()
                     + 5.0 * (T_new.block<3,3>(0,0) - T_curr.block<3,3>(0,0)).norm();
         T_curr = T_new;
-
-        std::cout << "  iter " << iter << ": obs=" << obs_matches.size()
-                  << " delta=" << delta_scale
-                  << " (z/roll/pitch fixed)" << std::endl;
     }
 
     // 残差数塌陷时沿轨平移不可观测：存活对应方向高度集中（seq02 失效段 dom 0.42~0.54 对
@@ -2518,8 +2447,6 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             const Eigen::Vector2d t_new =
                 Eigen::Vector2d(T_prev(0, 3), T_prev(1, 3))
                 + d_solve * (l_target / l_solve);
-            std::cout << "  [obs starve] res=" << obs_last_res << " w=" << w
-                      << " step " << l_solve << " -> " << l_target << " m" << std::endl;
             T_curr(0, 3) = t_new.x();
             T_curr(1, 3) = t_new.y();
         }
@@ -2537,17 +2464,6 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         const double y_fix = T_curr(1, 3);
         double roll_i = 0.0, pitch_i = 0.0, yaw_fix = 0.0;
         matrixToRPY(T_curr.block<3, 3>(0, 0), roll_i, pitch_i, yaw_fix);
-
-        // 地面阶段入口态：与出口态相减即地面阶段的净修正，用于把"外推+障碍带进来的
-        // 姿态"与"地面加上去的"分开归因
-        std::cout << "  [gnd in] roll=" << roll_i
-                  << " pitch=" << pitch_i
-                  << " z=" << T_curr(2, 3)
-                  << " guess_pitch=" << [&]{
-                         double r, p, y;
-                         matrixToRPY(T_guess.block<3, 3>(0, 0), r, p, y);
-                         return p;
-                     }() << std::endl;
 
         constexpr int kGndIters = 3;
         const double gnd_thr_last = param.ground_thr_last;
@@ -2659,12 +2575,6 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                         cmax_f_eff = std::max(1, (int)std::lround(reg_cmax_f * s));
                     }
                 }
-                if (giter == 0)
-                    std::cout << "  [gnd seed] cells=" << xy_bucket.size()
-                              << " cmax(F/M-B)=" << cmax_f_eff << "/" << cmax_eff
-                              << " (cfg " << reg_cmax_f << "/" << reg_cmax
-                              << ", budget=" << seed_bud << ")" << std::endl;
-
                 for (auto& [key, indices] : xy_bucket) {
                     (void)key;
                     std::vector<int> idx_f, idx_m, idx_b;
@@ -2701,7 +2611,8 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             }
 
             std::vector<RegMatch> gnd_matches;
-            buildGroundMatches(gnd_surf_to_pts, gnd_thr, gnd_matches);
+            buildGroundMatches(scan_local, T_curr, gnd_thr, gnd_surf_to_pts,
+                              gnd_prev_indices, gnd_prev_uv, gnd_matches);
 
             // 过 thr 后：每格不足 target 时，用该格内成功种子挂的邻居填充，再裁到 target
             if (reg_cs > 0.0 && reg_tgt > 0 && !seed_neighbors.empty()) {
@@ -2720,7 +2631,6 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 }
 
                 std::unordered_map<const BSplineSurface*, std::vector<int>> expand_surf_to_pts;
-                int n_expand_try = 0;
                 for (auto& [ckey, seeds] : cell_ok_seeds) {
                     const int have = cell_match_cnt[ckey];
                     if (have >= reg_tgt) continue;
@@ -2752,13 +2662,12 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                         expand_surf_to_pts[sp].push_back(ni);
                         matched_idx.insert(ni);
                         ++added;
-                        ++n_expand_try;
                     }
                 }
 
                 if (!expand_surf_to_pts.empty()) {
-                    const int n_before = (int)gnd_matches.size();
-                    buildGroundMatches(expand_surf_to_pts, gnd_thr, gnd_matches);
+                    buildGroundMatches(scan_local, T_curr, gnd_thr, expand_surf_to_pts,
+                                      gnd_prev_indices, gnd_prev_uv, gnd_matches);
                     // 每格最多保留 reg_tgt（种子优先，因其排在前面）
                     std::unordered_map<std::int64_t, int> kept;
                     std::vector<RegMatch> trimmed;
@@ -2770,14 +2679,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                         ++kept[key];
                         trimmed.push_back(m);
                     }
-                    const int n_added = (int)trimmed.size() - n_before;
                     gnd_matches.swap(trimmed);
-                    if (giter == 0) {
-                        std::cout << "  [gnd] expand try=" << n_expand_try
-                                  << " +" << std::max(0, n_added)
-                                  << " ->" << gnd_matches.size()
-                                  << " (target/cell=" << reg_tgt << ")" << std::endl;
-                    }
                 }
             }
 
@@ -2816,7 +2718,6 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
                 // 短板桶：从成功种子邻居补点（邻居 lx 仍须落在同桶）
                 std::unordered_map<const BSplineSurface*, std::vector<int>> fb_expand;
-                int n_fb_try = 0;
                 for (int b = 0; b < 3; ++b) {
                     if (have[b] >= tgt[b] || ok_seeds[b].empty()) continue;
                     const int need = tgt[b] - have[b];
@@ -2845,11 +2746,11 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                         fb_expand[sp].push_back(ni);
                         matched_idx.insert(ni);
                         ++added;
-                        ++n_fb_try;
                     }
                 }
                 if (!fb_expand.empty())
-                    buildGroundMatches(fb_expand, gnd_thr, gnd_matches);
+                    buildGroundMatches(scan_local, T_curr, gnd_thr, fb_expand,
+                                      gnd_prev_indices, gnd_prev_uv, gnd_matches);
 
                 // 重新分桶并裁到 tgt（超额裁，不足全留）
                 const int total = (int)gnd_matches.size();
@@ -2870,16 +2771,6 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 for (int b = 0; b < 3; ++b)
                     trim_bucket(idx_bkt[b], std::max(0, tgt[b]));
 
-                if (giter == 0) {
-                    std::cout << "  [gnd fb] total0=" << total0
-                              << " cap=" << tgt_base
-                              << " +try=" << n_fb_try
-                              << " ->" << total
-                              << " F=" << idx_bkt[0].size() << "/" << tgt[0]
-                              << " M=" << idx_bkt[1].size() << "/" << tgt[1]
-                              << " B=" << idx_bkt[2].size() << "/" << std::max(0, tgt[2])
-                              << std::endl;
-                }
                 std::unordered_set<int> keep_idx;
                 keep_idx.reserve(idx_bkt[0].size() + idx_bkt[1].size() + idx_bkt[2].size());
                 for (int b = 0; b < 3; ++b)
@@ -2892,31 +2783,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 gnd_matches.swap(balanced);
             }
 
-            if (giter == 0) {
-                // 求解前按雷达系 x 分桶的竖直残差：残差场若沿 x 单调（前后反号），
-                // 驱动的就是 pitch。用它定位推力来自哪个纵向区段。
-                static constexpr double kEdge[6] = {-35, -20, -8, 8, 20, 35};
-                double sum[7] = {0}; int num[7] = {0};
-                for (const auto& m : gnd_matches) {
-                    const double lx = m.p_local.x();
-                    int b = 0;
-                    while (b < 6 && lx >= kEdge[b]) ++b;
-                    sum[b] += (m.p_world.z() - m.curvature.point.z());
-                    num[b] += 1;
-                }
-                std::cout << "  [gnd resid]";
-                for (int b = 0; b < 7; ++b)
-                    std::cout << " " << (num[b] ? sum[b] / num[b] : 0.0)
-                              << "/" << num[b];
-                std::cout << std::endl;
-            }
-
-            if ((int)gnd_matches.size() < 10) {
-                std::cout << "  [gnd] giter=" << giter
-                          << " thr=" << gnd_thr
-                          << " skip, matches=" << gnd_matches.size() << std::endl;
-                break;
-            }
+            if ((int)gnd_matches.size() < 10) break;
 
             last_gnd_matches = gnd_matches;
 
@@ -2965,26 +2832,6 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
             last_matches = obs_saved;
             last_matches.insert(last_matches.end(), gnd_matches.begin(), gnd_matches.end());
-
-            // 点到面残差对绕轴旋转的 Hessian 近似为 H_roll=Σy²、H_pitch=Σx²（法向近似竖直），
-            // 打出 rms 直接反映两个自由度的可观测性差距
-            double sum_x2 = 0.0, sum_y2 = 0.0, max_ay = 0.0;
-            for (const auto& m : gnd_matches) {
-                sum_x2 += m.p_local.x() * m.p_local.x();
-                sum_y2 += m.p_local.y() * m.p_local.y();
-                max_ay = std::max(max_ay, std::abs(m.p_local.y()));
-            }
-            const double inv_n = gnd_matches.empty() ? 0.0 : 1.0 / (double)gnd_matches.size();
-            std::cout << "  [gnd] giter=" << giter
-                      << " thr=" << gnd_thr
-                      << " matches=" << gnd_matches.size()
-                      << " roll=" << rpy_z[0]
-                      << " pitch=" << rpy_z[1]
-                      << " z=" << rpy_z[2]
-                      << " rmsY=" << std::sqrt(sum_y2 * inv_n)
-                      << " rmsX=" << std::sqrt(sum_x2 * inv_n)
-                      << " maxY=" << max_ay
-                      << " (xy/yaw fixed from obs)" << std::endl;
         }
     }
     }  // 外层交替
@@ -3013,10 +2860,8 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 (dir / (prefix + std::to_string(g_data.step) + ".txt")).string();
             std::ofstream f(out, std::ios::out | std::ios::trunc);
             f << std::fixed << std::setprecision(6);
-            const int n = write_pts(f);
+            write_pts(f);
             f.close();
-            std::cout << "  [" << tag << "] step=" << g_data.step
-                      << " n=" << n << " -> " << out << std::endl;
         };
 
         dumpWorldPts(
@@ -3150,14 +2995,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 ++n_unmatched;
             }
             f_unmatched.close();
-
-            std::cout << "  [Dump] step=" << g_data.step
-                      << " gnd_enter=" << gnd_enter_indices.size()
-                      << " matched=" << last_matches.size()
-                      << " unmatched=" << n_unmatched
-                      << " -> " << base
-                      << "/{matched,matched_gnd,unmatched,origin_scan,scan_world,scan_gnd,self_gnd,self_obs}.txt"
-                      << std::endl;
+            (void)n_unmatched;
         }
     }
     return T_curr;
@@ -3436,14 +3274,22 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
     std::vector<double> obs_fit_dists;
     // 障碍建图 lambda：A 收集 → B 并行 apply → C 串行入库
     auto buildObsFromSeg = [&](RangeImageProcessor& proc, SegmentationResult& s, int min_pts) {
-        // ── 阶段 A：串行筛 cluster + footprint 匹配，打包 tasks ──
+        // ── 阶段 A：并行筛 cluster + footprint 匹配，按 cid 定位写入 ──
+        // 每个 cluster 的判定只读 bspline_map / range_image，互不依赖；唯一的跨 cluster
+        // 耦合是 MAX_NEW_SURFACES 截断只看已接受的个数，所以把截断挪到后面的串行收集，
+        // 结果与串行版逐位一致（串行版也是按 cid 升序接受到额满为止）。
+        // findFootPrint 只读曲面成员，写全落在调用方的 uv_state/point_dists 上，同一张
+        // 曲面被多个 cluster 并发查询是安全的。
         std::vector<ObsBuildTask> tasks;
-        for (int cid = 0; cid < (int)s.clusters.size(); cid++) {
+        // do_obstacle=false 时 n_loop=0，整段跳过：等价于串行版在首个够大的 cluster 处 break
+        const int n_loop = do_obstacle ? (int)s.clusters.size() : 0;
+        std::vector<ObsBuildTask> per_cid(n_loop);
+        std::vector<char> cid_ready(n_loop, 0);
+        const int n_omp_a = std::max(1, param.num_thread);
+#pragma omp parallel for schedule(dynamic) num_threads(n_omp_a)
+        for (int cid = 0; cid < n_loop; cid++) {
             const auto& pixels = s.clusters[cid];
             if ((int)pixels.size() < min_pts) continue;
-
-            if (!do_obstacle) break;
-            if (g_data.step != 1 && (n_added_obs + (int)tasks.size()) >= MAX_NEW_SURFACES) break;
 
             std::unordered_map<int, std::vector<int>> surf_to_kidx;
             std::vector<Eigen::Vector3d> pix_world(pixels.size(), Eigen::Vector3d::Zero());
@@ -3527,7 +3373,15 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
             t.cloud_world = cloud_world;
             t.init_cp     = std::move(init_cp);
             t.num_cp      = num_cp;
-            tasks.push_back(std::move(t));
+            per_cid[cid]  = std::move(t);
+            cid_ready[cid] = 1;
+        }
+
+        // 按 cid 升序收集，额满即停：与串行版的接受集合完全相同
+        for (int cid = 0; cid < (int)cid_ready.size(); ++cid) {
+            if (!cid_ready[cid]) continue;
+            if (g_data.step != 1 && (n_added_obs + (int)tasks.size()) >= MAX_NEW_SURFACES) break;
+            tasks.push_back(std::move(per_cid[cid]));
         }
 
         // ── 阶段 B：OMP 并行 apply（每个 task 独立，无共享写） ──
@@ -3805,6 +3659,44 @@ void SLAMesher::saveGndSurfacesToTxt(const MultiResGroundMap& mr_ground,
               << n_pts << " sample points -> " << out_path << std::endl;
 }
 
+void SLAMesher::saveGroundControlsToTxt(const MultiResGroundMap& mr_ground) const
+{
+    const std::string out_dir = std::string(kBsplineBuildDir) + "/gnd_controls";
+    std::error_code ec;
+    std::filesystem::remove_all(out_dir, ec);
+    std::filesystem::create_directories(out_dir, ec);
+    if (ec) {
+        std::cerr << "Failed to create directory: " << out_dir
+                  << " (" << ec.message() << ")\n";
+        return;
+    }
+
+    int n_saved = 0;
+    for (int li = 0; li < mr_ground.numLayers(); ++li) {
+        for (const auto& [key, cell] : mr_ground.layer(li).cells()) {
+            if (!cell.surf) continue;
+            const auto& cps = cell.surf->getControls();
+            if (cps.empty()) continue;
+            const std::string out_path = out_dir + "/"
+                + std::to_string(li) + "_"
+                + std::to_string(key.ix) + "_"
+                + std::to_string(key.iy) + ".txt";
+            std::ofstream out(out_path, std::ios::out | std::ios::trunc);
+            if (!out) {
+                std::cerr << "Failed to open: " << out_path << std::endl;
+                continue;
+            }
+            out << std::fixed << std::setprecision(6);
+            out << cell.surf->getNumCpU() << " " << cell.surf->getNumCpV() << "\n";
+            for (const auto& cp : cps)
+                out << cp.x() << " " << cp.y() << " " << cp.z() << "\n";
+            ++n_saved;
+        }
+    }
+    std::cout << "Ground control points saved: " << n_saved
+              << " files in " << out_dir << std::endl;
+}
+
 void SLAMesher::dumpGndAllSurfacesAtBuild(const MultiResGroundMap& mr_ground) const
 {
     if (param.dump_gnd_scan_begin <= 0
@@ -3866,6 +3758,15 @@ void SLAMesher::saveControlPointsToTxt(const BSplineMap& bspline_map,
             std::cerr << "Failed to create directory: " << out_dir << " (" << ec.message() << ")\n";
             return;
         }
+        // 上一轮 dump 的 sid 文件不会被覆盖，渲染时会变成远离轨迹的幽灵面
+        std::vector<std::filesystem::path> stale;
+        for (const auto& ent : std::filesystem::directory_iterator(out_dir, ec)) {
+            if (ec) break;
+            if (ent.is_regular_file() && ent.path().extension() == ".txt")
+                stale.push_back(ent.path());
+        }
+        for (const auto& p : stale)
+            std::filesystem::remove(p, ec);
     }
     if (save_surface_samples && !filter_by_step) {
         std::filesystem::create_directories(sample_dir, ec);
@@ -4072,6 +3973,12 @@ void SLAMesher::process(){
 
         if(g_data.step == 1){
             processFirstFrame(T_world);
+            if (traj_file.is_open()) {
+                traj_file << T_world(0,3) << " "
+                          << T_world(1,3) << " "
+                          << T_world(2,3) << "\n";
+                traj_file.flush();
+            }
             runMapBuild(scan_local, pw_ground_mask, T_world, range_proc, range_proc_far, range_proc_gnd, bspline_map, mr_ground, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
             continue;
         }
@@ -4120,6 +4027,7 @@ void SLAMesher::process(){
 
     printMapSummary(bspline_map);
     saveGroundGridZ(mr_ground);
+    saveGroundControlsToTxt(mr_ground);
     if (param.save_surface_samples || param.all_surfaces_max_step > 0
         || param.map_save_step_begin > 0 || param.map_save_step_end > 0) {
         saveGndSurfacesToTxt(mr_ground);

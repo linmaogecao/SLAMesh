@@ -106,10 +106,12 @@ public:
     double findFootPrint(const vector<Eigen::Vector3d>& givepoints,vector<pair<Parameter, Parameter>>& footPrints, vector<double> &point_dists);
     // UV warm-start 版本: uv_state 作为输入初始值并被更新为精化后的 (u,v)。
     // 首次调用时若 uv_state 为空，自动从 PCA 平面投影做冷启动。
+    // out_evals 非空时写入每点末次完整 SurfaceEval（含二阶导），供 apply 复用曲率。
     double findFootPrintWarm(const vector<Eigen::Vector3d>& givepoints,
                              vector<pair<Parameter,Parameter>>& uv_state,
                              vector<double>& point_dists,
-                             int newton_steps = 5);
+                             int newton_steps = 5,
+                             vector<SurfaceEval>* out_evals = nullptr);
     void initControlPoint(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,vector<Eigen::Vector3d>& controlPs,int num_u,int num_v);
     void initControlPointPCA(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud,
                              vector<Eigen::Vector3d>& controlPs, int num_u, int num_v,
@@ -160,7 +162,8 @@ private:
 
     SurfaceEval evaluateSurface(const Parameter& paraU, const Parameter& paraV,
                                 const vector<double>& knotsU, const vector<double>& knotsV,
-                                const std::vector<Eigen::Vector3d>& controls, int num_cp_v) const;
+                                const std::vector<Eigen::Vector3d>& controls, int num_cp_v,
+                                bool second_order = true) const;
     SurfaceCurvature curvatureFromEval(const SurfaceEval& eval) const;
 
     void computePlaneFrame(const pcl::PointCloud<pcl::PointXYZ>::Ptr& cloud);
