@@ -6,6 +6,32 @@ slamesher:
   odom_available: false 
   read_offline_pcd: true 
   dataset: 1
+  # ════════════ 运行模式 ════════════
+  # 0 = 离线逐帧：配准完等建图完再取下一帧。KITTI 全部调参结果只在这条路径上成立。
+  #     数据源可以是 KITTI bin（read_offline_pcd:true）或 rosbag（false，严格 FIFO 不丢帧）。
+  # 1 = 实时：建图独立线程，主线程配准完立刻发里程计；追不上则丢帧。
+  #     配 rosbag play 用 launch/slamesh_rosbag_realtime.launch（会覆盖成 1）。
+  run_mode: 0
+  # 实时模式：接收缓冲滞后超过此帧数就丢到只剩最新；0 = 不丢帧（追不上就滞后）
+  max_lag_frames: 1
+  # 点云接收缓冲上限（帧）；回调里超出丢最旧，防止追不上时无界吃内存
+  pcl_buffer_max: 20
+  # 实时模式建图周期（秒）。丢帧后帧计数与墙上时间脱钩，按时间调度才能让地图更新率
+  # 与 CPU 负载解耦。<=0 时回退到按处理帧计数的 map_update_interval/ground_build_interval。
+  # KITTI 10Hz + interval 5 相当于 0.5 s。
+  map_build_period: 0.0
+  # 建图线程 OMP 线程数；<=0 用 num_thread。配准与建图并发时两边各开 num_thread 会在
+  # 核数上超订，把里程计关键路径拖长。8 核建议配准留 5、建图给 3。
+  num_thread_map: 0
+  # 实时模式：按 dt 缩放匹配门与障碍沿轨先验 sigma。丢一帧位移翻倍，固定的 0.8 m 门会
+  # 把本该匹配的对应判成外点，固定 0.3 m 先验会把步长锁死在外推值上。
+  scale_gates_by_dt: true
+  dt_scale_max: 4.0        # 缩放系数上限（外推的下限取其倒数），防时间戳抖动把门放飞
+  realtime_idle_timeout: 5.0  # 收到过数据后再断流这么多秒就认为 bag 播完，退出并落盘
+  # 第 2 帧冷启动：>0 时按 speed*dt 给，取代下面固定的 bootstrap_step2_t*（实时 dt 不定长）
+  bootstrap_speed_x: 0.0
+  bootstrap_speed_y: 0.0
+  bootstrap_speed_z: 0.0
   max_steps: 10000
   max_frames: 0      # 0=跑完 sequence；>0 时处理完该帧后退出（调试用，如 100）
   dump_frame: 0        # 0=不保存；>0 时导出 matched/unmatched/scan_world + 远距 cluster 漏斗统计

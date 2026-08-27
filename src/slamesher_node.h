@@ -13,6 +13,11 @@
 #include <sensor_msgs/point_cloud_conversion.h>
 #include <pcl/registration/icp.h>
 #include <unordered_set>
+#include <atomic>
+#include <condition_variable>
+#include <mutex>
+#include <shared_mutex>
+#include <thread>
 class Parameter{
     //algorithm parameter
 public:
@@ -204,10 +209,35 @@ public:
     double gnd_col_seed_h_up{0.4};  // 相对本列 seed_z 最大上抬（米）；挡住车身抬高假地面
     double gnd_normal_z_min{0.5};   // 拟合曲面法向 |z| 最小值；更小则视为墙面丢弃
 
+    // ══════════ 运行模式 ══════════
+    // 0 = KITTI 离线逐帧：单线程，配准完等建图完再取下一帧（原行为，数值逐位不变）
+    // 1 = rosbag/在线实时：建图独立线程，主线程只做配准并立即出里程计，追不上则丢帧
+    int    run_mode{0};
+    // 实时模式：接收缓冲里滞后帧数超过此值就丢到只剩最新；<=0 = 不丢帧（严格 FIFO）
+    int    max_lag_frames{1};
+    // 点云接收缓冲上限（帧）；超出时在回调里丢最旧，防止无界增长吃内存
+    int    pcl_buffer_max{20};
+    // 实时模式建图周期（秒）：距上次建图超过此值就建一次；<=0 回退到按处理帧计数的
+    // map_update_interval / ground_build_interval。丢帧时帧计数与墙上时间脱钩，
+    // 按时间调度才能让地图更新率与 CPU 负载解耦。
+    double map_build_period{0.0};
+    // 建图线程 OMP 线程数；<=0 用 num_thread。两条链并发时总线程数应 <= 核数，
+    // 否则建图的 8 线程会和配准抢核，把关键路径拖长。
+    int    num_thread_map{0};
+    // 实时模式：按帧间隔 dt 缩放匹配门与运动先验 sigma。丢帧后单帧位移成倍增长，
+    // 固定的 0.8 m 门和 0.3 m 沿轨先验会分别导致掉匹配和把步长锁死在外推值上。
+    bool   scale_gates_by_dt{true};
+    // dt 缩放系数的上限（下限取其倒数），防止时间戳抖动把门放飞
+    double dt_scale_max{4.0};
+    // 实时模式：已收到过数据后再连续这么多秒没新帧，就认为 bag 播完，退出并落盘
+    double realtime_idle_timeout{5.0};
+
     double correction_x{0}, correction_y{0}, correction_z{0},
     correction_roll_degree{0}, correction_pitch_degree{0}, correction_yaw_degree{0};
     // 无 odom 时 step2 冷启动：相对上一帧的 Velodyne 系平移先验 (m)
     double bootstrap_step2_tx{0.5}, bootstrap_step2_ty{0.0}, bootstrap_step2_tz{0.0};
+    // >0 时取代上面的固定位移，按 bootstrap_speed * dt 给（实时模式 dt 不固定）
+    double bootstrap_speed_x{0.0}, bootstrap_speed_y{0.0}, bootstrap_speed_z{0.0};
     double test_param;
     double eigen_1, eigen_2, eigen_3;//PCA
 
@@ -258,6 +288,11 @@ public:
     int step = 0;
     //transformPoints
     std::vector<Transf> T_seq;
+    // 与 T_seq 同下标的帧时间戳（秒）。实时模式丢帧后帧间隔不再恒定，匀速外推
+    // 必须按 dt 缩放，否则丢一帧就少给一半位移。离线模式里全是 0，不参与计算。
+    std::vector<double> t_seq;
+    double cur_scan_time{0};      // 当前正在处理的帧时间戳，updatePose 时写入 t_seq
+    int    n_dropped_frames{0};   // 累计因追不上而丢弃的帧数
 
     Transf transf_odom_last  = Eigen::MatrixXd::Identity(4, 4),
            transf_odom_now   = Eigen::MatrixXd::Identity(4, 4),//used to calculate incremental transformation between two odometry frames
@@ -270,6 +305,8 @@ public:
     Eigen::Matrix3d imu_rot;
     Eigen::Vector3d g;
     //lidar
+    // 实时模式下回调跑在 AsyncSpinner 线程上，与主线程的取帧并发，必须加锁
+    std::mutex pcl_buff_mutex;
     std::deque<sensor_msgs::PointCloud2> pcl_msg_buff_deque;
     sensor_msgs::PointCloud2 pcl_msg_buff;
 
@@ -349,6 +386,69 @@ public:
     void process();
 
 private:
+    // run_mode==0：原来的单线程逐帧流程，配准与建图串行（数值与改造前逐位一致）
+    void processOffline();
+    // run_mode==1：建图独立线程，主线程只做配准并立即出里程计；追不上则丢帧
+    void processRealtime();
+
+    // ══════════ 地图并发保护 ══════════
+    // 配准全程持 shared_lock：其间 BSplineMap::entries_ 不会扩容（getEntry 返回的裸
+    // 指针不失效）、voxel_index_ 不会 rehash、GroundCell::surf 不会被 refit 替换掉
+    // （queryNearest 返回的裸 BSplineSurface* 不会悬垂）。
+    // 建图线程只在「提交入库」这一小段取 unique_lock，昂贵的曲面拟合全在锁外。
+    std::shared_mutex map_mtx_;
+
+    // ══════════ 建图线程 ══════════
+    // 交给建图线程的一帧输入。scan 用 shared_ptr 传递，避免每帧拷贝 ~2MB 点云。
+    struct MapJob {
+        EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+        pcl::PointCloud<pcl::PointXYZ>::Ptr scan;
+        std::vector<uint8_t> pw_ground_mask;
+        Transf T_world = Eigen::Matrix4d::Identity();
+        int    step = 0;
+        bool   force = false;   // true = 无视 interval 直接建（按时间调度时用）
+    };
+    std::thread             map_thread_;
+    std::mutex              map_job_mutex_;
+    std::condition_variable map_job_cv_;
+    // 单槽队列：建图本来就是每隔若干帧一次，忙时直接跳过本次而不是排队，
+    // 排队只会让提交的位姿越来越旧。
+    std::shared_ptr<MapJob> pending_job_;
+    std::atomic<bool>       map_busy_{false};
+    std::atomic<bool>       map_thread_stop_{false};
+    int                     n_map_skipped_{0};
+
+    // 建图线程主体：自带一整套 RangeImageProcessor（不能和配准共用，见 runMapBuild）
+    void mapThreadLoop(BSplineMap& bspline_map, MultiResGroundMap& mr_ground,
+                       double match_dist_thr, double ground_z_min, double ground_z_max);
+    // 把一帧交给建图线程；线程仍在忙则返回 false（本次建图跳过）
+    bool submitMapJob(const pcl::PointCloud<pcl::PointXYZ>::Ptr& scan,
+                      const std::vector<uint8_t>& pw_ground_mask,
+                      const Transf& T_world, int step, bool force);
+
+    // 两种模式共用：按 yaml 构造两层地面图；跑完后统一落盘
+    MultiResGroundMap makeGroundMap() const;
+    void saveFinalOutputs(BSplineMap& bspline_map, MultiResGroundMap& mr_ground);
+
+    // 从 ROS 缓冲取一帧。max_lag_frames>0 时丢弃滞后帧只留最新（丢弃数累加到
+    // g_data.n_dropped_frames）。返回 false 表示 ros 已关闭。
+    bool fetchScanRealtime(pcl::PointCloud<pcl::PointXYZ>& scan_out, double& stamp_out);
+
+    // 一帧的公共预处理：Patchwork++ 地面分割 + 竖直角标定修正
+    void preprocessScan(pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                        std::vector<uint8_t>& pw_ground_mask);
+    // 生成配准用的近/远层 range image（排除地面点）
+    void buildRegRangeImages(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                             const std::vector<uint8_t>& pw_ground_mask,
+                             double ground_z_min, double ground_z_max,
+                             RangeImageProcessor& rp_near, RangeImageProcessor& rp_far,
+                             std::vector<bool>& obs_exclude_mask);
+    // 相对当前帧 dt 的匹配门/先验缩放系数；非实时模式恒为 1
+    double gateScaleForCurrentFrame() const;
+    // 传感器标称帧周期（秒），取所有观测到的帧间隔最小值——没丢帧时的那个间隔。
+    // 匹配门要按「当前 dt 相对标称 dt」放宽，而不是按相邻两帧的比值。
+    double nominal_dt_{0.0};
+
     struct RegMatch {
         Eigen::Vector3d p_local;
         Eigen::Vector3d p_world;
@@ -382,7 +482,9 @@ private:
                              double ground_z_max,
                              const RangeImageProcessor& rp_near,
                              const RangeImageProcessor& rp_far,
-                             bool use_far);
+                             bool use_far,
+                             // 匹配门与运动先验 sigma 的统一缩放（实时模式按 dt 给）
+                             double gate_scale = 1.0);
 
     // 障碍/地面匹配：对 surf_to_pts 中每张候选面做 footprint 并把过门的对应写入 out。
     // prev_indices/prev_uv 是跨迭代的足点热启动缓存（同一批下标复用上次收敛的 uv），
@@ -407,9 +509,19 @@ private:
                            std::vector<RegMatch>& out);
 
     // 统一建图：近/远两层 range image 分割 → z 分流地面/障碍 → 按各自 interval 决定是否建图
+    //
+    // build_step 而不是 g_data.step：异步建图时本函数处理的是若干毫秒前的那一帧，
+    //   而 g_data.step 已经被主线程推进了。所有 interval 判据、created_step、dump
+    //   条件都必须用交接过来的 step。
+    // force_build 为 true 时无视 map_update_interval / ground_build_interval 直接建
+    //   （实时模式改用 map_build_period 按时间调度）。
+    // range_proc / range_proc_far 必须是建图链专属实例：配准侧全程读自己那份
+    //   range_image_ 采障碍候选点，而本函数会用不同的点集和 z 范围重新生成它。
     void runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                      const std::vector<uint8_t>& pw_ground_mask,
                      const Transf& T_world,
+                     int build_step,
+                     bool force_build,
                      RangeImageProcessor& range_proc,
                      RangeImageProcessor& range_proc_far,
                      RangeImageProcessor& range_proc_gnd,
@@ -429,7 +541,7 @@ private:
     // 地面控制点：gnd_controls/<layer>_<ix>_<iy>.txt，与障碍 controls/ 同一世界系 xyz
     void saveGroundControlsToTxt(const MultiResGroundMap& mr_ground) const;
     // dump_gnd_scan 区间内：每次建完地面，累计快照到 all_surfaces/all_surfaces_<step>.txt
-    void dumpGndAllSurfacesAtBuild(const MultiResGroundMap& mr_ground) const;
+    void dumpGndAllSurfacesAtBuild(const MultiResGroundMap& mr_ground, int build_step) const;
     void saveControlPointsToTxt(const BSplineMap& bspline_map,
                                 bool save_surface_samples,
                                 int step_begin = 0,

@@ -132,31 +132,37 @@ public:
         return n_fit;
     }
 
-    // 仅重拟合本帧触及的格（OMP 并行 apply，串行写回曲面）
-    int refitCells(const std::vector<GroundCellKey>& keys, int n_threads = 1)
+    // 一个格的拟合任务。prepare 产出、fit 填充、commit 消费。
+    struct GndRefitTask {
+        GroundCellKey key;
+        pcl::PointCloud<pcl::PointXYZ>::Ptr cloud;
+        std::shared_ptr<BSplineSurface> surf;
+        bool ok = false;
+    };
+
+    // 阶段 A（需与 addPoints / commitRefit 互斥）：挑出要拟合的格，把点云快照出来。
+    // 快照之后 fit 阶段就不再碰 cells_，因此可以在锁外跑。
+    std::vector<GndRefitTask> prepareRefit(const std::vector<GroundCellKey>& keys) const
     {
-        // A: 串行收集需要拟合的格及下采样点云
-        struct GndTask {
-            GroundCellKey key;
-            pcl::PointCloud<pcl::PointXYZ>::Ptr cloud;
-            std::shared_ptr<BSplineSurface> surf;
-            bool ok = false;
-        };
-        std::vector<GndTask> tasks;
+        std::vector<GndRefitTask> tasks;
         tasks.reserve(keys.size());
         for (const auto& k : keys) {
             auto it = cells_.find(k);
             if (it == cells_.end() || !it->second.needs_refit) continue;
             const int n = (int)it->second.pts.size();
             if (n < min_pts_) continue;
-            GndTask t;
+            GndRefitTask t;
             t.key   = k;
             t.cloud = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
             subsampleToCloud(it->second.pts, fit_max_pts_, *t.cloud);
             tasks.push_back(std::move(t));
         }
+        return tasks;
+    }
 
-        // B: OMP 并行 apply
+    // 阶段 B（无需持锁）：OMP 并行 apply。只读 num_cp_，只写各 task 自己的字段。
+    void fitRefitTasks(std::vector<GndRefitTask>& tasks, int n_threads = 1) const
+    {
         const int npar = std::max(1, n_threads);
 #pragma omp parallel for schedule(dynamic) num_threads(npar)
         for (int i = 0; i < (int)tasks.size(); ++i) {
@@ -164,8 +170,12 @@ public:
             t.surf = std::make_shared<BSplineSurface>(3, 3, num_cp_, num_cp_);
             t.ok = t.surf->apply(t.cloud, 30, 1, 1, 0.05);
         }
+    }
 
-        // C: 串行写回（不同 key 理论可并行，但 unordered_map 写不安全）
+    // 阶段 C（需持写锁）：写回曲面。替换 cell.surf 会释放旧曲面，而配准侧持有的是
+    // 裸 BSplineSurface*，所以这一步必须与配准互斥。
+    int commitRefit(std::vector<GndRefitTask>& tasks)
+    {
         int n_fit = 0;
         for (auto& t : tasks) {
             auto it = cells_.find(t.key);
@@ -177,6 +187,15 @@ public:
             ++n_fit;
         }
         return n_fit;
+    }
+
+    // 仅重拟合本帧触及的格（OMP 并行 apply，串行写回曲面）。
+    // 三阶段合并版，供不需要把拟合放到锁外的调用方使用。
+    int refitCells(const std::vector<GroundCellKey>& keys, int n_threads = 1)
+    {
+        auto tasks = prepareRefit(keys);
+        fitRefitTasks(tasks, n_threads);
+        return commitRefit(tasks);
     }
 
     // 配准：在候选曲面中取 footprint 距离最近的一张

@@ -8,6 +8,8 @@
 #include <cmath>
 #include <omp.h>
 #include <sstream>
+#include <unistd.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <unordered_set>
 extern Parameter param;//in SLAMesh node
@@ -475,6 +477,31 @@ bool RangeImageProcessor::getPointCloud(pcl::PointCloud<pcl::PointXYZ> & pcl_got
         }
     }
     else{
+        // 在线（rosbag / 实机）严格 FIFO 取一帧，不丢帧：配准慢于数据率时只是滞后，
+        // 结果与离线逐帧一致。实时模式走 SLAMesher::fetchScanRealtime，那里才丢帧。
+        // 本分支跑在 run_mode==0 下，回调由下面的 spinOnce 在同一线程触发，加锁是
+        // 为了与实时模式共用同一个缓冲而不必分叉。
+        bool waited = false;
+        while(ros::ok()){
+            {
+                std::lock_guard<std::mutex> lk(g_data.pcl_buff_mutex);
+                if(!g_data.pcl_msg_buff_deque.empty()) break;
+            }
+            if(!waited){
+                ROS_INFO("Waiting for point cloud on /velodyne_points ...");
+                waited = true;
+            }
+            ros::spinOnce();
+            usleep(500);
+        }
+        if(!ros::ok()) return false;
+        {
+            std::lock_guard<std::mutex> lk(g_data.pcl_buff_mutex);
+            g_data.pcl_msg_buff = g_data.pcl_msg_buff_deque.front();
+            g_data.pcl_msg_buff_deque.pop_front();
+        }
+        pcl::fromROSMsg(g_data.pcl_msg_buff, *pcl_raw_ptr);
+        g_data.cur_scan_time = g_data.pcl_msg_buff.header.stamp.toSec();
     }
     if(voxel_filter_size > 0){
         *pcl_filtered_ptr = pclVoxelFilter(pcl_raw_ptr, voxel_filter_size);

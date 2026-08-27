@@ -136,6 +136,44 @@ inline Transf makePoseFromXYZRPY(double x, double y, double z,
     return T;
 }
 
+// 把一个相对变换按时间比例 s 缩放：平移线性缩放，旋转按轴角缩放。
+// 匀速外推假设帧间隔恒定，而实时模式一旦丢帧，dt 就从 0.1 s 变成 0.2/0.3 s，
+// 不缩放等于只给了应有位移的一半，初值直接差出米级。
+inline Transf scaleRelativeTransf(const Transf& dT, double s)
+{
+    if (s == 1.0) return dT;
+    const Eigen::AngleAxisd aa(Eigen::Matrix3d(dT.block<3, 3>(0, 0)));
+    Transf out = Eigen::Matrix4d::Identity();
+    out.block<3, 3>(0, 0) = Eigen::Matrix3d(Eigen::AngleAxisd(aa.angle() * s, aa.axis()));
+    out.block<3, 1>(0, 3) = dT.block<3, 1>(0, 3) * s;
+    return out;
+}
+
+// 当前帧与上一个「已处理」帧的时间间隔（秒）。离线模式时间戳恒为 0，返回 0 表示不可用。
+inline double frameDtNow()
+{
+    const int s = g_data.step;
+    if (s < 1 || (int)g_data.t_seq.size() < s) return 0.0;
+    const double t_prev = g_data.t_seq[s - 1];
+    if (t_prev <= 0.0 || g_data.cur_scan_time <= 0.0) return 0.0;
+    const double dt = g_data.cur_scan_time - t_prev;
+    return dt > 0.0 ? dt : 0.0;
+}
+
+// 匀速外推的时间缩放系数 dt_now / dt_prev，夹在 [1/dt_scale_max, dt_scale_max]。
+// 只在 run_mode==1 下生效；离线模式恒返回 1.0，保证数值与改造前逐位一致。
+inline double frameDtScale()
+{
+    if (param.run_mode != 1) return 1.0;
+    const int s = g_data.step;
+    if (s < 3 || (int)g_data.t_seq.size() < s) return 1.0;
+    const double dt_now  = frameDtNow();
+    const double dt_prev = g_data.t_seq[s - 1] - g_data.t_seq[s - 2];
+    if (dt_now <= 0.0 || dt_prev <= 0.0) return 1.0;
+    const double hi = std::max(1.0, param.dt_scale_max);
+    return std::min(std::max(dt_now / dt_prev, 1.0 / hi), hi);
+}
+
 // KITTI 的 HDL-64 有约 0.205° 的竖直角标定偏差：同一块地面在不同距离上被测出
 // 不同高度，误差正比于水平距离（40 m 处 0.14 m）。地图里存的是这块地面更远时的
 // 观测，当前帧在更近处看它，两者之差正比于这期间的距离变化，也就是正比于行驶
@@ -1236,6 +1274,7 @@ void Log::updatePose(Transf & now_slam_transf){
 
     //store Tsep
     T_seq.push_back(now_slam_transf);
+    t_seq.push_back(cur_scan_time);
     Point tmp_pose;
     tmp_pose = trans3Dpoint(0, 0, 0, now_slam_transf);
     pose.col(step) = tmp_pose;
@@ -1524,6 +1563,26 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/bootstrap_step2_tx", bootstrap_step2_tx, 0.5);
     nh.param("slamesher/bootstrap_step2_ty", bootstrap_step2_ty, 0.0);
     nh.param("slamesher/bootstrap_step2_tz", bootstrap_step2_tz, 0.0);
+    nh.param("slamesher/bootstrap_speed_x",  bootstrap_speed_x,  0.0);
+    nh.param("slamesher/bootstrap_speed_y",  bootstrap_speed_y,  0.0);
+    nh.param("slamesher/bootstrap_speed_z",  bootstrap_speed_z,  0.0);
+    nh.param("slamesher/run_mode",           run_mode,           0);
+    nh.param("slamesher/max_lag_frames",     max_lag_frames,     1);
+    nh.param("slamesher/pcl_buffer_max",     pcl_buffer_max,     20);
+    nh.param("slamesher/map_build_period",   map_build_period,   0.0);
+    nh.param("slamesher/num_thread_map",     num_thread_map,     0);
+    nh.param("slamesher/scale_gates_by_dt",  scale_gates_by_dt,  true);
+    nh.param("slamesher/dt_scale_max",       dt_scale_max,       4.0);
+    nh.param("slamesher/realtime_idle_timeout", realtime_idle_timeout, 5.0);
+    std::cout << "run_mode: " << run_mode
+              << (run_mode == 1 ? " (REALTIME: async map thread, frame dropping)"
+                                : " (OFFLINE: lockstep frame-by-frame)")
+              << "  max_lag_frames=" << max_lag_frames
+              << "  pcl_buffer_max=" << pcl_buffer_max
+              << "  map_build_period=" << map_build_period << "s"
+              << "  num_thread_map=" << (num_thread_map > 0 ? num_thread_map : num_thread)
+              << "  scale_gates_by_dt=" << (scale_gates_by_dt ? "on" : "off")
+              << "  dt_scale_max=" << dt_scale_max << std::endl;
     std::cout << "cluster_ds: min_pts=" << cluster_ds_min_pts
               << " target_max=" << cluster_ds_target_max
               << (cluster_ds_target_max > 0 ? " (range-image 2D downsample on)" : " (off)") << std::endl;
@@ -1641,7 +1700,9 @@ Transf SLAMesher::getOdom(){
             g_data.transf_odom_now =  state2quat2trans3(g_data.odom_offline[g_data.step + step_offset]);}
         else{
             //use odometry from topic
-            ros::spinOnce();
+            // 实时模式下 AsyncSpinner 已在另一线程抽同一个全局回调队列，这里再
+            // spinOnce 就是两个线程并发消费同一个队列。
+            if (param.run_mode != 1) ros::spinOnce();
         }
 
         odom_now = g_data.transf_odom_now;
@@ -1658,16 +1719,30 @@ Transf SLAMesher::getOdom(){
             odom = g_data.T_seq[g_data.step - 1];
         }
         else if (g_data.step == 2) {
-            // 第二帧无运动历史：用固定前进平移作初值（Velodyne +X）
+            // 第二帧无运动历史：用固定前进平移作初值（Velodyne +X）。
+            // bootstrap_speed_* > 0 时按速度×dt 给，适配实时模式不固定的帧间隔。
             Transf dT = Eigen::Matrix4d::Identity();
-            dT(0, 3) = param.bootstrap_step2_tx;
-            dT(1, 3) = param.bootstrap_step2_ty;
-            dT(2, 3) = param.bootstrap_step2_tz;
+            const double dt = frameDtNow();
+            const bool use_speed = (param.bootstrap_speed_x != 0.0 ||
+                                    param.bootstrap_speed_y != 0.0 ||
+                                    param.bootstrap_speed_z != 0.0) && dt > 0.0;
+            if (use_speed) {
+                dT(0, 3) = param.bootstrap_speed_x * dt;
+                dT(1, 3) = param.bootstrap_speed_y * dt;
+                dT(2, 3) = param.bootstrap_speed_z * dt;
+            } else {
+                dT(0, 3) = param.bootstrap_step2_tx;
+                dT(1, 3) = param.bootstrap_step2_ty;
+                dT(2, 3) = param.bootstrap_step2_tz;
+            }
             odom = g_data.T_seq[g_data.step - 1] * dT;
         }
         else if (g_data.step > 2) {
-            // 匀速外推：T_{t-1} * (T_{t-2}^{-1} T_{t-1})
-            odom = g_data.T_seq[g_data.step - 1] * g_data.T_seq[g_data.step - 2].inverse() * g_data.T_seq[g_data.step - 1];
+            // 匀速外推：T_{t-1} * (T_{t-2}^{-1} T_{t-1})，增量按 dt_now/dt_prev 缩放
+            const Transf dT_prev =
+                g_data.T_seq[g_data.step - 2].inverse() * g_data.T_seq[g_data.step - 1];
+            odom = g_data.T_seq[g_data.step - 1]
+                 * scaleRelativeTransf(dT_prev, frameDtScale());
             if (param.predict_horizontal_only) {
                 // roll/pitch/z 由地面阶段求解，而地面阶段的修正量恒等于「本帧速率减
                 // 上帧速率」，对速率本身没有回复力。再对这三个自由度做匀速外推，等于
@@ -1835,8 +1910,15 @@ void SLAMesher::odomCallback(const nav_msgs::Odometry::ConstPtr & odom_msg){
 }
 void SLAMesher::pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr & pcl_msg){
     //receive point cloud
-    ROS_INFO("PointCloud seq: [%d]", pcl_msg->header.seq);
+    // 实时模式下本回调跑在 AsyncSpinner 线程，与主线程取帧并发，故加锁。
+    // 缓冲设上限：追不上时无界增长会吃掉几个 GB，且越排越旧毫无用处。
+    std::lock_guard<std::mutex> lk(g_data.pcl_buff_mutex);
     g_data.pcl_msg_buff_deque.push_back(*pcl_msg);
+    const size_t cap = param.pcl_buffer_max > 0 ? (size_t)param.pcl_buffer_max : 1;
+    while(g_data.pcl_msg_buff_deque.size() > cap){
+        g_data.pcl_msg_buff_deque.pop_front();
+        ++g_data.n_dropped_frames;
+    }
 }
 bool SLAMesher::visualize(Map & map_glb, Map & map_now, int option){
     //visualization. some types may be a heavy load for SLAMesh or rviz.
@@ -2178,8 +2260,21 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                                     double ground_z_max,
                                     const RangeImageProcessor& rp_near,
                                     const RangeImageProcessor& rp_far,
-                                    bool use_far)
+                                    bool use_far,
+                                    double gate_scale)
 {
+    // 整帧持读锁：本函数把 getEntry 返回的 BSplineMapEntry* 和 queryNearest 返回的
+    // BSplineSurface* 塞进 surf_to_pts / prev_indices / prev_uv 跨迭代复用，而建图
+    // 线程的 addSurface 会让 entries_ 扩容、refit 会释放旧的地面曲面。锁住整帧比
+    // 把这些容器都改成 shared_ptr 更省事，代价只是建图提交要等本帧结束。
+    std::shared_lock<std::shared_mutex> map_lk(map_mtx_);
+
+    // 丢帧后单帧位移成倍增长，外推残差同比放大；固定 0.8 m 的门会把本该匹配上的
+    // 对应全判成外点。gate_scale 由调用方按 dt 给出，非实时模式恒为 1。
+    if (gate_scale != 1.0) match_dist_thr *= gate_scale;
+    const double obs_thr_last_eff      = param.obs_thr_last      * gate_scale;
+    const double obs_prior_sigma_xy_eff = param.obs_prior_sigma_xy * gate_scale;
+
     Transf T_curr = T_guess;
     double delta_scale = 100.0;
     int prev_match_count = -1;
@@ -2214,11 +2309,11 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         // 首轮用大门吃掉外推残差，之后几何收紧到 obs_thr_last 剔外点（动态车辆、
         // 植被、鬼面）。原实现四轮恒定 0.8 m，末轮仍在吸收明显不该要的对应。
         cur_match_thr = match_dist_thr;
-        if (param.obs_thr_last > 0.0 && param.obs_thr_last < match_dist_thr
+        if (obs_thr_last_eff > 0.0 && obs_thr_last_eff < match_dist_thr
             && max_iters > 1) {
             const double t = (double)std::min(iter, max_iters - 1) / (max_iters - 1);
             cur_match_thr = match_dist_thr
-                          * std::pow(param.obs_thr_last / match_dist_thr, t);
+                          * std::pow(obs_thr_last_eff / match_dist_thr, t);
         }
         std::unordered_map<int, std::vector<int>> obs_surf_to_pts;
         const int col_step = std::max(1, param.obs_rimg_col_step);
@@ -2375,7 +2470,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 loss, xy_yaw);
         }
 
-        if (param.obs_prior_sigma_xy > 0.0 && param.obs_prior_along_only
+        if (obs_prior_sigma_xy_eff > 0.0 && param.obs_prior_along_only
             && g_data.step >= 2) {
             const Transf& T_p = g_data.T_seq[g_data.step - 1];
             const double dx = T_guess(0, 3) - T_p(0, 3);
@@ -2385,7 +2480,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 problem.AddResidualBlock(
                     MotionPriorAlongTrack::Create(
                         T_p(0, 3), T_p(1, 3), dx / len, dy / len, len,
-                        1.0 / param.obs_prior_sigma_xy),
+                        1.0 / obs_prior_sigma_xy_eff),
                     nullptr, xy_yaw);
             }
             if (param.obs_prior_sigma_yaw > 0.0) {
@@ -2396,13 +2491,13 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                         yaw_g, 1.0 / (param.obs_prior_sigma_yaw * M_PI / 180.0)),
                     nullptr, xy_yaw);
             }
-        } else if (param.obs_prior_sigma_xy > 0.0 && param.obs_prior_sigma_yaw > 0.0) {
+        } else if (obs_prior_sigma_xy_eff > 0.0 && param.obs_prior_sigma_yaw > 0.0) {
             double r_g, p_g, yaw_g;
             matrixToRPY(T_guess.block<3, 3>(0, 0), r_g, p_g, yaw_g);
             problem.AddResidualBlock(
                 MotionPriorXYYaw::Create(
                     T_guess(0, 3), T_guess(1, 3), yaw_g,
-                    1.0 / param.obs_prior_sigma_xy,
+                    1.0 / obs_prior_sigma_xy_eff,
                     1.0 / (param.obs_prior_sigma_yaw * M_PI / 180.0)),
                 nullptr, xy_yaw);
         }
@@ -3006,6 +3101,8 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                      const std::vector<uint8_t>& pw_ground_mask,
                      const Transf& T_world,
+                     int build_step,
+                     bool force_build,
                      RangeImageProcessor& range_proc,
                      RangeImageProcessor& range_proc_far,
                      RangeImageProcessor& range_proc_gnd,
@@ -3018,11 +3115,18 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
     constexpr int    MIN_CLUSTER_PTS  = 30;
     constexpr int    MAX_NEW_SURFACES = 70;
 
-    const bool dump_clusters = (param.dump_cluster_step > 0 && g_data.step == param.dump_cluster_step);
-    const bool dump_occluded = (param.dump_occluded_step > 0 && g_data.step == param.dump_occluded_step);
-    const bool dump_far_funnel = (param.dump_frame > 0 && g_data.step == param.dump_frame);
-    const bool do_obstacle = (g_data.step == 1) || (g_data.step % param.map_update_interval  == 0);
-    const bool do_ground   = (g_data.step == 1) || (g_data.step % param.ground_build_interval == 0);
+    // 建图线程的 OMP 预算与配准分开：两条链各开 num_thread 个线程会在核数上超订，
+    // 把里程计关键路径拖长。<=0 时沿用 num_thread（离线单线程下等价于原行为）。
+    const int n_map_threads = std::max(1, param.num_thread_map > 0 ? param.num_thread_map
+                                                                  : param.num_thread);
+
+    const bool dump_clusters = (param.dump_cluster_step > 0 && build_step == param.dump_cluster_step);
+    const bool dump_occluded = (param.dump_occluded_step > 0 && build_step == param.dump_occluded_step);
+    const bool dump_far_funnel = (param.dump_frame > 0 && build_step == param.dump_frame);
+    const bool do_obstacle = force_build || (build_step == 1)
+                          || (build_step % param.map_update_interval  == 0);
+    const bool do_ground   = force_build || (build_step == 1)
+                          || (build_step % param.ground_build_interval == 0);
     if (!do_obstacle && !do_ground && !dump_clusters && !dump_occluded && !dump_far_funnel) return;
 
     TicToc t_upd;
@@ -3033,7 +3137,8 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
     const Eigen::Vector3d t_w = T_world.block<3,1>(0,3);
 
     int n_added_gnd = 0, n_added_obs = 0;
-    const bool profile_frame1_apply = (g_data.step == 1);
+    // apply profile 用的是进程级全局变量，多线程下不可用；实时模式一律关掉。
+    const bool profile_frame1_apply = (build_step == 1 && param.run_mode != 1);
     if (profile_frame1_apply) {
         BSplineSurface::setApplyProfileLogPath(
             std::string(kBsplineBuildDir) + "/frame1_apply_profile.txt");
@@ -3140,21 +3245,35 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                 static_cast<float>(pw.x()), static_cast<float>(pw.y()), static_cast<float>(pw.z())));
         }
 
-        if (g_data.step == 1)
+        if (build_step == 1)
             saveFrame1GroundPoints(gnd_lidar_pts);
 
         if (!cloud_gnd_world.empty()) {
-            mr_ground.addPoints(cloud_gnd_world, g_data.step);
             if (profile_frame1_apply)
                 BSplineSurface::setApplyProfileLabel("gnd");
-            n_added_gnd = mr_ground.refitAll(param.num_thread);
+            // 三段式：投格/挑格（写锁）→ 并行拟合（无锁，这是耗时主体）→ 写回（写锁）。
+            // 写回会替换 GroundCell::surf 并释放旧曲面，而配准侧持有裸指针，必须互斥。
+            MultiResGroundMap::RefitBatch gnd_batch;
+            {
+                std::unique_lock<std::shared_mutex> lk(map_mtx_);
+                mr_ground.addPoints(cloud_gnd_world, build_step);
+                gnd_batch = mr_ground.prepareRefitAll();
+            }
+            mr_ground.fitRefitAll(gnd_batch, n_map_threads);
+            {
+                std::unique_lock<std::shared_mutex> lk(map_mtx_);
+                n_added_gnd = mr_ground.commitRefitAll(gnd_batch);
+            }
         }
         // dump 区间内：每次建完地面，写累计 all_surfaces_<step>.txt（含此前建图）
-        dumpGndAllSurfacesAtBuild(mr_ground);
+        {
+            std::shared_lock<std::shared_mutex> lk(map_mtx_);
+            dumpGndAllSurfacesAtBuild(mr_ground, build_step);
+        }
     }
 
     if (dump_clusters) {
-        saveClusterFilterStatsTxt(scan_local, g_data.step, ground_z_min, ground_z_max,
+        saveClusterFilterStatsTxt(scan_local, build_step, ground_z_min, ground_z_max,
                                   split_dist, range_proc, range_proc_far);
     }
 
@@ -3219,7 +3338,7 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                     ++n_in_far;
                 }
             }
-            std::cout << "  [DumpOccluded] step=" << g_data.step
+            std::cout << "  [DumpOccluded] step=" << build_step
                       << " near: occluded=" << occ.size() << " rangeimage=" << n_in
                       << (use_far_layer ? " far: occluded=" + std::to_string(range_proc_far.getOccludedPoints().size())
                                               + " rangeimage=" + std::to_string(n_in_far) : "")
@@ -3253,7 +3372,7 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
             param.cluster_ds_target_max,
             far_min);
         if (dump_far_funnel) {
-            saveFarClusterPipelineAuditTxt(scan_local, g_data.step, T_world,
+            saveFarClusterPipelineAuditTxt(scan_local, build_step, T_world,
                                            ground_z_min, ground_z_max, far_z_floor,
                                            split_dist, far_min,
                                            range_proc_far, seg_far_pre_ds, seg_far);
@@ -3287,7 +3406,9 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
         const int n_loop = do_obstacle ? (int)s.clusters.size() : 0;
         std::vector<ObsBuildTask> per_cid(n_loop);
         std::vector<char> cid_ready(n_loop, 0);
-        const int n_omp_a = std::max(1, param.num_thread);
+        const int n_omp_a = n_map_threads;
+        // 只读地图（queryCandidates / getEntry / findFootPrint），与配准可并发
+        std::shared_lock<std::shared_mutex> read_lk(map_mtx_);
 #pragma omp parallel for schedule(dynamic) num_threads(n_omp_a)
         for (int cid = 0; cid < n_loop; cid++) {
             const auto& pixels = s.clusters[cid];
@@ -3378,16 +3499,17 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
             per_cid[cid]  = std::move(t);
             cid_ready[cid] = 1;
         }
+        read_lk.unlock();  // 后面不再读地图，提前放开，别挡住别的写者
 
         // 按 cid 升序收集，额满即停：与串行版的接受集合完全相同
         for (int cid = 0; cid < (int)cid_ready.size(); ++cid) {
             if (!cid_ready[cid]) continue;
-            if (g_data.step != 1 && (n_added_obs + (int)tasks.size()) >= MAX_NEW_SURFACES) break;
+            if (build_step != 1 && (n_added_obs + (int)tasks.size()) >= MAX_NEW_SURFACES) break;
             tasks.push_back(std::move(per_cid[cid]));
         }
 
         // ── 阶段 B：OMP 并行 apply（每个 task 独立，无共享写） ──
-        const int n_omp = std::max(1, param.num_thread);
+        const int n_omp = n_map_threads;
         // Frame1Apply profile 在并行区不可用（全局变量），先暂停
         const bool had_profile = profile_frame1_apply && do_obstacle;
         if (had_profile) BSplineSurface::setApplyProfileLogPath("");
@@ -3400,14 +3522,17 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                                  param.obs_fit_eps);
         }
 
-        // ── 阶段 C：串行入库 ──
+        // ── 阶段 C1：决定入库内容（含拆分重拟合），不碰地图，无需持锁 ──
+        struct ObsInsert {
+            std::shared_ptr<BSplineSurface> surf;
+            pcl::PointCloud<pcl::PointXYZ>::Ptr cloud;
+        };
+        std::vector<ObsInsert> to_insert;
+        to_insert.reserve(tasks.size());
         int n_fit_rej = 0, n_split_ok = 0, n_split_keep = 0;
         auto addObsSurf = [&](std::shared_ptr<BSplineSurface> surf,
                               pcl::PointCloud<pcl::PointXYZ>::Ptr cloud) {
-            bspline_map.addSurface(surf, cloud, /*is_ground=*/false, g_data.step,
-                                   param.obs_map_replace_frac, param.obs_map_voxel_owner);
-            obs_fit_dists.push_back(surf->getFitMeanDist());
-            ++n_added_obs;
+            to_insert.push_back({std::move(surf), std::move(cloud)});
         };
         auto fitDistOf = [&](const std::shared_ptr<BSplineSurface>& surf) {
             return param.obs_fit_weight_adj ? surf->getFitMeanDistAdj()
@@ -3473,6 +3598,27 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
             }
             addObsSurf(t.surf, t.cloud_world);
         }
+
+        // ── 阶段 C2：串行入库（写锁）。addSurface 会让 entries_ 扩容、voxel_index_
+        // rehash，配准侧的裸 entry 指针与哈希表遍历都会被打断，必须独占。
+        // 这段只做体素索引写入，是毫秒级的，昂贵的拟合都留在了上面的无锁区。
+        {
+            TicToc t_wait;
+            std::unique_lock<std::shared_mutex> write_lk(map_mtx_);
+            // 等锁时间 ≈ 被阻塞的配准帧剩余时长。持续偏高说明该调大
+            // map_build_period 或减 num_thread_map。
+            const double wait_ms = t_wait.toc();
+            if (wait_ms > 30.0)
+                std::cout << "  [MapBuild] waited " << wait_ms
+                          << " ms for map write lock" << std::endl;
+            for (auto& ins : to_insert) {
+                bspline_map.addSurface(ins.surf, ins.cloud, /*is_ground=*/false, build_step,
+                                       param.obs_map_replace_frac, param.obs_map_voxel_owner);
+                obs_fit_dists.push_back(ins.surf->getFitMeanDist());
+                ++n_added_obs;
+            }
+        }
+
         if (n_fit_rej > 0)
             std::cout << "  [obs fit-rej] n=" << n_fit_rej
                       << " thr=" << param.obs_fit_max_dist << std::endl;
@@ -3512,21 +3658,25 @@ void SLAMesher::runMapBuild(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
                     n_far_clusters = (int)seg_far.clusters.size();
                 }
             }
-            std::cout << "  [DumpCluster] step=" << g_data.step
+            std::cout << "  [DumpCluster] step=" << build_step
                       << " near_clusters=" << seg.clusters.size()
                       << (use_far_layer ? " far_clusters=" + std::to_string(n_far_clusters) : "")
                       << " -> " << cluster_dir << "/ (world frame)" << std::endl;
         }
     }
 
-    std::cout << "  [MapBuild] step=" << g_data.step
-              << " near_clusters=" << seg.clusters.size()
-              << (use_far_layer ? " far_clusters=" + std::to_string(seg_far.clusters.size()) : "")
-              << " +gnd_cells_refit=" << n_added_gnd << " +obs=" << n_added_obs
-              << " obs_total=" << bspline_map.size()
-              << " alive=" << bspline_map.aliveSurfaceCount()
-              << " retired=" << bspline_map.retiredCount()
-              << " (" << t_upd.toc() << " ms)" << std::endl;
+    {
+        // size/alive/retired 都要遍历 entries_，与建图写入互斥
+        std::shared_lock<std::shared_mutex> lk(map_mtx_);
+        std::cout << "  [MapBuild] step=" << build_step
+                  << " near_clusters=" << seg.clusters.size()
+                  << (use_far_layer ? " far_clusters=" + std::to_string(seg_far.clusters.size()) : "")
+                  << " +gnd_cells_refit=" << n_added_gnd << " +obs=" << n_added_obs
+                  << " obs_total=" << bspline_map.size()
+                  << " alive=" << bspline_map.aliveSurfaceCount()
+                  << " retired=" << bspline_map.retiredCount()
+                  << " (" << t_upd.toc() << " ms)" << std::endl;
+    }
 
     // 新入库障碍面自身的平均点到面距离分布（米）。传感器测距噪声约 0.02 m，
     // 超出部分是拟合/几何误差，直接进配准残差。
@@ -3699,12 +3849,13 @@ void SLAMesher::saveGroundControlsToTxt(const MultiResGroundMap& mr_ground) cons
               << " files in " << out_dir << std::endl;
 }
 
-void SLAMesher::dumpGndAllSurfacesAtBuild(const MultiResGroundMap& mr_ground) const
+void SLAMesher::dumpGndAllSurfacesAtBuild(const MultiResGroundMap& mr_ground,
+                                          int build_step) const
 {
     if (param.dump_gnd_scan_begin <= 0
         || param.dump_gnd_scan_end < param.dump_gnd_scan_begin
-        || g_data.step < param.dump_gnd_scan_begin
-        || g_data.step > param.dump_gnd_scan_end) {
+        || build_step < param.dump_gnd_scan_begin
+        || build_step > param.dump_gnd_scan_end) {
         return;
     }
     const std::filesystem::path dir =
@@ -3718,7 +3869,7 @@ void SLAMesher::dumpGndAllSurfacesAtBuild(const MultiResGroundMap& mr_ground) co
     }
     // 累计快照：当前地面地图全量采样（含此前各次建图结果）
     const std::string out =
-        (dir / ("all_surfaces_" + std::to_string(g_data.step) + ".txt")).string();
+        (dir / ("all_surfaces_" + std::to_string(build_step) + ".txt")).string();
     saveGndSurfacesToTxt(mr_ground, out);
 }
 
@@ -3879,12 +4030,9 @@ void SLAMesher::saveControlPointsToTxt(const BSplineMap& bspline_map,
     }
 }
 
-void SLAMesher::process(){
-    TicToc t_whole;
-
-    // ========== 全局地图 & 工具初始化 ==========
-    BSplineMap bspline_map(param.grid);
-    MultiResGroundMap mr_ground({
+MultiResGroundMap SLAMesher::makeGroundMap() const
+{
+    return MultiResGroundMap({
         // 层 0：细格（精细，近处为主）
         {param.ground_cell_size,
          param.ground_cell_min_pts,
@@ -3908,6 +4056,211 @@ void SLAMesher::process(){
          param.gnd_normal_z_min,
          param.ground_cell_z_filter}
     });
+}
+
+void SLAMesher::preprocessScan(pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                               std::vector<uint8_t>& pw_ground_mask)
+{
+    // 地面分割每帧只跑一次，建图链与配准链共用同一份 mask
+    pw_ground_mask.clear();
+    if (param.use_patchwork_ground) {
+        TicToc t_pw;
+        patchwork_.estimateGround(scan_local, pw_ground_mask);
+        const int n_gnd = (int)std::count(pw_ground_mask.begin(), pw_ground_mask.end(),
+                                          uint8_t(1));
+        std::cout << "  [Patchwork++] ground=" << n_gnd << "/" << scan_local.size()
+                  << "  sensor_h=" << patchwork_.sensorHeight()
+                  << "  " << t_pw.toc() << " ms" << std::endl;
+    }
+
+    // 竖直角标定修正：必须在建 range image / 配准 / 建图之前。原地改写，
+    // 下标不变，pw_ground_mask 仍然对齐。ground_only 时只动地面点，障碍链
+    // 拿到的仍是原始几何（runMapBuild 按 !ground_mask 取障碍点）。
+    if (param.scan_correct_deg != 0.0) {
+        const bool gnd_only = param.scan_correct_ground_only
+                           && !pw_ground_mask.empty();
+        correctScanCalib(scan_local, param.scan_correct_deg * M_PI / 180.0,
+                         gnd_only ? &pw_ground_mask : nullptr);
+    }
+}
+
+void SLAMesher::buildRegRangeImages(const pcl::PointCloud<pcl::PointXYZ>& scan_local,
+                                    const std::vector<uint8_t>& pw_ground_mask,
+                                    double ground_z_min, double ground_z_max,
+                                    RangeImageProcessor& rp_near, RangeImageProcessor& rp_far,
+                                    std::vector<bool>& obs_exclude_mask)
+{
+    // 为配准生成 range image：排除地面点，仅剩余点进障碍链。
+    // 有 Patchwork++ mask 时按 mask 排除，与 runMapBuild 建障碍面所用的点集
+    // （!ground_mask）逐点一致；否则回退 z 带排除（原行为）。
+    const double split = param.range_image_split;
+    const bool use_far = (split > 0.0);
+    const double far_z_floor = farLayerZFloor(ground_z_min);
+    const bool use_mask = param.obs_reg_use_pw_mask && !pw_ground_mask.empty();
+    if (use_mask) {
+        obs_exclude_mask.assign(scan_local.size(), false);
+        for (size_t i = 0; i < obs_exclude_mask.size(); ++i)
+            obs_exclude_mask[i] = (i < pw_ground_mask.size() && pw_ground_mask[i] != 0);
+    }
+    const std::vector<bool>* excl = use_mask ? &obs_exclude_mask : nullptr;
+    rp_near.generateRangeImage(scan_local, ground_z_min, ground_z_max, true,
+                               0.0, use_far ? split : 1e9, ground_z_min, excl);
+    if (use_far)
+        rp_far.generateRangeImage(scan_local, ground_z_min, ground_z_max, true,
+                                  split, 1e9, far_z_floor, excl);
+}
+
+double SLAMesher::gateScaleForCurrentFrame() const
+{
+    if (param.run_mode != 1 || !param.scale_gates_by_dt) return 1.0;
+    const double dt = frameDtNow();
+    if (dt <= 0.0 || nominal_dt_ <= 0.0) return 1.0;
+    const double hi = std::max(1.0, param.dt_scale_max);
+    // 只放宽不收紧：dt 等于标称周期时保持原门限，从而与离线调参结果一致
+    return std::min(std::max(dt / nominal_dt_, 1.0), hi);
+}
+
+bool SLAMesher::fetchScanRealtime(pcl::PointCloud<pcl::PointXYZ>& scan_out, double& stamp_out)
+{
+    sensor_msgs::PointCloud2 msg;
+    bool got = false;
+    bool announced = false;
+    const double t_wait_begin = ros::WallTime::now().toSec();
+    const bool had_data = !g_data.t_seq.empty() && g_data.cur_scan_time > 0.0;
+
+    while (ros::ok() && !got) {
+        {
+            std::lock_guard<std::mutex> lk(g_data.pcl_buff_mutex);
+            auto& dq = g_data.pcl_msg_buff_deque;
+            if (!dq.empty()) {
+                // 追不上时只留最新一帧。排队处理旧帧只会让位姿输出越来越滞后于现实，
+                // 而实时里程计的价值恰恰在于「现在在哪」。
+                const int lag = param.max_lag_frames;
+                if (lag > 0 && (int)dq.size() > lag) {
+                    const int n_drop = (int)dq.size() - 1;
+                    g_data.n_dropped_frames += n_drop;
+                    std::cout << "  [Realtime] buffer lag=" << dq.size()
+                              << " frames, drop " << n_drop
+                              << " (dropped total " << g_data.n_dropped_frames << ")"
+                              << std::endl;
+                    while (dq.size() > 1) dq.pop_front();
+                }
+                msg = dq.front();
+                dq.pop_front();
+                g_data.pcl_msg_buff = msg;
+                got = true;
+            }
+        }
+        if (got) break;
+        if (!announced) {
+            std::cout << "  [Realtime] waiting for point cloud on /velodyne_points ..."
+                      << std::endl;
+            announced = true;
+        }
+        // 已经收过数据却持续断流：bag 播完了，退出去落盘而不是干等
+        if (had_data && param.realtime_idle_timeout > 0.0
+            && ros::WallTime::now().toSec() - t_wait_begin > param.realtime_idle_timeout) {
+            std::cout << "  [Realtime] no new scan for " << param.realtime_idle_timeout
+                      << " s, assume stream ended." << std::endl;
+            return false;
+        }
+        usleep(500);
+    }
+    if (!got) return false;
+
+    pcl::fromROSMsg(msg, scan_out);
+    stamp_out = msg.header.stamp.toSec();
+    return true;
+}
+
+bool SLAMesher::submitMapJob(const pcl::PointCloud<pcl::PointXYZ>::Ptr& scan,
+                             const std::vector<uint8_t>& pw_ground_mask,
+                             const Transf& T_world, int step, bool force)
+{
+    if (map_busy_.load()) return false;
+    std::lock_guard<std::mutex> lk(map_job_mutex_);
+    if (pending_job_) return false;  // 上一帧还没被取走
+    auto job = std::make_shared<MapJob>();
+    job->scan            = scan;   // 共享所有权，避免拷贝 ~2MB 点云
+    job->pw_ground_mask  = pw_ground_mask;
+    job->T_world         = T_world;
+    job->step            = step;
+    job->force           = force;
+    pending_job_ = std::move(job);
+    map_job_cv_.notify_one();
+    return true;
+}
+
+void SLAMesher::mapThreadLoop(BSplineMap& bspline_map, MultiResGroundMap& mr_ground,
+                              double match_dist_thr, double ground_z_min, double ground_z_max)
+{
+    // 建图链专属 range image：配准全程读它自己那份 range_image_ 采障碍候选点，
+    // 而这里会用 scan_obs 和完全不同的 z 范围重新生成，共用一套就是并发读写。
+    RangeImageProcessor rp_near, rp_far, rp_gnd;
+
+    while (true) {
+        std::shared_ptr<MapJob> job;
+        {
+            std::unique_lock<std::mutex> lk(map_job_mutex_);
+            map_job_cv_.wait(lk, [this] {
+                return map_thread_stop_.load() || pending_job_ != nullptr;
+            });
+            if (map_thread_stop_.load()) break;
+            job = pending_job_;
+            pending_job_.reset();
+        }
+        if (!job || !job->scan) continue;
+
+        map_busy_.store(true);
+        TicToc t_map;
+        runMapBuild(*job->scan, job->pw_ground_mask, job->T_world, job->step, job->force,
+                    rp_near, rp_far, rp_gnd, bspline_map, mr_ground,
+                    match_dist_thr, ground_z_min, ground_z_max);
+        std::cout << "  [MapThread] built step=" << job->step
+                  << " in " << t_map.toc() << " ms"
+                  << " (odometry已推进到 step=" << g_data.step << ")" << std::endl;
+        map_busy_.store(false);
+    }
+}
+
+void SLAMesher::saveFinalOutputs(BSplineMap& bspline_map, MultiResGroundMap& mr_ground)
+{
+    printMapSummary(bspline_map);
+    saveGroundGridZ(mr_ground);
+    saveGroundControlsToTxt(mr_ground);
+    if (param.save_surface_samples || param.all_surfaces_max_step > 0
+        || param.map_save_step_begin > 0 || param.map_save_step_end > 0) {
+        saveGndSurfacesToTxt(mr_ground);
+    }
+    if (param.all_surfaces_max_step > 0) {
+        saveControlPointsToTxt(bspline_map, true, 0, param.all_surfaces_max_step);
+    } else if (param.map_save_step_begin > 0 || param.map_save_step_end > 0) {
+        saveControlPointsToTxt(bspline_map, true,
+                               param.map_save_step_begin, param.map_save_step_end);
+    } else {
+        saveControlPointsToTxt(bspline_map, param.save_surface_samples);
+    }
+    g_data.savePath2TxtKitti(g_data.file_loc_path_wrt, g_data.path);
+    g_data.file_loc_path_wrt.close();
+    std::cout << "KITTI trajectory saved." << std::endl;
+}
+
+void SLAMesher::process(){
+    if (param.run_mode == 1) processRealtime();
+    else                     processOffline();
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+// run_mode 0：逐帧串行。配准完等建图完再取下一帧，与改造前的行为逐位一致。
+// 数据源可以是离线 KITTI bin（read_offline_pcd:true）也可以是 rosbag（false，
+// 严格 FIFO 不丢帧，追不上就滞后）。KITTI 那套调好的参数只在这条路径上有效。
+// ══════════════════════════════════════════════════════════════════════════
+void SLAMesher::processOffline(){
+    TicToc t_whole;
+
+    // ========== 全局地图 & 工具初始化 ==========
+    BSplineMap bspline_map(param.grid);
+    MultiResGroundMap mr_ground = makeGroundMap();
     RangeImageProcessor range_proc;
     RangeImageProcessor range_proc_far;  // 远层（range >= range_image_split）
     RangeImageProcessor range_proc_gnd;  // 地面专用 RI（宽 z 带，列底→上传播）
@@ -3952,27 +4305,7 @@ void SLAMesher::process(){
         }
         std::cout << "===STEP " << g_data.step << "=== points: " << scan_local.size() << std::endl;
 
-        // 地面分割每帧只跑一次，建图链与配准链共用同一份 mask
-        pw_ground_mask.clear();
-        if (param.use_patchwork_ground) {
-            TicToc t_pw;
-            patchwork_.estimateGround(scan_local, pw_ground_mask);
-            const int n_gnd = (int)std::count(pw_ground_mask.begin(), pw_ground_mask.end(),
-                                              uint8_t(1));
-            std::cout << "  [Patchwork++] ground=" << n_gnd << "/" << scan_local.size()
-                      << "  sensor_h=" << patchwork_.sensorHeight()
-                      << "  " << t_pw.toc() << " ms" << std::endl;
-        }
-
-        // 竖直角标定修正：必须在建 range image / 配准 / 建图之前。原地改写，
-        // 下标不变，pw_ground_mask 仍然对齐。ground_only 时只动地面点，障碍链
-        // 拿到的仍是原始几何（runMapBuild 按 !ground_mask 取障碍点）。
-        if (param.scan_correct_deg != 0.0) {
-            const bool gnd_only = param.scan_correct_ground_only
-                               && !pw_ground_mask.empty();
-            correctScanCalib(scan_local, param.scan_correct_deg * M_PI / 180.0,
-                             gnd_only ? &pw_ground_mask : nullptr);
-        }
+        preprocessScan(scan_local, pw_ground_mask);
 
         if(g_data.step == 1){
             processFirstFrame(T_world);
@@ -3982,33 +4315,17 @@ void SLAMesher::process(){
                           << T_world(2,3) << "\n";
                 traj_file.flush();
             }
-            runMapBuild(scan_local, pw_ground_mask, T_world, range_proc, range_proc_far, range_proc_gnd, bspline_map, mr_ground, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
+            runMapBuild(scan_local, pw_ground_mask, T_world, g_data.step, false,
+                        range_proc, range_proc_far, range_proc_gnd, bspline_map, mr_ground,
+                        match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
             continue;
         }
 
         TicToc t_register;
         Transf T_guess = getOdom();
 
-        // 为配准生成 range image：排除地面点，仅剩余点进障碍链。
-        // 有 Patchwork++ mask 时按 mask 排除，与 runMapBuild 建障碍面所用的点集
-        // （!ground_mask）逐点一致；否则回退 z 带排除（原行为）。
-        {
-            const double split = param.range_image_split;
-            const bool use_far = (split > 0.0);
-            const double far_z_floor = farLayerZFloor(GROUND_Z_MIN);
-            const bool use_mask = param.obs_reg_use_pw_mask && !pw_ground_mask.empty();
-            if (use_mask) {
-                obs_exclude_mask.assign(scan_local.size(), false);
-                for (size_t i = 0; i < obs_exclude_mask.size(); ++i)
-                    obs_exclude_mask[i] = (i < pw_ground_mask.size() && pw_ground_mask[i] != 0);
-            }
-            const std::vector<bool>* excl = use_mask ? &obs_exclude_mask : nullptr;
-            range_proc.generateRangeImage(scan_local, GROUND_Z_MIN, GROUND_Z_MAX, true,
-                                          0.0, use_far ? split : 1e9, GROUND_Z_MIN, excl);
-            if (use_far)
-                range_proc_far.generateRangeImage(scan_local, GROUND_Z_MIN, GROUND_Z_MAX, true,
-                                                  split, 1e9, far_z_floor, excl);
-        }
+        buildRegRangeImages(scan_local, pw_ground_mask, GROUND_Z_MIN, GROUND_Z_MAX,
+                            range_proc, range_proc_far, obs_exclude_mask);
 
         T_world = registerScanToMap(scan_local, pw_ground_mask, T_guess, bspline_map, mr_ground,
                                     max_rg_iters, converge_thr, match_dist_thr, skip_points,
@@ -4028,7 +4345,9 @@ void SLAMesher::process(){
             traj_file.flush();
         }
 
-        runMapBuild(scan_local, pw_ground_mask, T_world, range_proc, range_proc_far, range_proc_gnd, bspline_map, mr_ground, match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
+        runMapBuild(scan_local, pw_ground_mask, T_world, g_data.step, false,
+                    range_proc, range_proc_far, range_proc_gnd, bspline_map, mr_ground,
+                    match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
 
         path_pub.publish(g_data.path);
         std::cout << "===STEP " << g_data.step << "=== Total: " << t_step.toc() << " ms===" << std::endl;
@@ -4036,25 +4355,179 @@ void SLAMesher::process(){
     }
 
     std::cout << "Process finished. Total time: " << t_whole.toc() / 1000.0 << " s" << std::endl;
+    saveFinalOutputs(bspline_map, mr_ground);
+}
 
-    printMapSummary(bspline_map);
-    saveGroundGridZ(mr_ground);
-    saveGroundControlsToTxt(mr_ground);
-    if (param.save_surface_samples || param.all_surfaces_max_step > 0
-        || param.map_save_step_begin > 0 || param.map_save_step_end > 0) {
-        saveGndSurfacesToTxt(mr_ground);
+// ══════════════════════════════════════════════════════════════════════════
+// run_mode 1：rosbag play / 实机。主线程只做「取帧 → 预处理 → 配准 → 发里程计」，
+// 建图交给独立线程，两者通过 map_mtx_ 同步（配准整帧持读锁，建图只在提交入库时
+// 取写锁）。主线程追不上数据率时丢弃滞后帧只留最新，丢帧带来的 dt 变化由
+// frameDtScale（外推）和 gateScaleForCurrentFrame（匹配门/先验）吸收。
+// ══════════════════════════════════════════════════════════════════════════
+void SLAMesher::processRealtime(){
+    TicToc t_whole;
+
+    BSplineMap bspline_map(param.grid);
+    MultiResGroundMap mr_ground = makeGroundMap();
+
+    // 两条链各自一套 range image，不能共用（见 mapThreadLoop 注释）
+    RangeImageProcessor rp_reg_near, rp_reg_far;
+    RangeImageProcessor rp_map_near, rp_map_far, rp_map_gnd;
+
+    g_data.extendLog();
+    Transf T_world = g_data.initFirstTransf();
+    g_data.updatePose(T_world);
+
+    // initFirstTransf 的 grt/odom 分支里有 ros::spinOnce，必须等它跑完再起
+    // AsyncSpinner，否则两个线程会同时抽同一个全局回调队列。
+    ros::AsyncSpinner spinner(2);
+    spinner.start();
+
+    const int    max_rg_iters   = param.register_times;
+    const double converge_thr   = param.converge_thr;
+    const double match_dist_thr = 0.8;
+    const int    skip_points    = 20;
+    static std::ofstream traj_file;
+    if (!traj_file.is_open()) {
+        traj_file.open(kBsplineBuildDir + "/bspline_traj_xyz.txt",
+                       std::ios::out | std::ios::trunc);
+        traj_file << std::fixed << std::setprecision(6);
     }
-    if (param.all_surfaces_max_step > 0) {
-        saveControlPointsToTxt(bspline_map, true, 0, param.all_surfaces_max_step);
-    } else if (param.map_save_step_begin > 0 || param.map_save_step_end > 0) {
-        saveControlPointsToTxt(bspline_map, true,
-                               param.map_save_step_begin, param.map_save_step_end);
-    } else {
-        saveControlPointsToTxt(bspline_map, param.save_surface_samples);
+
+    const double GROUND_Z_MIN = param.ground_z_min;
+    const double GROUND_Z_MAX = param.ground_z_max;
+
+    patchwork_.reset(param.patchwork);
+    std::vector<uint8_t> pw_ground_mask;
+    std::vector<bool>    obs_exclude_mask;
+
+    map_thread_stop_.store(false);
+    map_thread_ = std::thread(&SLAMesher::mapThreadLoop, this,
+                              std::ref(bspline_map), std::ref(mr_ground),
+                              match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
+
+    double last_build_stamp = -1.0;
+    double t_reg_sum = 0.0;
+    int    n_reg = 0;
+
+    while(nh.ok()){
+        g_data.step++;
+        if (param.max_frames > 0 && g_data.step > param.max_frames) {
+            std::cout << "Reached max_frames=" << param.max_frames << ", stop." << std::endl;
+            g_data.step--;
+            break;
+        }
+        g_data.extendLog();
+        TicToc t_step;
+
+        // 每帧新建：提交给建图线程后该缓冲的所有权由 shared_ptr 共享，主线程
+        // 下一帧换用新的缓冲，两侧不会碰同一块内存。
+        auto scan_ptr = pcl::make_shared<pcl::PointCloud<pcl::PointXYZ>>();
+        double stamp = 0.0;
+        if(!fetchScanRealtime(*scan_ptr, stamp)){
+            std::cout << "No more point cloud, exit." << std::endl;
+            g_data.step--;
+            break;
+        }
+        g_data.cur_scan_time = stamp;
+        {
+            // 标称帧周期 = 观测到的最小帧间隔（也就是没丢帧时的那个间隔）
+            const double dt = frameDtNow();
+            if (dt > 1e-4)
+                nominal_dt_ = (nominal_dt_ <= 0.0) ? dt : std::min(nominal_dt_, dt);
+        }
+        std::cout << "===STEP " << g_data.step << "=== points: " << scan_ptr->size()
+                  << "  dt=" << frameDtNow() << "s" << std::endl;
+
+        preprocessScan(*scan_ptr, pw_ground_mask);
+
+        if(g_data.step == 1){
+            processFirstFrame(T_world);
+            if (traj_file.is_open()) {
+                traj_file << T_world(0,3) << " " << T_world(1,3) << " "
+                          << T_world(2,3) << "\n";
+                traj_file.flush();
+            }
+            // 第 1 帧同步建图：第 2 帧配准必须有图可用，而且 apply profile 用的是
+            // 进程级全局变量，只有单线程时安全。
+            runMapBuild(*scan_ptr, pw_ground_mask, T_world, g_data.step, true,
+                        rp_map_near, rp_map_far, rp_map_gnd, bspline_map, mr_ground,
+                        match_dist_thr, GROUND_Z_MIN, GROUND_Z_MAX);
+            last_build_stamp = stamp;
+            continue;
+        }
+
+        TicToc t_register;
+        Transf T_guess = getOdom();
+
+        buildRegRangeImages(*scan_ptr, pw_ground_mask, GROUND_Z_MIN, GROUND_Z_MAX,
+                            rp_reg_near, rp_reg_far, obs_exclude_mask);
+
+        const double gate_scale = gateScaleForCurrentFrame();
+        T_world = registerScanToMap(*scan_ptr, pw_ground_mask, T_guess, bspline_map, mr_ground,
+                                    max_rg_iters, converge_thr, match_dist_thr, skip_points,
+                                    GROUND_Z_MIN, GROUND_Z_MIN, GROUND_Z_MAX,
+                                    rp_reg_near, rp_reg_far, (param.range_image_split > 0.0),
+                                    gate_scale);
+
+        g_data.updatePose(T_world);
+        // 里程计在这里就发出去了，不再等建图完成
+        pubTf();
+        path_pub.publish(g_data.path);
+
+        const double t_reg = t_register.toc();
+        t_reg_sum += t_reg;
+        ++n_reg;
+        std::cout << "  Registration: " << t_reg << " ms | gate x" << gate_scale
+                  << " | Pose: " << T_world(0,3) << " " << T_world(1,3) << " "
+                  << T_world(2,3) << std::endl;
+
+        if (traj_file.is_open()) {
+            traj_file << T_world(0,3) << " " << T_world(1,3) << " "
+                      << T_world(2,3) << "\n";
+            traj_file.flush();
+        }
+
+        // 建图调度：map_build_period>0 按墙上时间（丢帧时帧计数与时间脱钩），
+        // 否则沿用按帧计数的 map_update_interval / ground_build_interval。
+        bool want_build;
+        bool force_build;
+        if (param.map_build_period > 0.0) {
+            want_build  = (last_build_stamp < 0.0)
+                       || (stamp - last_build_stamp >= param.map_build_period);
+            force_build = true;
+        } else {
+            want_build  = (g_data.step % param.map_update_interval  == 0)
+                       || (g_data.step % param.ground_build_interval == 0);
+            force_build = false;
+        }
+        if (want_build) {
+            if (submitMapJob(scan_ptr, pw_ground_mask, T_world, g_data.step, force_build)) {
+                last_build_stamp = stamp;
+            } else {
+                ++n_map_skipped_;
+                std::cout << "  [MapThread] busy, skip build at step=" << g_data.step
+                          << " (skipped total " << n_map_skipped_ << ")" << std::endl;
+            }
+        }
+
+        std::cout << "===STEP " << g_data.step << "=== Total: " << t_step.toc()
+                  << " ms===" << std::endl;
+        std::cout.flush();
     }
-    g_data.savePath2TxtKitti(g_data.file_loc_path_wrt, g_data.path);
-    g_data.file_loc_path_wrt.close();
-    std::cout << "KITTI trajectory saved." << std::endl;
+
+    // 收尾：停建图线程后再落盘，避免与提交并发
+    map_thread_stop_.store(true);
+    map_job_cv_.notify_all();
+    if (map_thread_.joinable()) map_thread_.join();
+    spinner.stop();
+
+    std::cout << "Process finished. Total time: " << t_whole.toc() / 1000.0 << " s" << std::endl;
+    std::cout << "  [Realtime] frames processed=" << n_reg
+              << "  mean registration=" << (n_reg > 0 ? t_reg_sum / n_reg : 0.0) << " ms"
+              << "  frames dropped=" << g_data.n_dropped_frames
+              << "  map builds skipped=" << n_map_skipped_ << std::endl;
+    saveFinalOutputs(bspline_map, mr_ground);
 }
 SLAMesher::SLAMesher(ros::NodeHandle & nh_, Parameter & param_, Log & g_data_) : nh (nh_), param(param_), g_data(g_data_){
     odom_pub          = nh.advertise<nav_msgs::Odometry>("/lidar_odometry", 1);

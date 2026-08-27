@@ -58,6 +58,9 @@ include_directories(${ANN_INCLUDE_DIR})
 #ictmap
 #find_package(octomap REQUIRED)
 #include_directories(${OCTOMAP_INCLUDE_DIRS})
+#threads (建图线程 / shared_mutex)
+set(THREADS_PREFER_PTHREAD_FLAG ON)
+find_package(Threads REQUIRED)
 #openmp
 find_package(OpenMP)
 if (OPENMP_FOUND)
@@ -100,7 +103,7 @@ endif()
 
 #target_link_libraries(slamesh ${catkin_LIBRARIES} ${PCL_LIBRARIES}  ${CERES_LIBRARIES} gflags ${GFLAGS_LIBRARY}
 #        ${LVR2_LIBRARIES})
-target_link_libraries(slamesh ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBS} ${G2O_LIBS} ${CERES_LIBRARIES} ${ANN_LIBRARY} ${LVR2_LIBRARIES} )
+target_link_libraries(slamesh ${catkin_LIBRARIES} ${PCL_LIBRARIES} ${OpenCV_LIBS} ${G2O_LIBS} ${CERES_LIBRARIES} ${ANN_LIBRARY} ${LVR2_LIBRARIES} Threads::Threads )
 
 
 

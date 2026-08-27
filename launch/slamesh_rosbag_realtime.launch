@@ -1,0 +1,47 @@
+<launch>
+    <!--
+      rosbag play 实时模式。
+
+      用法：
+        roslaunch slamesh slamesh_rosbag_realtime.launch
+        rosbag play your.bag --clock          # use_sim_time:true 时必须带 --clock
+      若话题不是 /velodyne_points，改下面的 remap。
+
+      与 slamesh_kitti_odometry.launch 共用 config/kitti_odometry.yaml（同一套调好的
+      配准/建图参数），只覆盖运行模式相关的几项，避免两份 yaml 各自漂移。
+    -->
+    <arg name="seq"         default = "/00" />
+    <arg name="param"       default = "" />
+    <arg name="data_path"   default = " " />
+    <arg name="result_path" default = "$(find slamesh)/slamesh_result/rosbag" />
+    <arg name="lidar_topic" default = "/velodyne_points" />
+    <!-- 建图周期（秒）。KITTI 10Hz + map_update_interval 5 相当于 0.5 s -->
+    <arg name="map_build_period" default = "0.5" />
+    <!-- 建图线程 OMP 线程数；与配准分摊核数，避免超订 -->
+    <arg name="num_thread_map"   default = "3" />
+
+    <rosparam file="$(find slamesh)/config/kitti_odometry.yaml" command="load" />
+    <node pkg="slamesh" type="slamesh" name="slamesher" output="screen">
+        <remap from="/velodyne_points" to="$(arg lidar_topic)" />
+        <param name="seq"              value="$(arg seq)"/>
+        <param name="file_loc_report"  value="$(arg result_path)"/>
+        <param name="file_loc_dataset" value="$(arg data_path)"/>
+        <!-- 覆盖 yaml 里的离线设置 -->
+        <param name="run_mode"         value="1"/>
+        <param name="read_offline_pcd" value="false"/>
+        <param name="max_frames"       value="0"/>
+        <param name="map_build_period" value="$(arg map_build_period)"/>
+        <param name="num_thread_map"   value="$(arg num_thread_map)"/>
+        <param name="num_thread"       value="5"/>
+        <!-- 实时下这些 dump 都要关掉：它们每帧写盘且只在单线程里安全 -->
+        <param name="dump_frame"            value="0"/>
+        <param name="dump_cluster_step"     value="0"/>
+        <param name="dump_occluded_step"    value="0"/>
+        <param name="dump_gnd_scan_begin"   value="0"/>
+        <param name="dump_gnd_scan_end"     value="0"/>
+        <param name="save_surface_samples"  value="false"/>
+    </node>
+<!--
+      <node name="rviz" pkg="rviz" type="rviz" args="-d $(find slamesh)/config/rviz/slamesh_mesh_tool.rviz" required="false" />
+-->
+</launch>

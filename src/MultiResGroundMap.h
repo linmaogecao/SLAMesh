@@ -59,6 +59,29 @@ public:
         return total;
     }
 
+    // 三阶段版本：把昂贵的 apply 挪到锁外。prepare/commit 需持写锁，fit 不需要。
+    // 用法：{锁} addPoints + prepareRefitAll → {无锁} fitRefitAll → {锁} commitRefitAll
+    using RefitBatch = std::vector<std::vector<GroundGridMap::GndRefitTask>>;
+
+    RefitBatch prepareRefitAll() const {
+        RefitBatch batch(layers_.size());
+        for (int li = 0; li < (int)layers_.size(); ++li)
+            batch[li] = layers_[li].prepareRefit(per_layer_touched_[li]);
+        return batch;
+    }
+
+    void fitRefitAll(RefitBatch& batch, int n_threads = 1) const {
+        for (int li = 0; li < (int)layers_.size() && li < (int)batch.size(); ++li)
+            layers_[li].fitRefitTasks(batch[li], n_threads);
+    }
+
+    int commitRefitAll(RefitBatch& batch) {
+        int total = 0;
+        for (int li = 0; li < (int)layers_.size() && li < (int)batch.size(); ++li)
+            total += layers_[li].commitRefit(batch[li]);
+        return total;
+    }
+
     // 细优先 fallback 查询
     // layer_idx（可选）: 命中层编号；-1 = 全未命中
     const BSplineSurface* queryNearest(const Eigen::Vector3d& p,

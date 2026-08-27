@@ -1,6 +1,20 @@
 slamesher:
   # play ros bag or run it in mobile robot, the configuration used in our real-world demo, the sensor is an ouster OS1-32 lidar
+  #
+  # 注意：这是旧版（cell/GP）管线的配置，缺少现在的 B-spline 配准/建图所需的全部
+  # ground_*/obs_*/gnd_*/patchwork 参数。用它启动时那些参数会全部退回 Parameter 里的
+  # 硬编码默认值，而不是 kitti_odometry.yaml 里调好的值。
+  # 要跑 rosbag 实时模式请用 launch/slamesh_rosbag_realtime.launch（复用
+  # config/kitti_odometry.yaml，只覆盖 run_mode/read_offline_pcd 等模式相关项）。
   #read param
+  run_mode: 1            # 0=离线逐帧；1=实时（建图独立线程 + 丢帧）
+  max_lag_frames: 1
+  pcl_buffer_max: 20
+  map_build_period: 0.5  # 秒；<=0 回退按帧计数
+  num_thread_map: 3
+  scale_gates_by_dt: true
+  dt_scale_max: 4.0
+  realtime_idle_timeout: 5.0
   use_sim_time: true
   grt_available: false 
   odom_available: false 
