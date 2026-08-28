@@ -1,4 +1,24 @@
 #include "tool.h"
+#include <algorithm>
+#include <filesystem>
+
+static std::vector<std::string> g_nclt_files;
+static std::string              g_nclt_cached_dir;
+
+static const std::vector<std::string>& getNcltFileList(const std::string& dir) {
+    if (dir == g_nclt_cached_dir && !g_nclt_files.empty())
+        return g_nclt_files;
+    g_nclt_files.clear();
+    g_nclt_cached_dir = dir;
+    for (const auto& entry : std::filesystem::directory_iterator(dir)) {
+        if (entry.is_regular_file() && entry.path().extension() == ".bin")
+            g_nclt_files.push_back(entry.path().string());
+    }
+    std::sort(g_nclt_files.begin(), g_nclt_files.end());
+    std::cout << "[NCLT] found " << g_nclt_files.size()
+              << " .bin files in " << dir << std::endl;
+    return g_nclt_files;
+}
 
 //format transform
 Transf state2trans3(State state){
@@ -186,39 +206,64 @@ Transf PoseWithCovariance2transf(geometry_msgs::PoseWithCovariance pose) {
 }
 bool readKitti(const std::string & file_dataset, const std::string & seq, int line_num, int dataset,
                pcl::PointCloud<pcl::PointXYZ> & laser_cloud){//partially refer to A-LOAM
-    std::stringstream bin_point_cloud_path;
-    if(dataset == 1){//kitti
-        bin_point_cloud_path << file_dataset << seq << "/velodyne/" << std::setfill('0') << std::setw(6) << line_num << ".bin";
+    std::string bin_path;
+    if (dataset == 3) {
+        // NCLT: velodyne_sync 目录下按时间戳命名的 .bin 文件
+        const std::string vel_dir = file_dataset + seq + "/velodyne_sync";
+        const auto& files = getNcltFileList(vel_dir);
+        if (line_num < 0 || line_num >= (int)files.size()) return false;
+        bin_path = files[line_num];
+    } else {
+        std::stringstream ss;
+        if (dataset == 1)      // kitti
+            ss << file_dataset << seq << "/velodyne/" << std::setfill('0') << std::setw(6) << line_num << ".bin";
+        else if (dataset == 2) // mai_city
+            ss << file_dataset << seq << "/velodyne/" << std::setfill('0') << std::setw(5) << line_num << ".bin";
+        bin_path = ss.str();
     }
-    else if(dataset == 2){//mai_city
-        bin_point_cloud_path << file_dataset << seq << "/velodyne/" << std::setfill('0') << std::setw(5) << line_num << ".bin";
-    }
-    std::cout<<std::setprecision(7)<<setiosflags(std::ios::fixed);
-    std::ifstream bin_point_cloud_file(bin_point_cloud_path.str(), std::ifstream::in | std::ifstream::binary);
-    if(!bin_point_cloud_file.good()){
-        return false;
-    }
-    bin_point_cloud_file.seekg(0, std::ios::end);
-    const size_t num_elements = bin_point_cloud_file.tellg() / sizeof(float);
-    bin_point_cloud_file.seekg(0, std::ios::beg);
-    std::vector<float> lidar_data(num_elements);
-    bin_point_cloud_file.read(reinterpret_cast<char*>(&lidar_data[0]), num_elements * sizeof(float));
-    std::cout << "totally " << int(lidar_data.size() / 4.0) << " points in this lidar frame \n";
 
-    std::vector<Eigen::Vector3d> lidar_points;
-    std::vector<float> lidar_intensities;
-    for (std::size_t i = 0; i < lidar_data.size(); i += 4)
-    {
-        lidar_points.emplace_back(lidar_data[i], lidar_data[i+1], lidar_data[i+2]);
-        lidar_intensities.push_back(lidar_data[i+3]);
+    std::cout << std::setprecision(7) << setiosflags(std::ios::fixed);
+    std::ifstream bin_file(bin_path, std::ifstream::in | std::ifstream::binary);
+    if (!bin_file.good()) return false;
 
-        pcl::PointXYZ point;
-        point.x = lidar_data[i];
-        point.y = lidar_data[i + 1];
-        point.z = lidar_data[i + 2];
-        //if(point.z > -2.5){//there are some underground outliers in kitti dataset, remove them
+    bin_file.seekg(0, std::ios::end);
+    const size_t file_bytes = bin_file.tellg();
+    bin_file.seekg(0, std::ios::beg);
+
+    if (dataset == 3) {
+        // NCLT velodyne_sync: x y z intensity (4 × float32 = 16 bytes/point)
+        // 部分版本只有 x y z (3 × float32 = 12 bytes/point)，自动检测
+        const bool has_intensity = (file_bytes % (4 * sizeof(float)) == 0);
+        const int stride = has_intensity ? 4 : 3;
+        const size_t num_elements = file_bytes / sizeof(float);
+        std::vector<float> data(num_elements);
+        bin_file.read(reinterpret_cast<char*>(data.data()), file_bytes);
+        const size_t n_pts = num_elements / stride;
+        laser_cloud.reserve(n_pts);
+        for (size_t i = 0; i < num_elements; i += stride) {
+            pcl::PointXYZ p;
+            p.x = data[i];
+            p.y = data[i + 1];
+            p.z = data[i + 2];
+            if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z))
+                laser_cloud.push_back(p);
+        }
+        std::cout << "path:" << bin_path << std::endl;
+        std::cout << "totally " << laser_cloud.size() << " points in this lidar frame (NCLT)\n";
+    } else {
+        const size_t num_elements = file_bytes / sizeof(float);
+        std::vector<float> lidar_data(num_elements);
+        bin_file.read(reinterpret_cast<char*>(lidar_data.data()), num_elements * sizeof(float));
+        std::cout << "path:" << bin_path << std::endl;
+        std::cout << "totally " << int(lidar_data.size() / 4.0) << " points in this lidar frame \n";
+
+        for (std::size_t i = 0; i < lidar_data.size(); i += 4) {
+            pcl::PointXYZ point;
+            point.x = lidar_data[i];
+            point.y = lidar_data[i + 1];
+            point.z = lidar_data[i + 2];
             laser_cloud.push_back(point);
-        //}
+        }
     }
     return true;
 }

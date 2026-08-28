@@ -8,6 +8,12 @@ slamesher:
   dataset: 1
   max_steps: 10000
   save_mesh_map: true       # 当前无效：mesh 链只能从 visualize/saveResult 进，两者均未被调用
+  # ── Range Image (默认 HDL-64E，若用其他雷达需改) ─────────────────────
+  ri_h_scans: 64
+  ri_w_cols: 1500
+  ri_fov_up: 2.0
+  ri_fov_down: -24.8
+  lidar_flip_yz: false
   #register param
   range_max: 60
   range_min: 0.5

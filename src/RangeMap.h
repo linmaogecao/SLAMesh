@@ -45,29 +45,34 @@ struct VoxelKeyHash {
 
 class RangeImageProcessor {
 public:
-    const int H_SCANS = 64;
-    const int W_COLS = 1500;
-    const float FOV_UP = 2.0f;
-    const float FOV_DOWN = -24.8f;
-    const double MIN_RANGE = 1.0;
-    const double MAX_RANGE = 100.0;
-    const double MIN_Z = -2.5;   // 低于此高度的点不进 range image (世界系/雷达系)
+    int H_SCANS = 64;
+    int W_COLS = 1500;
+    float FOV_UP = 2.0f;
+    float FOV_DOWN = -24.8f;
+    double MIN_RANGE = 1.0;
+    double MAX_RANGE = 100.0;
+    double MIN_Z = -2.5;   // 低于此高度的点不进 range image (世界系/雷达系)
     double alpha_vert_rad_;
     double alpha_horiz_rad_;
     std::vector<RangePixel> range_image_;
-    // pixel_to_cloud_idx_[pixel_idx] = 对应点云中的点下标（-1 表示该 pixel 无效）
-    // 由 generateRangeImage 填充，与 range_image_ 同步
     std::vector<int> pixel_to_cloud_idx_;
-    // 本次 generateRangeImage 中：已通过筛选但因同像素存在更近点而未写入 range image 的点（雷达系）。
-    // 仅在 collect_occluded_ 打开时收集（默认关闭，只有 dump 路径需要）。
     std::vector<Eigen::Vector3d> occluded_points_;
     bool collect_occluded_ = false;
     RangeImageProcessor() {
+        recomputeDerived();
+    }
+    void configure(int h, int w, float fov_up, float fov_down) {
+        H_SCANS = h;
+        W_COLS  = w;
+        FOV_UP  = fov_up;
+        FOV_DOWN = fov_down;
+        recomputeDerived();
+    }
+    void recomputeDerived() {
         range_image_.resize(H_SCANS * W_COLS);
         pixel_to_cloud_idx_.resize(H_SCANS * W_COLS, -1);
-        alpha_vert_rad_ = (FOV_UP * M_PI / 180.0f - FOV_DOWN * M_PI / 180.0f)/(H_SCANS - 1);
+        alpha_vert_rad_ = (FOV_UP * M_PI / 180.0f - FOV_DOWN * M_PI / 180.0f) / (H_SCANS - 1);
         alpha_horiz_rad_ = (2.0 * M_PI) / W_COLS;
-
     }
     // -----------------------------------------------------------------
     // 2. 核心函数: PointCloud -> RangeImage

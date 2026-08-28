@@ -18,6 +18,13 @@ class Parameter{
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     int    max_steps{10000}, max_frames{0}, dump_frame{0}, dump_cluster_step{0}, dump_occluded_step{0}, register_times, num_test, min_points_num_to_gp, num_thread, cross_cell_overlap_length, dataset;
+    // Range image 几何参数（可由 yaml 覆盖，不同雷达型号不同）
+    int    ri_h_scans{64};
+    int    ri_w_cols{1500};
+    double ri_fov_up{2.0};
+    double ri_fov_down{-24.8};
+    // 雷达倒装：翻转 Y/Z（NCLT HDL-32E 倒装，原始坐标 Z 朝下）
+    bool   lidar_flip_yz{false};
     int    dump_gnd_scan_begin{0}, dump_gnd_scan_end{0};  // 闭区间：gnd_scan/+whole_gnd/+scan_world/；建地面时再写 all_surfaces/all_surfaces_<step>.txt（累计）；0=关
     int    map_update_interval{20}, ground_build_interval{20};
     int    map_save_step_begin{0}, map_save_step_end{0};  // 0=不限；导出 created_step 在此闭区间内的曲面

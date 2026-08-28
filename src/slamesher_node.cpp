@@ -1341,6 +1341,14 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/file_loc_dataset", file_loc_dataset, std::string("/not_set"));
     nh.param("slamesher/dataset", dataset, 6);
     nh.param("slamesher/seq", seq, std::string(""));
+    nh.param("slamesher/ri_h_scans", ri_h_scans, 64);
+    nh.param("slamesher/ri_w_cols",  ri_w_cols,  1500);
+    nh.param("slamesher/ri_fov_up",  ri_fov_up,  2.0);
+    nh.param("slamesher/ri_fov_down",ri_fov_down,-24.8);
+    nh.param("slamesher/lidar_flip_yz", lidar_flip_yz, false);
+    std::cout << "range_image: H=" << ri_h_scans << " W=" << ri_w_cols
+              << " FOV=[" << ri_fov_down << "," << ri_fov_up << "]"
+              << "  lidar_flip_yz=" << (lidar_flip_yz ? "on" : "off") << std::endl;
     nh.param("slamesher/max_steps", max_steps, 1);
     nh.param("slamesher/max_frames", max_frames, 0);
     nh.param("slamesher/dump_frame", dump_frame, 0);
@@ -4090,6 +4098,12 @@ void SLAMesher::process(){
     RangeImageProcessor range_proc;
     RangeImageProcessor range_proc_far;  // 远层（range >= range_image_split）
     RangeImageProcessor range_proc_gnd;  // 地面专用 RI（宽 z 带，列底→上传播）
+    range_proc.configure(param.ri_h_scans, param.ri_w_cols,
+                         (float)param.ri_fov_up, (float)param.ri_fov_down);
+    range_proc_far.configure(param.ri_h_scans, param.ri_w_cols,
+                             (float)param.ri_fov_up, (float)param.ri_fov_down);
+    range_proc_gnd.configure(param.ri_h_scans, param.ri_w_cols,
+                             (float)param.ri_fov_up, (float)param.ri_fov_down);
 
     g_data.extendLog();
     Transf T_world = g_data.initFirstTransf();
@@ -4128,6 +4142,12 @@ void SLAMesher::process(){
         if(!range_proc.getPointCloud(scan_local, 0)){
             std::cout << "No more point cloud, exit." << std::endl;
             break;
+        }
+        if (param.lidar_flip_yz) {
+            for (auto& p : scan_local.points) {
+                p.y = -p.y;
+                p.z = -p.z;
+            }
         }
         std::cout << "===STEP " << g_data.step << "=== points: " << scan_local.size() << std::endl;
 

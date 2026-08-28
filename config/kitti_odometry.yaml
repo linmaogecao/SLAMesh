@@ -19,6 +19,12 @@ slamesher:
   map_save_step_begin: 0 # 与 end 配合的 step 闭区间过滤（all_surfaces_max_step>0 时优先）
   map_save_step_end:   0  # 0=不限；例 begin=100 end=150 只导出该区间新建的曲面
   save_mesh_map: false      # 当前无效：mesh 链只能从 visualize/saveResult 进，两者均未被调用
+  # ── Range Image (HDL-64E) ──────────────────────────────────────────────
+  ri_h_scans: 64
+  ri_w_cols: 1500
+  ri_fov_up: 2.0
+  ri_fov_down: -24.8
+  lidar_flip_yz: false
   #register param
   range_max: 100
   range_min: 1.2

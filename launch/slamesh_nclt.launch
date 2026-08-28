@@ -1,0 +1,15 @@
+<launch>
+    <!-- NCLT dataset: Velodyne HDL-32E (inverted mounting)
+         data_path 指向 NCLT 日期目录的父目录，seq 填日期子目录名（如 /2012-01-08）
+         目录结构: data_path/seq/velodyne_sync/*.bin -->
+    <arg name="seq" default="/2012-01-08" />
+    <arg name="data_path" default="/home/albus/dataset/nclt" />
+    <arg name="result_path" default="$(find slamesh)/slamesh_result/nclt" />
+
+    <rosparam file="$(find slamesh)/config/nclt.yaml" command="load" />
+    <node pkg="slamesh" type="slamesh" name="slamesher" output="screen">
+        <param name="seq"             value="$(arg seq)" />
+        <param name="file_loc_report" value="$(arg result_path)" />
+        <param name="file_loc_dataset" value="$(arg data_path)" />
+    </node>
+</launch>
