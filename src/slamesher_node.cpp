@@ -72,6 +72,7 @@ POSSIBILITY OF SUCH DAMAGE.
 #include <fstream>
 #include <iomanip>
 #include <algorithm>
+#include <iterator>
 #include <omp.h>
 Parameter param;//parameters
 Log g_data;//global variables
@@ -1421,6 +1422,10 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/obs_match_per_surf_max",      obs_match_per_surf_max,      50);
     nh.param("slamesher/obs_cand_target",             obs_cand_target,             1500);
     nh.param("slamesher/obs_reg_use_pw_mask",         obs_reg_use_pw_mask,         true);
+    nh.param("slamesher/num_thread_reg",              num_thread_reg,              0);
+    nh.param("slamesher/reg_time_breakdown",          reg_time_breakdown,          false);
+    nh.param("slamesher/obs_reuse_cand_delta",        obs_reuse_cand_delta,        0.0);
+    nh.param("slamesher/gnd_expand_last_iter_only",   gnd_expand_last_iter_only,   false);
     nh.param("slamesher/use_patchwork_ground", use_patchwork_ground, true);
     {
         const PatchworkppConfig d;
@@ -1602,6 +1607,13 @@ void Parameter::initParameter(ros::NodeHandle & nh){
 
     //<!--  gp param  -->
     nh.param("slamesher/num_thread", num_thread, 1);
+    if (num_thread_reg <= 0) num_thread_reg = num_thread;
+    std::cout << "num_thread=" << num_thread
+              << "  num_thread_reg=" << num_thread_reg
+              << "  reg_time_breakdown=" << (reg_time_breakdown ? "on" : "off")
+              << "  obs_reuse_cand_delta=" << obs_reuse_cand_delta
+              << "  gnd_expand_last_iter_only="
+              << (gnd_expand_last_iter_only ? "on" : "off") << std::endl;
     nh.param("slamesher/grid", grid, 1.0);
     nh.param("slamesher/min_points_num_to_gp", min_points_num_to_gp, 8);
     nh.param("slamesher/num_test",  num_test, 10);
@@ -1990,52 +2002,83 @@ void SLAMesher::buildObsMatches(
         int& stat_edge_kept, int& stat_edge_rej, int& stat_gate_rej,
         std::vector<RegMatch>& out)
 {
-    for (auto& [sid, indices] : surf_to_pts) {
+    // 任务表按 surf_to_pts 的自然迭代序建立；并行段只写各自槽位，归并再按同一序
+    // 追加到 out。out 的顺序决定 Ceres 残差块的加入顺序，进而决定浮点求和顺序，
+    // 所以这里必须与串行版逐位一致（Ceres 本身仍是 num_threads=1）。
+    struct ObsTask {
+        int sid = -1;
+        const std::vector<int>* indices = nullptr;
+        BSplineSurface* surf = nullptr;
+        std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
+        std::vector<RegMatch> matches;
+        int edge_kept = 0, edge_rej = 0, gate_rej = 0;
+    };
+
+    std::vector<ObsTask> tasks;
+    tasks.reserve(surf_to_pts.size());
+    for (const auto& [sid, indices] : surf_to_pts) {
         const BSplineMapEntry* entry = bspline_map.getEntry(sid);
         if (!entry || !entry->surface) continue;
         if (entry->is_ground != want_ground) continue;
+        if (indices.empty()) continue;
 
-        auto& surf = entry->surface;
+        ObsTask t;
+        t.sid     = sid;
+        t.indices = &indices;
+        t.surf    = entry->surface.get();
+        // warm start：同一批下标才能复用上次收敛的 uv。命中后 findFootPrintWarm
+        // 内部的收敛判据会提前退出，Newton 步数远少于 6。
+        auto pi = prev_indices.find(sid);
+        auto pu = prev_uv.find(sid);
+        if (pi != prev_indices.end() && pu != prev_uv.end()
+            && pi->second == indices && pu->second.size() == indices.size()) {
+            t.footprints = pu->second;
+        }
+        tasks.push_back(std::move(t));
+    }
+
+    const int n_task = static_cast<int>(tasks.size());
+    const int n_thr  = std::max(1, param.num_thread_reg);
+    const Eigen::Matrix3d R_curr = T_curr.block<3,3>(0,0);
+    const Eigen::Vector3d t_curr = T_curr.block<3,1>(0,3);
+
+    // findFootPrintWarm / getCurvature 只读曲面的 knots/controls，写的都是出参；
+    // 每个任务对应唯一 sid，曲面之间不重叠，故可并发。
+#pragma omp parallel for schedule(dynamic) num_threads(n_thr)
+    for (int ti = 0; ti < n_task; ++ti) {
+        ObsTask& t = tasks[ti];
+        const std::vector<int>& indices = *t.indices;
+        BSplineSurface* surf = t.surf;
         const auto& knU = surf->getKnotsU();
         const auto& knV = surf->getKnotsV();
         const auto& cps = surf->getControls();
-        int num_cpv     = surf->getNumCpV();
+        const int num_cpv = surf->getNumCpV();
 
         std::vector<Eigen::Vector3d> pts_world;
         pts_world.reserve(indices.size());
         for (int idx : indices)
-            pts_world.push_back(T_curr.block<3,3>(0,0) *
-                Eigen::Vector3d(scan_local[idx].x, scan_local[idx].y, scan_local[idx].z) +
-                T_curr.block<3,1>(0,3));
+            pts_world.push_back(R_curr *
+                Eigen::Vector3d(scan_local[idx].x, scan_local[idx].y, scan_local[idx].z)
+                + t_curr);
 
-        std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
         std::vector<double> dists;
-        auto prev_idx_it = prev_indices.find(sid);
-        auto prev_uv_it = prev_uv.find(sid);
-        if (prev_idx_it != prev_indices.end() &&
-            prev_uv_it != prev_uv.end() &&
-            prev_idx_it->second == indices &&
-            prev_uv_it->second.size() == indices.size()) {
-            footprints = prev_uv_it->second;
-        }
-        surf->findFootPrintWarm(pts_world, footprints, dists, /*newton_steps=*/6);
-        prev_indices[sid] = indices;
-        prev_uv[sid] = footprints;
+        surf->findFootPrintWarm(pts_world, t.footprints, dists, /*newton_steps=*/6);
 
+        t.matches.reserve(indices.size());
         for (int k = 0; k < (int)indices.size(); k++) {
             double d = std::sqrt(std::abs(dists[k]));
             constexpr double kEdgeEps = 1e-4;
             const bool on_edge =
-                footprints[k].first.second  < kEdgeEps ||
-                footprints[k].first.second  > 1.0 - kEdgeEps ||
-                footprints[k].second.second < kEdgeEps ||
-                footprints[k].second.second > 1.0 - kEdgeEps;
-            if (d < 1e-6) { ++stat_gate_rej; if (on_edge) ++stat_edge_rej; continue; }
+                t.footprints[k].first.second  < kEdgeEps ||
+                t.footprints[k].first.second  > 1.0 - kEdgeEps ||
+                t.footprints[k].second.second < kEdgeEps ||
+                t.footprints[k].second.second > 1.0 - kEdgeEps;
+            if (d < 1e-6) { ++t.gate_rej; if (on_edge) ++t.edge_rej; continue; }
 
             // 地面片是瓦片式铺开的，瓦片边缘的足点由邻接瓦片正常覆盖，不算外点；
             // 边界处理只对障碍片生效。
             const bool edge_obs = on_edge && !want_ground;
-            auto [paraU, paraV] = footprints[k];
+            auto [paraU, paraV] = t.footprints[k];
 
             SurfaceCurvature curv;
             bool curv_ready = false;
@@ -2050,23 +2093,23 @@ void SLAMesher::buildObsMatches(
                 const double dn  = std::abs(curv.normal.dot(r));
                 const double dtan = std::sqrt(std::max(0.0, r.squaredNorm() - dn * dn));
                 if (dn > cur_match_thr || dtan > param.obs_edge_tan_max) {
-                    ++stat_gate_rej;
-                    ++stat_edge_rej;
+                    ++t.gate_rej;
+                    ++t.edge_rej;
                     continue;
                 }
                 drop_tangent = true;
             } else {
                 if (d > cur_match_thr) {
-                    ++stat_gate_rej;
-                    if (on_edge) ++stat_edge_rej;
+                    ++t.gate_rej;
+                    if (on_edge) ++t.edge_rej;
                     continue;
                 }
                 if (edge_obs && param.obs_edge_mode == 1) {
-                    ++stat_edge_kept;
+                    ++t.edge_kept;
                     continue;
                 }
             }
-            if (on_edge) ++stat_edge_kept;
+            if (on_edge) ++t.edge_kept;
 
             if (!curv_ready) {
                 curv = surf->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
@@ -2085,8 +2128,18 @@ void SLAMesher::buildObsMatches(
             m.drop_tangent = drop_tangent;
             m.fit_dist  = param.obs_fit_weight_adj ? surf->getFitMeanDistAdj()
                                                    : surf->getFitMeanDist();
-            out.push_back(m);
+            t.matches.push_back(m);
         }
+    }
+
+    for (ObsTask& t : tasks) {
+        prev_indices[t.sid] = *t.indices;
+        prev_uv[t.sid]      = std::move(t.footprints);
+        stat_edge_kept += t.edge_kept;
+        stat_edge_rej  += t.edge_rej;
+        stat_gate_rej  += t.gate_rej;
+        out.insert(out.end(), std::make_move_iterator(t.matches.begin()),
+                              std::make_move_iterator(t.matches.end()));
     }
 }
 
@@ -2104,6 +2157,13 @@ void SLAMesher::buildGroundMatches(
     // unordered_map，顺序随堆地址（ASLR）变化；而下游按 out 的顺序做每格截顶
     // （每格只留前 reg_tgt 个），于是同配置重跑保留的匹配子集不同，实测 seq06
     // 第 2 帧 z 就差 1.5 mm。每个扫描点只归一张最近面，点集不相交，最小下标严格可比。
+    struct GndTask {
+        const BSplineSurface* surf = nullptr;
+        const std::vector<int>* indices = nullptr;
+        std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
+        std::vector<RegMatch> matches;
+    };
+
     std::vector<std::pair<int, const BSplineSurface*>> order;
     order.reserve(surf_to_pts.size());
     for (const auto& [sp, idxs] : surf_to_pts) {
@@ -2112,42 +2172,54 @@ void SLAMesher::buildGroundMatches(
     }
     std::sort(order.begin(), order.end());
 
+    std::vector<GndTask> tasks;
+    tasks.reserve(order.size());
     for (const auto& [order_key, surf_ptr] : order) {
         (void)order_key;
-        const std::vector<int>& indices = surf_to_pts.at(surf_ptr);
-        const auto& knU  = surf_ptr->getKnotsU();
-        const auto& knV  = surf_ptr->getKnotsV();
-        const auto& cps  = surf_ptr->getControls();
-        int num_cpv      = surf_ptr->getNumCpV();
+        GndTask t;
+        t.surf    = surf_ptr;
+        t.indices = &surf_to_pts.at(surf_ptr);
+        auto pi = prev_indices.find(surf_ptr);
+        auto pu = prev_uv.find(surf_ptr);
+        if (pi != prev_indices.end() && pu != prev_uv.end()
+            && pi->second == *t.indices && pu->second.size() == t.indices->size()) {
+            t.footprints = pu->second;
+        }
+        tasks.push_back(std::move(t));
+    }
+
+    const int n_task = static_cast<int>(tasks.size());
+    const int n_thr  = std::max(1, param.num_thread_reg);
+    const Eigen::Matrix3d R_curr = T_curr.block<3,3>(0,0);
+    const Eigen::Vector3d t_curr = T_curr.block<3,1>(0,3);
+
+    // 每个扫描点只归一张最近面，任务间曲面不重叠；归并按 order 序，与串行版一致。
+#pragma omp parallel for schedule(dynamic) num_threads(n_thr)
+    for (int ti = 0; ti < n_task; ++ti) {
+        GndTask& t = tasks[ti];
+        const std::vector<int>& indices = *t.indices;
+        BSplineSurface* surf = const_cast<BSplineSurface*>(t.surf);
+        const auto& knU  = surf->getKnotsU();
+        const auto& knV  = surf->getKnotsV();
+        const auto& cps  = surf->getControls();
+        const int num_cpv = surf->getNumCpV();
 
         std::vector<Eigen::Vector3d> pts_world;
         pts_world.reserve(indices.size());
         for (int idx : indices)
-            pts_world.push_back(T_curr.block<3,3>(0,0) *
-                Eigen::Vector3d(scan_local[idx].x, scan_local[idx].y, scan_local[idx].z) +
-                T_curr.block<3,1>(0,3));
+            pts_world.push_back(R_curr *
+                Eigen::Vector3d(scan_local[idx].x, scan_local[idx].y, scan_local[idx].z)
+                + t_curr);
 
-        std::vector<std::pair<BSplineSurface::Parameter, BSplineSurface::Parameter>> footprints;
         std::vector<double> dists;
-        auto prev_idx_it = prev_indices.find(surf_ptr);
-        auto prev_uv_it = prev_uv.find(surf_ptr);
-        if (prev_idx_it != prev_indices.end() &&
-            prev_uv_it != prev_uv.end() &&
-            prev_idx_it->second == indices &&
-            prev_uv_it->second.size() == indices.size()) {
-            footprints = prev_uv_it->second;
-        }
-        const_cast<BSplineSurface*>(surf_ptr)->findFootPrintWarm(
-            pts_world, footprints, dists, /*newton_steps=*/6);
-        prev_indices[surf_ptr] = indices;
-        prev_uv[surf_ptr] = footprints;
+        surf->findFootPrintWarm(pts_world, t.footprints, dists, /*newton_steps=*/6);
 
+        t.matches.reserve(indices.size());
         for (int k = 0; k < (int)indices.size(); k++) {
             double d = std::sqrt(std::abs(dists[k]));
             if (d > thr || d < 1e-6) continue;
-            auto [paraU, paraV] = footprints[k];
-            SurfaceCurvature curv = const_cast<BSplineSurface*>(surf_ptr)
-                ->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
+            auto [paraU, paraV] = t.footprints[k];
+            SurfaceCurvature curv = surf->getCurvature(paraU, paraV, knU, knV, cps, num_cpv);
             if (curv.normal.norm() < 1e-9) continue;
             curv.normal.normalize();
 
@@ -2159,8 +2231,15 @@ void SLAMesher::buildGroundMatches(
             m.curvature = curv;
             m.scan_idx  = indices[k];
             m.is_ground = true;
-            out.push_back(m);
+            t.matches.push_back(m);
         }
+    }
+
+    for (GndTask& t : tasks) {
+        prev_indices[t.surf] = *t.indices;
+        prev_uv[t.surf]      = std::move(t.footprints);
+        out.insert(out.end(), std::make_move_iterator(t.matches.begin()),
+                              std::make_move_iterator(t.matches.end()));
     }
 }
 
@@ -2200,6 +2279,12 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
     std::vector<int> gnd_enter_indices;      // 最后一轮进入地面匹配的点索引
     std::vector<RegMatch> last_gnd_matches;  // 最后一轮过 thr、进 Ceres 的地面匹配
 
+    // 分段耗时累计（毫秒），param.reg_time_breakdown 打开时每帧打印
+    const bool prof = param.reg_time_breakdown;
+    double ms_obs_collect = 0, ms_obs_match = 0, ms_obs_solve = 0;
+    double ms_gnd_sample = 0, ms_gnd_match = 0, ms_gnd_solve = 0;
+    TicToc t_seg;
+
     // 障碍解 x/y/yaw 时 roll/pitch/z 取自外推，地面解完 roll/pitch/z 后不再回头，
     // 于是用错误姿态算出的 x/y/yaw 永久留在结果里。多跑几轮让两组自由度互相收敛。
     const int n_alt = std::max(1, param.reg_alternations);
@@ -2210,6 +2295,8 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
     // 阶段 1：障碍匹配 — 只优化世界系 x / y / yaw；z / roll / pitch 固定
     // ══════════════════════════════════════════════════════════════════════
     int obs_last_res = -1;
+    // 跨迭代持有：obs_reuse_cand_delta 开启时上一轮的候选集可以被下一轮沿用
+    std::unordered_map<int, std::vector<int>> obs_surf_to_pts;
     for (int iter = 0; iter < max_iters && delta_scale > converge_thr; iter++) {
         // 首轮用大门吃掉外推残差，之后几何收紧到 obs_thr_last 剔外点（动态车辆、
         // 植被、鬼面）。原实现四轮恒定 0.8 m，末轮仍在吸收明显不该要的对应。
@@ -2220,15 +2307,27 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             cur_match_thr = match_dist_thr
                           * std::pow(param.obs_thr_last / match_dist_thr, t);
         }
-        std::unordered_map<int, std::vector<int>> obs_surf_to_pts;
         const int col_step = std::max(1, param.obs_rimg_col_step);
         const int surf_cap = param.obs_match_per_surf_max;
         const double far_match_min_z = farLayerZFloor(ground_z_min);
 
+        // 每个有效像素要做 27 次体素哈希查询，queryCandidates 内部还各带一次
+        // unordered_set + vector 的堆分配；这段每帧要跑 max_iters 轮且全串行。
+        // 改成按行并行，命中先落进本行的桶，再按行序归并到 obs_surf_to_pts ——
+        // 各 sid 下的 cloud_idx 顺序与串行版完全相同（下游截顶按该顺序等间隔取）。
+        std::vector<std::vector<std::pair<int,int>>> row_hits;
         auto collectFromRangeImage = [&](const RangeImageProcessor& rp, double obs_min_z, int v0) {
             const int W = rp.W_COLS;
             const int H = rp.H_SCANS;
+            const int n_thr = std::max(1, param.num_thread_reg);
+            const Eigen::Matrix3d R_reg = T_curr.block<3,3>(0,0);
+            const Eigen::Vector3d t_reg = T_curr.block<3,1>(0,3);
+            row_hits.resize(H);            // 跨调用复用各行缓冲，只清内容不还容量
+            for (auto& h : row_hits) h.clear();
+            // 各行有效像素数差异大（近地面的行密、朝天的行几乎全空），用 dynamic
+#pragma omp parallel for schedule(dynamic) num_threads(n_thr)
             for (int u = 0; u < H; ++u) {
+                std::vector<std::pair<int,int>>& hits = row_hits[u];
                 for (int v = v0; v < W; v += col_step) {
                     const int px_idx = u * W + v;
                     const auto& px = rp.range_image_[px_idx];
@@ -2236,12 +2335,14 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                     if (px.z < obs_min_z) continue;
                     const int cloud_idx = rp.pixel_to_cloud_idx_[px_idx];
                     if (cloud_idx < 0 || cloud_idx >= (int)scan_local.size()) continue;
-                    Eigen::Vector3d p_w = T_curr.block<3,3>(0,0) *
-                        Eigen::Vector3d(px.x, px.y, px.z) + T_curr.block<3,1>(0,3);
+                    Eigen::Vector3d p_w = R_reg * Eigen::Vector3d(px.x, px.y, px.z) + t_reg;
                     for (int sid : bspline_map.queryCandidates(p_w, 1))
-                        obs_surf_to_pts[sid].push_back(cloud_idx);
+                        hits.emplace_back(sid, cloud_idx);
                 }
             }
+            for (const auto& hits : row_hits)
+                for (const auto& [sid, cloud_idx] : hits)
+                    obs_surf_to_pts[sid].push_back(cloud_idx);
         };
         // 逐曲面截顶后的候选量：已满额的大曲面不会因补采而增加，
         // 补采的增量只落在未满额的小曲面上，故用截顶后的量做触发判据
@@ -2252,28 +2353,42 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             return n;
         };
 
-        collectFromRangeImage(rp_near, match_min_z, 0);
-        if (use_far) collectFromRangeImage(rp_far, far_match_min_z, 0);
+        // delta_scale 此刻还是上一轮解出的位姿增量。增量足够小时候选集实质不变，
+        // 跳过整张 range image 的重扫 + queryCandidates。附带效果更值钱：下标列表
+        // 不变才能命中 buildObsMatches 的 warm-start，命中后 Newton 靠内部收敛判据
+        // 提前退出。会改变结果（候选略有滞后），故默认关闭。
+        const bool reuse_cand = param.obs_reuse_cand_delta > 0.0
+                             && iter > 0
+                             && !obs_surf_to_pts.empty()
+                             && delta_scale <= param.obs_reuse_cand_delta;
+        if (prof) t_seg.tic();
+        if (!reuse_cand) {
+            obs_surf_to_pts.clear();
+            collectFromRangeImage(rp_near, match_min_z, 0);
+            if (use_far) collectFromRangeImage(rp_far, far_match_min_z, 0);
 
-        if (param.obs_cand_target > 0) {
-            for (int off = 1; off < col_step && cappedTotal() < param.obs_cand_target; ++off) {
-                collectFromRangeImage(rp_near, match_min_z, off);
-                if (use_far) collectFromRangeImage(rp_far, far_match_min_z, off);
+            if (param.obs_cand_target > 0) {
+                for (int off = 1; off < col_step && cappedTotal() < param.obs_cand_target; ++off) {
+                    collectFromRangeImage(rp_near, match_min_z, off);
+                    if (use_far) collectFromRangeImage(rp_far, far_match_min_z, off);
+                }
             }
-        }
 
-        if (surf_cap > 0) {
-            for (auto& [sid, idxs] : obs_surf_to_pts) {
-                if ((int)idxs.size() > surf_cap) {
-                    const int step = (int)idxs.size() / surf_cap;
-                    std::vector<int> kept;
-                    kept.reserve(surf_cap);
-                    for (int i = 0; i < (int)idxs.size() && (int)kept.size() < surf_cap; i += step)
-                        kept.push_back(idxs[i]);
-                    idxs = std::move(kept);
+            if (surf_cap > 0) {
+                for (auto& [sid, idxs] : obs_surf_to_pts) {
+                    if ((int)idxs.size() > surf_cap) {
+                        const int step = (int)idxs.size() / surf_cap;
+                        std::vector<int> kept;
+                        kept.reserve(surf_cap);
+                        for (int i = 0; i < (int)idxs.size() && (int)kept.size() < surf_cap; i += step)
+                            kept.push_back(idxs[i]);
+                        idxs = std::move(kept);
+                    }
                 }
             }
         }
+
+        if (prof) { ms_obs_collect += t_seg.toc(); t_seg.tic(); }
 
         std::vector<RegMatch> obs_matches;
         obs_matches.reserve(bspline_map.size() * param.obs_match_per_surf_max);
@@ -2282,6 +2397,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                        bspline_map, obs_surf_to_pts, obs_prev_indices, obs_prev_uv,
                        stat_edge_kept, stat_edge_rej, stat_gate_rej, obs_matches);
         obs_last_res = (int)obs_matches.size();
+        if (prof) { ms_obs_match += t_seg.toc(); t_seg.tic(); }
 
         // 左右平衡：一侧墙垄断时点到面残差把 yaw 往单边拽。雷达系 y>=0 为左。
         // 任一侧超过 max_frac 时，该侧保留 keep = frac/(1-frac)*对侧 个，按 scan_idx 等间隔取。
@@ -2417,6 +2533,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
         opts.num_threads = 1;
         ceres::Solver::Summary summary;
         ceres::Solve(opts, &problem, &summary);
+        if (prof) ms_obs_solve += t_seg.toc();
 
         const Transf T_new = makePoseFromXYZRPY(
             xy_yaw[0], xy_yaw[1], z_fix, roll_fix, pitch_fix, xy_yaw[2]);
@@ -2474,45 +2591,58 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             return kSched[std::min(std::max(it, 0), kGndIters - 1)];
         };
 
+        // XY 格子采样：分层 z + |y|；格内按 lx 分前/中/后，前向更密初抽并挂邻居；
+        // 过 thr 后格扩容，再 FB 邻居补短板并裁超额。
+        // 这批参数与地面判据在三轮迭代间恒定，提到循环外只算一次。
+        const double reg_cs   = param.ground_reg_cell_size;
+        const int    reg_cmax = param.ground_reg_cell_max_pts > 0
+                                ? param.ground_reg_cell_max_pts : 30;
+        const int    reg_cmax_f = (param.ground_reg_cell_max_pts_front > 0)
+                                ? param.ground_reg_cell_max_pts_front : reg_cmax;
+        const int    reg_tgt  = param.ground_reg_cell_target_pts;
+        const int    nbr_cap  = param.ground_reg_nbr_per_seed;
+        const int    seed_bud = param.ground_reg_total_max;
+        const double y_max    = param.ground_reg_y_max;
+        const double x_max    = param.ground_reg_x_max;
+        const double x_max_f  = param.ground_reg_x_max_front;
+        const double near_x   = param.gnd_near_x_max;
+        const double near_y   = param.gnd_near_y_max;
+        const double near_z   = param.gnd_near_z_max;
+        const bool   use_near = (near_x > 0.0 && near_y > 0.0);
+        const double fb_x0    = param.ground_reg_fb_x0;
+        const double fb_front = param.ground_reg_fb_front;
+        const double fb_mid   = param.ground_reg_fb_mid;
+        auto zCeilAt = [&](double lx, double ly) -> double {
+            if (use_near && std::abs(lx) <= near_x && std::abs(ly) <= near_y)
+                return std::min(near_z, ground_z_max);  // 近区只许更严
+            return ground_z_max;
+        };
+        // 地面判据：有 Patchwork++ mask 时以其为准，否则回退分层 z 带。
+        // |y| 上限属于采样密度控制，两条路径都保留。
+        const bool use_pw = !pw_ground_mask.empty();
+        auto passGndLocal = [&](int idx, double lx, double ly, double lz) -> bool {
+            if (y_max > 0.0 && std::abs(ly) > y_max) return false;
+            if (x_max > 0.0 && std::abs(lx) > x_max) return false;
+            if (x_max_f > 0.0 && lx > x_max_f) return false;
+            if (use_pw) return pw_ground_mask[idx] != 0;
+            if (lz < ground_z_min || lz > zCeilAt(lx, ly)) return false;
+            return true;
+        };
+
+        // 判据只看雷达系坐标与 mask，三轮迭代结果完全相同；原实现每轮重扫全云
+        // （HDL-64 约 12 万点）。下标仍是升序，分桶的插入顺序不变。
+        std::vector<int> gnd_cand_idx;
+        if (reg_cs > 0.0) {
+            gnd_cand_idx.reserve(scan_local.size() / 4);
+            for (int i = 0; i < (int)scan_local.size(); ++i)
+                if (passGndLocal(i, scan_local[i].x, scan_local[i].y, scan_local[i].z))
+                    gnd_cand_idx.push_back(i);
+        }
+
         for (int giter = 0; giter < kGndIters; ++giter) {
+            if (prof) t_seg.tic();
             const double gnd_thr = gndMatchDistForIter(giter);
             std::unordered_map<const BSplineSurface*, std::vector<int>> gnd_surf_to_pts;
-            // XY 格子采样：分层 z + |y|；格内按 lx 分前/中/后，前向更密初抽并挂邻居；
-            // 过 thr 后格扩容，再 FB 邻居补短板并裁超额。
-            const double reg_cs   = param.ground_reg_cell_size;
-            const int    reg_cmax = param.ground_reg_cell_max_pts > 0
-                                    ? param.ground_reg_cell_max_pts : 30;
-            const int    reg_cmax_f = (param.ground_reg_cell_max_pts_front > 0)
-                                    ? param.ground_reg_cell_max_pts_front : reg_cmax;
-            const int    reg_tgt  = param.ground_reg_cell_target_pts;
-            const int    nbr_cap  = param.ground_reg_nbr_per_seed;
-            const int    seed_bud = param.ground_reg_total_max;
-            const double y_max    = param.ground_reg_y_max;
-            const double x_max    = param.ground_reg_x_max;
-            const double x_max_f  = param.ground_reg_x_max_front;
-            const double near_x   = param.gnd_near_x_max;
-            const double near_y   = param.gnd_near_y_max;
-            const double near_z   = param.gnd_near_z_max;
-            const bool   use_near = (near_x > 0.0 && near_y > 0.0);
-            const double fb_x0    = param.ground_reg_fb_x0;
-            const double fb_front = param.ground_reg_fb_front;
-            const double fb_mid   = param.ground_reg_fb_mid;
-            auto zCeilAt = [&](double lx, double ly) -> double {
-                if (use_near && std::abs(lx) <= near_x && std::abs(ly) <= near_y)
-                    return std::min(near_z, ground_z_max);  // 近区只许更严
-                return ground_z_max;
-            };
-            // 地面判据：有 Patchwork++ mask 时以其为准，否则回退分层 z 带。
-            // |y| 上限属于采样密度控制，两条路径都保留。
-            const bool use_pw = !pw_ground_mask.empty();
-            auto passGndLocal = [&](int idx, double lx, double ly, double lz) -> bool {
-                if (y_max > 0.0 && std::abs(ly) > y_max) return false;
-                if (x_max > 0.0 && std::abs(lx) > x_max) return false;
-                if (x_max_f > 0.0 && lx > x_max_f) return false;
-                if (use_pw) return pw_ground_mask[idx] != 0;
-                if (lz < ground_z_min || lz > zCeilAt(lx, ly)) return false;
-                return true;
-            };
 
             // seed -> 同格未抽中邻居；scan_idx -> 所属世界 XY 格 key（扩容统计用）
             std::unordered_map<int, std::vector<int>> seed_neighbors;
@@ -2522,19 +2652,53 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
             if (reg_cs > 0.0) {
                 std::unordered_map<std::int64_t, std::vector<int>> xy_bucket;
-                for (int i = 0; i < (int)scan_local.size(); ++i) {
-                    const double lx = scan_local[i].x, ly = scan_local[i].y, lz = scan_local[i].z;
-                    if (!passGndLocal(i, lx, ly, lz)) continue;
+                for (int i : gnd_cand_idx) {
                     const Eigen::Vector3d p_w = R_curr *
-                        Eigen::Vector3d(lx, ly, lz) + t_curr;
+                        Eigen::Vector3d(scan_local[i].x, scan_local[i].y, scan_local[i].z)
+                        + t_curr;
                     const std::int64_t cx = static_cast<std::int64_t>(std::floor(p_w.x() / reg_cs));
                     const std::int64_t cy = static_cast<std::int64_t>(std::floor(p_w.y() / reg_cs));
                     const std::int64_t key = cx * 1000003LL + cy;
                     xy_bucket[key].push_back(i);
                     pt_cell_key[i] = key;
                 }
+                // 放宽横向门后占用格数成倍增长，逐格配额不变会让查询量随之膨胀。
+                // 按占用格数把每格配额等比压到全局预算内：覆盖范围照常扩大，单帧代价有界。
+                int cmax_eff = reg_cmax, cmax_f_eff = reg_cmax_f;
+                if (seed_bud > 0 && !xy_bucket.empty()) {
+                    const double per_cell_cfg = reg_cmax_f + 2.0 * reg_cmax;
+                    const double per_cell_bud =
+                        static_cast<double>(seed_bud) / static_cast<double>(xy_bucket.size());
+                    if (per_cell_bud < per_cell_cfg) {
+                        const double s = per_cell_bud / per_cell_cfg;
+                        cmax_eff   = std::max(1, (int)std::lround(reg_cmax   * s));
+                        cmax_f_eff = std::max(1, (int)std::lround(reg_cmax_f * s));
+                    }
+                }
+
+                // 每个种子都要走一次 queryNearest，而 queryNearest 会对邻域内每张
+                // 候选面做一次冷启动 findFootPrint（PCA 投影 + 6 步 Newton），是地面
+                // 采样的主要开销。按格并行：每格产物先落自己的桶，再按 xy_bucket 的
+                // 自然迭代序归并，各曲面下的种子顺序与串行版相同。
+                // findFootPrint/coldInitUVFromPCA 都只读曲面数据，同一张面被多格
+                // 并发查询也安全。
+                std::vector<const std::vector<int>*> cells;
+                cells.reserve(xy_bucket.size());
+                for (auto& [key, indices] : xy_bucket) {
+                    (void)key;
+                    cells.push_back(&indices);
+                }
+
+                struct CellOut {
+                    std::vector<std::pair<const BSplineSurface*, int>> hits;  // (最近面, 种子)
+                    std::vector<std::pair<int, std::vector<int>>>      nbrs;  // (种子, 同格邻居)
+                };
+                std::vector<CellOut> cell_out(cells.size());
+                const int n_cell = (int)cells.size();
+                const int n_thr  = std::max(1, param.num_thread_reg);
+
                 // 每格内按雷达系 lx 分前/中/后，前向用更密 max_pts，再挂邻居
-                auto sample_group = [&](const std::vector<int>& indices, int cmax) {
+                auto sample_group = [&](const std::vector<int>& indices, int cmax, CellOut& co) {
                     const int n = (int)indices.size();
                     if (n <= 0 || cmax <= 0) return;
                     const int step = std::max(1, n / cmax);
@@ -2544,7 +2708,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                             Eigen::Vector3d(scan_local[seed].x, scan_local[seed].y,
                                            scan_local[seed].z) + t_curr;
                         const BSplineSurface* sp = mr_ground.queryNearest(p_w);
-                        if (sp) gnd_surf_to_pts[sp].push_back(seed);
+                        if (sp) co.hits.emplace_back(sp, seed);
 
                         const int k_end = std::min(n, k + step);
                         std::vector<int> nbrs;
@@ -2561,24 +2725,14 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                             nbrs.swap(kept);
                         }
                         if (!nbrs.empty())
-                            seed_neighbors[seed] = std::move(nbrs);
+                            co.nbrs.emplace_back(seed, std::move(nbrs));
                     }
                 };
-                // 放宽横向门后占用格数成倍增长，逐格配额不变会让查询量随之膨胀。
-                // 按占用格数把每格配额等比压到全局预算内：覆盖范围照常扩大，单帧代价有界。
-                int cmax_eff = reg_cmax, cmax_f_eff = reg_cmax_f;
-                if (seed_bud > 0 && !xy_bucket.empty()) {
-                    const double per_cell_cfg = reg_cmax_f + 2.0 * reg_cmax;
-                    const double per_cell_bud =
-                        static_cast<double>(seed_bud) / static_cast<double>(xy_bucket.size());
-                    if (per_cell_bud < per_cell_cfg) {
-                        const double s = per_cell_bud / per_cell_cfg;
-                        cmax_eff   = std::max(1, (int)std::lround(reg_cmax   * s));
-                        cmax_f_eff = std::max(1, (int)std::lround(reg_cmax_f * s));
-                    }
-                }
-                for (auto& [key, indices] : xy_bucket) {
-                    (void)key;
+
+#pragma omp parallel for schedule(dynamic) num_threads(n_thr)
+                for (int ci = 0; ci < n_cell; ++ci) {
+                    const std::vector<int>& indices = *cells[ci];
+                    CellOut& co = cell_out[ci];
                     std::vector<int> idx_f, idx_m, idx_b;
                     idx_f.reserve(indices.size());
                     idx_m.reserve(indices.size());
@@ -2589,9 +2743,16 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                         else if (lx <= -fb_x0) idx_b.push_back(i);
                         else                   idx_m.push_back(i);
                     }
-                    sample_group(idx_f, cmax_f_eff);
-                    sample_group(idx_m, cmax_eff);
-                    sample_group(idx_b, cmax_eff);
+                    sample_group(idx_f, cmax_f_eff, co);
+                    sample_group(idx_m, cmax_eff,   co);
+                    sample_group(idx_b, cmax_eff,   co);
+                }
+
+                for (CellOut& co : cell_out) {
+                    for (const auto& [sp, seed] : co.hits)
+                        gnd_surf_to_pts[sp].push_back(seed);
+                    for (auto& [seed, nb] : co.nbrs)
+                        seed_neighbors[seed] = std::move(nb);
                 }
             } else {
                 // 退化：旧 skip 模式（无邻居扩容）
@@ -2612,12 +2773,19 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 gnd_enter_indices.insert(gnd_enter_indices.end(), indices.begin(), indices.end());
             }
 
+            if (prof) { ms_gnd_sample += t_seg.toc(); t_seg.tic(); }
+
             std::vector<RegMatch> gnd_matches;
             buildGroundMatches(scan_local, T_curr, gnd_thr, gnd_surf_to_pts,
                               gnd_prev_indices, gnd_prev_uv, gnd_matches);
 
+            // 补点扩容只影响本轮解的加密程度，而前两轮的解都会被后续轮次覆盖；
+            // 这一段每点要走 6 步 Newton，是地面链最贵的部分。默认仍逐轮扩容。
+            const bool do_expand = !param.gnd_expand_last_iter_only
+                                || giter == kGndIters - 1;
+
             // 过 thr 后：每格不足 target 时，用该格内成功种子挂的邻居填充，再裁到 target
-            if (reg_cs > 0.0 && reg_tgt > 0 && !seed_neighbors.empty()) {
+            if (do_expand && reg_cs > 0.0 && reg_tgt > 0 && !seed_neighbors.empty()) {
                 std::unordered_map<std::int64_t, std::vector<int>> cell_ok_seeds;
                 std::unordered_map<std::int64_t, int> cell_match_cnt;
                 std::unordered_set<int> matched_idx;
@@ -2720,7 +2888,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
                 // 短板桶：从成功种子邻居补点（邻居 lx 仍须落在同桶）
                 std::unordered_map<const BSplineSurface*, std::vector<int>> fb_expand;
-                for (int b = 0; b < 3; ++b) {
+                for (int b = 0; do_expand && b < 3; ++b) {
                     if (have[b] >= tgt[b] || ok_seeds[b].empty()) continue;
                     const int need = tgt[b] - have[b];
                     std::vector<int> pool;
@@ -2785,6 +2953,8 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
                 gnd_matches.swap(balanced);
             }
 
+            if (prof) { ms_gnd_match += t_seg.toc(); t_seg.tic(); }
+
             if ((int)gnd_matches.size() < 10) break;
 
             last_gnd_matches = gnd_matches;
@@ -2826,6 +2996,7 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             opts.num_threads = 1;  // 同上：可复现优先
             ceres::Solver::Summary summary;
             ceres::Solve(opts, &problem, &summary);
+            if (prof) ms_gnd_solve += t_seg.toc();
 
             T_curr = makePoseFromXYZRPY(
                 x_fix, y_fix, rpy_z[2], rpy_z[0], rpy_z[1], yaw_fix);
@@ -2999,6 +3170,14 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             f_unmatched.close();
             (void)n_unmatched;
         }
+    }
+
+    if (prof) {
+        std::cout << "  [reg] obs collect/match/solve = "
+                  << ms_obs_collect << "/" << ms_obs_match << "/" << ms_obs_solve
+                  << " ms | gnd sample/match/solve = "
+                  << ms_gnd_sample << "/" << ms_gnd_match << "/" << ms_gnd_solve
+                  << " ms" << std::endl;
     }
     return T_curr;
 }

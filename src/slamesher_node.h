@@ -36,6 +36,22 @@ public:
     int    obs_rimg_col_step{3};           // range image 列方向采样间隔（1=全取，3=每3列取1）
     int    obs_match_per_surf_max{50};     // 每个障碍曲面最多保留的匹配点数（0=不限）
     int    obs_cand_target{1500};          // 逐曲面截顶后的候选目标；不足则补采偏移列（0=关闭）
+    // ── 配准提速 ────────────────────────────────────────────────────────────
+    // 配准侧 OMP 线程数（障碍/地面 footprint 并行）。<=0 沿用 num_thread。
+    // 与建图共用一个 num_thread 会在两者重叠时互相抢核，故单独给一份预算。
+    int    num_thread_reg{0};
+    // 每帧打印配准分段耗时：障碍收集/匹配/求解 + 地面采样/匹配/求解
+    bool   reg_time_breakdown{false};
+    // 障碍阶段跨迭代复用上一轮的候选集（surf_to_pts）。上一轮位姿增量 <= 此值（米）
+    // 时跳过 range image 重扫 + queryCandidates，直接沿用旧候选。副作用是正向的：
+    // 候选下标列表不变才能命中 buildObsMatches 的 warm-start 缓存，命中后
+    // findFootPrintWarm 靠内部收敛提前退出，Newton 步数从 6 掉到 1~2。
+    // <=0 关闭（每轮都重新收集，原行为）。会改变结果，需 A/B。
+    double obs_reuse_cand_delta{0.0};
+    // 地面阶段：每格补点扩容只在最后一轮做。前几轮的解会被后续轮次覆盖，
+    // 补点对它们只是加密不改结论，而这一段是配准里最贵的（每点 6 步 Newton）。
+    // false = 每轮都扩容（原行为）。会改变结果，需 A/B。
+    bool   gnd_expand_last_iter_only{false};
     // 配准侧障碍 range image 用 Patchwork++ 地面 mask 排除地面点，而非 z 带
     // [ground_z_min, ground_z_max]。建图侧（runMapBuild）本来就是按 mask 取 !ground
     // 的点建障碍面，配准侧却按 z 带取点，两侧的「障碍点」定义不一致：

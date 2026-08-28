@@ -229,6 +229,15 @@ slamesher:
   visualisation_type: 3
   #gp param / OMP 建图并行线程数（障碍 apply + 地面格 apply 均使用）
   num_thread: 8
+  # 配准侧 footprint 并行线程数；0=沿用 num_thread。与建图分开给预算，避免抢核
+  num_thread_reg: 8
+  # 每帧打印 障碍收集/匹配/求解 + 地面采样/匹配/求解 的分段耗时
+  reg_time_breakdown: false
+  # 障碍迭代间复用候选集：上轮位姿增量 <= 此值(m) 就不重扫 range image。
+  # 副作用是激活 warm-start（下标不变才命中），Newton 步数大幅下降。会改结果，需 A/B
+  obs_reuse_cand_delta: 0.0
+  # 地面每格补点扩容只在最后一轮做（前两轮的解都会被覆盖）。会改结果，需 A/B
+  gnd_expand_last_iter_only: false
   grid: 2
   min_points_num_to_gp: 11
   num_test: 6
