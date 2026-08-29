@@ -2545,6 +2545,10 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
 
         const Transf T_new = makePoseFromXYZRPY(
             xy_yaw[0], xy_yaw[1], z_fix, roll_fix, pitch_fix, xy_yaw[2]);
+        if (!T_new.allFinite()) {
+            ROS_WARN("Obs Ceres produced NaN at iter %d, keeping previous T_curr.", iter);
+            break;
+        }
         delta_scale = (T_new.block<3,1>(0,3) - T_curr.block<3,1>(0,3)).norm()
                     + 5.0 * (T_new.block<3,3>(0,0) - T_curr.block<3,3>(0,0)).norm();
         T_curr = T_new;
@@ -3006,10 +3010,15 @@ Transf SLAMesher::registerScanToMap(const pcl::PointCloud<pcl::PointXYZ>& scan_l
             ceres::Solve(opts, &problem, &summary);
             if (prof) ms_gnd_solve += t_seg.toc();
 
-            T_curr = makePoseFromXYZRPY(
+            const Transf T_gnd_new = makePoseFromXYZRPY(
                 x_fix, y_fix, rpy_z[2], rpy_z[0], rpy_z[1], yaw_fix);
-            roll_i = rpy_z[0];
-            pitch_i = rpy_z[1];
+            if (T_gnd_new.allFinite()) {
+                T_curr = T_gnd_new;
+                roll_i = rpy_z[0];
+                pitch_i = rpy_z[1];
+            } else {
+                ROS_WARN("Gnd Ceres produced NaN at giter %d, keeping previous T_curr.", giter);
+            }
 
             last_matches = obs_saved;
             last_matches.insert(last_matches.end(), gnd_matches.begin(), gnd_matches.end());
@@ -4213,6 +4222,13 @@ void SLAMesher::process(){
                                     max_rg_iters, converge_thr, match_dist_thr, skip_points,
                                     GROUND_Z_MIN, GROUND_Z_MIN, GROUND_Z_MAX,
                                     range_proc, range_proc_far, (param.range_image_split > 0.0));
+
+        // NaN guard：Ceres 在条件极差（匹配数刚过门限但方向高度集中）时可能产生 NaN。
+        // 检测到 NaN 则回退到匀速外推，避免污染后续帧。
+        if (!T_world.allFinite()) {
+            ROS_WARN("Step %d: registerScanToMap returned NaN, fall back to T_guess.", g_data.step);
+            T_world = T_guess;
+        }
 
         g_data.updatePose(T_world);
         pubTf();

@@ -35,14 +35,16 @@ slamesher:
   map_update_interval: 5
   ground_build_interval: 5
   map_unmatched_ratio_min: 0.30
-  cluster_ds_min_pts: 80
-  cluster_ds_target_max: 200
-  range_image_split: 25.0
+  # HDL-32E 只有 32 线，聚类天然比 HDL-64E 小一半，阈值也相应降低
+  cluster_ds_min_pts: 30
+  cluster_ds_target_max: 100
+  # 32 线雷达远层聚类过于稀疏，先禁用远层（单层模式）
+  range_image_split: 0.0
   range_image_far_z_floor_offset: 20
-  range_image_far_min_cluster: 20
-  obs_rimg_col_step: 3
-  obs_match_per_surf_max: 50
-  obs_cand_target: 1500
+  range_image_far_min_cluster: 10
+  obs_rimg_col_step: 2
+  obs_match_per_surf_max: 30
+  obs_cand_target: 1000
   obs_reg_use_pw_mask: true
   # ── Patchwork++ ────────────────────────────────────────────────────────
   use_patchwork_ground: true
@@ -50,8 +52,8 @@ slamesher:
   pw_num_iter: 3
   pw_num_lpr: 20
   pw_num_min_pts: 10
-  pw_th_seeds: 0.3
-  pw_th_dist: 0.125
+  pw_th_seeds: 0.4
+  pw_th_dist: 0.2
   pw_th_seeds_v: 0.25
   pw_th_dist_v: 0.1
   pw_max_r: 60.0
