@@ -231,20 +231,22 @@ bool readKitti(const std::string & file_dataset, const std::string & seq, int li
     bin_file.seekg(0, std::ios::beg);
 
     if (dataset == 3) {
-        // NCLT velodyne_sync: x y z intensity (4 × float32 = 16 bytes/point)
-        // 部分版本只有 x y z (3 × float32 = 12 bytes/point)，自动检测
-        const bool has_intensity = (file_bytes % (4 * sizeof(float)) == 0);
-        const int stride = has_intensity ? 4 : 3;
-        const size_t num_elements = file_bytes / sizeof(float);
-        std::vector<float> data(num_elements);
-        bin_file.read(reinterpret_cast<char*>(data.data()), file_bytes);
-        const size_t n_pts = num_elements / stride;
+        // NCLT velodyne_sync 格式（参考 KISS-ICP / PIN-SLAM nclt.py）：
+        //   每点 4 × int16 = 8 字节，字段顺序: x_s, y_s, z_s, intensity_s
+        //   真实坐标: val = raw * 0.005 + (-100.0)
+        //   传感器倒装，坐标翻转: 输出 (x, -y, -z) 使 Z 朝上
+        const size_t bytes_per_point = 4 * sizeof(int16_t);  // 8 bytes
+        const size_t n_pts = file_bytes / bytes_per_point;
+        std::vector<int16_t> raw(n_pts * 4);
+        bin_file.read(reinterpret_cast<char*>(raw.data()), (std::streamsize)(n_pts * 4 * sizeof(int16_t)));
+        const float scale = 0.005f;
+        const float off   = -100.0f;
         laser_cloud.reserve(n_pts);
-        for (size_t i = 0; i < num_elements; i += stride) {
+        for (size_t i = 0; i < n_pts; ++i) {
             pcl::PointXYZ p;
-            p.x = data[i];
-            p.y = data[i + 1];
-            p.z = data[i + 2];
+            p.x =  raw[i * 4 + 0] * scale + off;
+            p.y = -(raw[i * 4 + 1] * scale + off);  // 翻转 Y
+            p.z = -(raw[i * 4 + 2] * scale + off);  // 翻转 Z
             if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z))
                 laser_cloud.push_back(p);
         }

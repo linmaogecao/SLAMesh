@@ -23,8 +23,8 @@ slamesher:
   ri_w_cols: 1800
   ri_fov_up: 10.67
   ri_fov_down: -30.67
-  # HDL-32E 倒装在车顶：原始坐标 X 前 Y 左 Z 下，翻转 Y/Z 变成标准 Z 朝上
-  lidar_flip_yz: true
+  # 坐标翻转已在 readKitti dataset==3 分支内完成（-y, -z），这里不再重复翻转
+  lidar_flip_yz: false
   # ── 配准参数 ───────────────────────────────────────────────────────────
   range_max: 80
   range_min: 1.0
