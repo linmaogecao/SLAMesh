@@ -48,7 +48,7 @@ slamesher:
   obs_reg_use_pw_mask: true
   # ── Patchwork++ ────────────────────────────────────────────────────────
   use_patchwork_ground: true
-  pw_sensor_height: 1.5
+  pw_sensor_height: 1.0
   pw_num_iter: 3
   pw_num_lpr: 20
   pw_num_min_pts: 10
@@ -64,7 +64,7 @@ slamesher:
   pw_enable_TGR: true
   # ── 地面栅格 ───────────────────────────────────────────────────────────
   ground_z_min: -3.0
-  ground_z_max: -0.8
+  ground_z_max: -0.5
   ground_cell_size: 6.0
   ground_cell_min_pts: 60
   ground_cell_num_cp: 5
@@ -118,10 +118,10 @@ slamesher:
   ground_coarse_cell_max_pts: 600
   ground_coarse_fit_max_pts: 250
   gnd_ri_z_min: -3.0
-  gnd_ri_z_max: 0.0
+  gnd_ri_z_max: -0.3
   gnd_near_x_max: 20.0
   gnd_near_y_max: 10.0
-  gnd_near_z_max: -1.0
+  gnd_near_z_max: -0.6
   gnd_col_max_step: 0.1
   gnd_col_seed_h_up: 0.1
   gnd_normal_z_min: 0.5

@@ -231,22 +231,27 @@ bool readKitti(const std::string & file_dataset, const std::string & seq, int li
     bin_file.seekg(0, std::ios::beg);
 
     if (dataset == 3) {
-        // NCLT velodyne_sync 格式（参考 KISS-ICP / PIN-SLAM nclt.py）：
+        // NCLT velodyne_sync 格式（参考 PIN-SLAM nclt.py）：
         //   每点 4 × int16 = 8 字节，字段顺序: x_s, y_s, z_s, intensity_s
-        //   真实坐标: val = raw * 0.005 + (-100.0)
-        //   传感器倒装，坐标翻转: 输出 (x, -y, -z) 使 Z 朝上
+        //   真实坐标: val = raw * 0.005 + (-100.0)，单位 m
+        //   传感器 z 轴朝下，翻转后还需加 z_body_vel（传感器在 body 系的 z 坐标）
+        //   将点云变换到 body 系（轮轴为原点，z 朝上）：
+        //     x_b = x_s,  y_b = -y_s,  z_b = -z_s + z_body_vel
+        //   其中 z_body_vel = -0.957m（Table 4，velodyne 在 body 系 z 坐标；body z 朝下
+        //   负值表示传感器在轮轴上方 0.957m）。
         const size_t bytes_per_point = 4 * sizeof(int16_t);  // 8 bytes
         const size_t n_pts = file_bytes / bytes_per_point;
         std::vector<int16_t> raw(n_pts * 4);
         bin_file.read(reinterpret_cast<char*>(raw.data()), (std::streamsize)(n_pts * 4 * sizeof(int16_t)));
-        const float scale = 0.005f;
-        const float off   = -100.0f;
+        const float scale       = 0.005f;
+        const float off         = -100.0f;
+        const float z_body_vel  = -0.957f;  // NCLT Table 4: velodyne z in body frame (body z-down)
         laser_cloud.reserve(n_pts);
         for (size_t i = 0; i < n_pts; ++i) {
             pcl::PointXYZ p;
             p.x =  raw[i * 4 + 0] * scale + off;
-            p.y = -(raw[i * 4 + 1] * scale + off);  // 翻转 Y
-            p.z = -(raw[i * 4 + 2] * scale + off);  // 翻转 Z
+            p.y = -(raw[i * 4 + 1] * scale + off);
+            p.z = -(raw[i * 4 + 2] * scale + off) + z_body_vel;  // 翻转 + 平移到 body 系原点
             if (std::isfinite(p.x) && std::isfinite(p.y) && std::isfinite(p.z))
                 laser_cloud.push_back(p);
         }
