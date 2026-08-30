@@ -20,6 +20,20 @@ static const std::vector<std::string>& getNcltFileList(const std::string& dir) {
     return g_nclt_files;
 }
 
+bool ncltFrameUtime(const std::string & file_dataset, const std::string & seq,
+                    int line_num, int64_t & utime) {
+    const std::string vel_dir = file_dataset + seq + "/velodyne_sync";
+    const auto& files = getNcltFileList(vel_dir);
+    if (line_num < 0 || line_num >= (int)files.size()) return false;
+    const std::string stem = std::filesystem::path(files[line_num]).stem().string();
+    try {
+        utime = (int64_t)std::stoll(stem);
+    } catch (const std::exception&) {
+        return false;
+    }
+    return true;
+}
+
 //format transform
 Transf state2trans3(State state){
     Transf result_transf;

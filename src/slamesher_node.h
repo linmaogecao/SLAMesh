@@ -10,6 +10,7 @@
 #include "BSplineSDMErr.h"
 #include "MultiResGroundMap.h"
 #include "PatchworkppGround.h"
+#include "utility/nclt_odom.h"
 #include <sensor_msgs/point_cloud_conversion.h>
 #include <pcl/registration/icp.h>
 #include <unordered_set>
@@ -235,6 +236,15 @@ public:
     double eigen_1, eigen_2, eigen_3;//PCA
 
     std::string file_loc_report, file_loc_dataset, seq, console_log_path;
+    // 离线里程计先验（NCLT）：文件名相对 file_loc_dataset+seq，空则不启用。
+    // 只取帧间增量作配准初值，不使用绝对位姿，详见 utility/nclt_odom.h。
+    std::string odom_file;
+    // 静止判定。两个条件必须同时成立：Segway 会原地转向，实测在 |dxy| 小于阈值
+    // 的区间里有 27% 其实在转（|dyaw| 最大到 0.066 rad/100ms），只看位移会把
+    // 原地转向误判成静止而冻结 yaw。
+    double stationary_trans_thr{0.01};  // m，帧间水平位移
+    double stationary_rot_thr{0.005};   // rad，帧间偏航
+    bool   stationary_hold{true};       // 判定静止时保持位姿并跳过配准与建图
     bool three_dir;//features fixed
     bool odom_available, read_offline_pcd, cross_overlap, grt_available, imu_feedback,
             meshing_tsdf, full_cover, save_raw_point_clouds, point2mesh{true},
@@ -285,7 +295,6 @@ public:
     Transf transf_odom_last  = Eigen::MatrixXd::Identity(4, 4),
            transf_odom_now   = Eigen::MatrixXd::Identity(4, 4),//used to calculate incremental transformation between two odometry frames
            transf_slam       = Eigen::MatrixXd::Identity(4, 4);
-    std::vector<State> odom_offline;//not used
     std::queue<nav_msgs::OdometryConstPtr> odometry_msg_buf;
     //imu
     std::queue<sensor_msgs::ImuConstPtr> imu_msg_buf;
@@ -365,6 +374,8 @@ public:
     void pointCloudCallback(const sensor_msgs::PointCloud2::ConstPtr & pcl_msg);
 
     Transf getOdom();
+    // getOdom 判定本帧原地静止；process() 据此跳过配准与建图
+    bool frameStationary() const { return frame_stationary_; }
     void imuIntegration(const sensor_msgs::ImuConstPtr & imu_msg);
     bool visualize(Map & map_glb, Map & map_now, int option);
     void pubTf();
@@ -372,6 +383,13 @@ public:
     void process();
 
 private:
+    NcltOdometry nclt_odom_;
+    bool frame_stationary_{false};
+
+    // 本帧相对上一帧的里程计增量（已在 SLAMesh 系）。无可用里程计时返回 false，
+    // getOdom 回退到匀速外推。
+    bool getOdomIncrement(Transf & dT);
+
     struct RegMatch {
         Eigen::Vector3d p_local;
         Eigen::Vector3d p_world;

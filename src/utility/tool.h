@@ -2,6 +2,7 @@
 #ifndef TOOL_H_
 #define TOOL_H_
 #include "pointMatrix.h"
+#include <cstdint>
 #include <iostream>
 #include <chrono>
 //eigen
@@ -46,6 +47,10 @@ geometry_msgs::PoseWithCovariance transf2PoseWithCovariance(Transf transf);
 Transf PoseWithCovariance2transf(geometry_msgs::PoseWithCovariance pose);
 bool readKitti(const std::string & file_dataset, const std::string& seq, int line_num, int dataset,
                pcl::PointCloud<pcl::PointXYZ> & laser_cloud);
+// NCLT: velodyne_sync 下的文件名就是该帧的微秒时间戳，用来查里程计。
+// line_num 与 readKitti 的帧序号同一套（排序后的下标）。
+bool ncltFrameUtime(const std::string & file_dataset, const std::string & seq,
+                    int line_num, int64_t & utime);
 
 //transformation
 Point trans3Dpoint(int x, int y, int z, const Transf& transf);

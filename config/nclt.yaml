@@ -2,9 +2,19 @@ slamesher:
   # NCLT dataset (Velodyne HDL-32E, inverted mounting)
   use_sim_time: false
   grt_available: false
-  odom_available: false
   read_offline_pcd: true
   dataset: 3
+  # ── 运动先验：NCLT 里程计（轮式编码器 + KVH 光纤陀螺 + GX3 IMU 的 EKF 输出）──
+  # 只取帧间增量替代匀速外推，绝对位姿不用。文件放在 <data_path>/<seq>/ 下，
+  # 与 velodyne_sync 同级。取不到时自动回退到匀速外推。
+  odom_available: true
+  odom_file: "odometry_mu_100hz.csv"
+  # 静止判定：两个条件必须同时成立。Segway 会原地转向，实测 |dxy| 低于阈值的
+  # 区间里有 27% 其实在转，只看位移会冻结 yaw。实测 |dxy| 静止段噪声底
+  # 5~10mm、行进中位数 0.12m/帧，阈值落在 p05 与 p10 之间的空隙里。
+  stationary_trans_thr: 0.01
+  stationary_rot_thr: 0.005
+  stationary_hold: true
   max_steps: 100000
   max_frames: 0
   dump_frame: 0

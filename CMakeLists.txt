@@ -72,6 +72,7 @@ if(USE_VOXBLOX)
     message("USE_VOXBLOX")
     add_executable(slamesh
             src/utility/tool.cpp
+            src/utility/nclt_odom.cpp
             src/factor/lidarFactor.cpp
             src/cell.cpp
             src/map.cpp
@@ -87,6 +88,7 @@ else()
     message("DONT USE_VOXBLOX")
     add_executable(slamesh
             src/utility/tool.cpp
+            src/utility/nclt_odom.cpp
             src/factor/lidarFactor.cpp
             src/cell.cpp
             src/map.cpp

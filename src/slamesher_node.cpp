@@ -1186,7 +1186,7 @@ Transf Log::initFirstTransf(){
     //2, use first odom
     else if(param.odom_available){
         if(param.read_offline_pcd){
-            transf_odom_now = state2quat2trans3(g_data.odom_offline[0]);
+            // 离线里程计只提供帧间增量，不提供世界系锚点，起始位姿保持单位阵
         }
         else{
             bool first = true;
@@ -1338,6 +1338,10 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     nh.param("slamesher/odom_available", odom_available, false);
     nh.param("slamesher/read_offline_pcd", read_offline_pcd, false);
     nh.param("slamesher/imu_feedback", imu_feedback, false);//? TO DO
+    nh.param("slamesher/odom_file", odom_file, std::string(""));
+    nh.param("slamesher/stationary_trans_thr", stationary_trans_thr, 0.01);
+    nh.param("slamesher/stationary_rot_thr",   stationary_rot_thr,   0.005);
+    nh.param("slamesher/stationary_hold",      stationary_hold,      true);
     nh.param("slamesher/file_loc_dataset", file_loc_dataset, std::string("/not_set"));
     nh.param("slamesher/dataset", dataset, 6);
     nh.param("slamesher/seq", seq, std::string(""));
@@ -1651,29 +1655,65 @@ void Parameter::initParameter(ros::NodeHandle & nh){
     std::cout<<"====ROS INIT DONE===="<<std::endl;
 }
 
-Transf SLAMesher::getOdom(){
-    //before scan registration, obtain initial guess of transformation from motion prior or odometry msg
-    Transf odom, dT, odom_now, odom_pre;
-    if(param.odom_available){
-        if(param.read_offline_pcd){
-            //use odometry from file
-            int step_offset = 0;
-            g_data.transf_odom_now =  state2quat2trans3(g_data.odom_offline[g_data.step + step_offset]);}
-        else{
-            //use odometry from topic
-            ros::spinOnce();
-        }
-
-        odom_now = g_data.transf_odom_now;
-        odom_pre = g_data.transf_odom_last;
-        dT = odom_pre.inverse() * odom_now;
-        odom.block(0, 0, 3, 3) = odom.block(0, 0, 3, 3) * dT.block(0, 0, 3, 3);//only use orientation of imu odom
-        odom.block(0, 3, 1, 3) = g_data.transf_odom_now.block(0, 3, 1, 3);
-        //store odom_offline path
-        g_data.recordPoseToPath(Odom, odom);
-        g_data.transf_odom_last = g_data.transf_odom_now;//once the odom_offline was read, the odom_buff_last will be updated
+bool SLAMesher::getOdomIncrement(Transf & dT){
+    if(param.read_offline_pcd){
+        if(nclt_odom_.empty()) return false;
+        // process() 里第 step 帧读的是排序后下标 step-1 的那个 .bin
+        int64_t ut_now = 0, ut_pre = 0;
+        if(!ncltFrameUtime(param.file_loc_dataset, param.seq, g_data.step - 1, ut_now)) return false;
+        if(!ncltFrameUtime(param.file_loc_dataset, param.seq, g_data.step - 2, ut_pre)) return false;
+        Transf T_now, T_pre;
+        if(!nclt_odom_.poseAt(ut_now, T_now)) return false;
+        if(!nclt_odom_.poseAt(ut_pre, T_pre)) return false;
+        // 只用增量：绝对位姿在整段 session 上会漂到不可用，帧间 100ms 却很准
+        dT = T_pre.inverse() * T_now;
     }
     else{
+        //odomCallback / imuIntegration 维护 transf_odom_now
+        ros::spinOnce();
+        dT = g_data.transf_odom_last.inverse() * g_data.transf_odom_now;
+        g_data.transf_odom_last = g_data.transf_odom_now;
+    }
+    return dT.allFinite();
+}
+
+Transf SLAMesher::getOdom(){
+    //before scan registration, obtain initial guess of transformation from motion prior or odometry msg
+    Transf odom = g_data.T_seq[g_data.step - 1];
+    frame_stationary_ = false;
+
+    Transf dT;
+    if(param.odom_available && g_data.step >= 2 && getOdomIncrement(dT)){
+        const Transf & Tp = g_data.T_seq[g_data.step - 1];
+        double d_r, d_p, d_yaw;
+        matrixToRPY(dT.block<3, 3>(0, 0), d_r, d_p, d_yaw);
+        const double d_xy = std::hypot(dT(0, 3), dT(1, 3));
+
+        frame_stationary_ = param.stationary_hold
+                         && d_xy < param.stationary_trans_thr
+                         && std::fabs(d_yaw) < param.stationary_rot_thr;
+        if(frame_stationary_){
+            // 原地未动：重复观测同一视角不带新信息，保持上一帧位姿
+            odom = Tp;
+        }
+        else{
+            // 里程计的 z 恒为 0（NCLT 明确不观测高度），roll/pitch 出自其 EKF 的
+            // 匀速模型而非实测，两者都不带信息。只取 x/y/yaw，z 与 roll/pitch
+            // 沿用上一帧交给地面阶段求解——这也断掉了 yaw 原先的自由积分器。
+            const Transf pred = Tp * dT;
+            double r_e, p_e, y_e, r_p, p_p, y_p;
+            matrixToRPY(pred.block<3, 3>(0, 0), r_e, p_e, y_e);
+            matrixToRPY(Tp.block<3, 3>(0, 0),   r_p, p_p, y_p);
+            odom = makePoseFromXYZRPY(pred(0, 3), pred(1, 3), Tp(2, 3),
+                                      r_p, p_p, y_e);
+        }
+        g_data.recordPoseToPath(Odom, odom);
+    }
+    else{
+        if(param.odom_available && g_data.step >= 2){
+            ROS_WARN_THROTTLE(5.0, "Step %d: no odometry increment, fall back to extrapolation.",
+                              g_data.step);
+        }
         if(g_data.step == 1){
             odom = g_data.T_seq[g_data.step - 1];
         }
@@ -1702,7 +1742,8 @@ Transf SLAMesher::getOdom(){
             }
         }
     }
-    std::cout << "Pose Odom:" << "x: " << odom(0, 3) << "  y: " << odom(1, 3) << "  z: " << odom(2, 3) << "\n";
+    std::cout << "Pose Odom:" << "x: " << odom(0, 3) << "  y: " << odom(1, 3) << "  z: " << odom(2, 3)
+              << (frame_stationary_ ? "  [stationary]" : "") << "\n";
     return odom;//use as initial guess
 }
 void SLAMesher::imuIntegration(const sensor_msgs::ImuConstPtr & imu_msg){
@@ -4197,6 +4238,25 @@ void SLAMesher::process(){
         TicToc t_register;
         Transf T_guess = getOdom();
 
+        if (frameStationary()) {
+            // 里程计判定原地未动：同一视角的重复观测不带新信息，配准只会注入
+            // 噪声，建图会让同一片曲面被反复拉扯。直接保持位姿。
+            T_world = T_guess;
+            g_data.updatePose(T_world);
+            pubTf();
+            if (traj_file.is_open()) {
+                traj_file << T_world(0,3) << " "
+                          << T_world(1,3) << " "
+                          << T_world(2,3) << "\n";
+                traj_file.flush();
+            }
+            path_pub.publish(g_data.path);
+            std::cout << "===STEP " << g_data.step << "=== stationary, pose held. Total: "
+                      << t_step.toc() << " ms===" << std::endl;
+            std::cout.flush();
+            continue;
+        }
+
         // 为配准生成 range image：排除地面点，仅剩余点进障碍链。
         // 有 Patchwork++ mask 时按 mask 排除，与 runMapBuild 建障碍面所用的点集
         // （!ground_mask）逐点一致；否则回退 z 带排除（原行为）。
@@ -4299,7 +4359,16 @@ SLAMesher::SLAMesher(ros::NodeHandle & nh_, Parameter & param_, Log & g_data_) :
         ground_truth_sub = nh.subscribe("/pose", 500, &SLAMesher::groundTruthCallback, this);//vicon
         ground_truth_uav_sub = nh.subscribe("/mavros/local_position/odom", 500, &SLAMesher::groundTruthUavCallback, this);//gps+imu
     }
-    if(param.odom_available){
+    if(param.odom_available && param.read_offline_pcd){
+        //离线：从文件取运动先验，不订阅任何 topic
+        if(param.odom_file.empty()){
+            ROS_WARN("odom_available is set but odom_file is empty, extrapolation will be used.");
+        }
+        else if(!nclt_odom_.load(param.file_loc_dataset + param.seq + "/" + param.odom_file)){
+            ROS_WARN("Offline odometry unavailable, extrapolation will be used.");
+        }
+    }
+    else if(param.odom_available){
         //odometry may be provided by those ways, choose one from odom_sub and imu_sub
         odom_sub = nh.subscribe("/odom", 1, & SLAMesher::odomCallback, this);
         //imu_sub = nh.subscribe("/imu/data", 500, & SLAMesher::imuCallback, this);
